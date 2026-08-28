@@ -66,6 +66,8 @@ pub trait MobilityHooks: Send + Sync {
     async fn forget(&self, sandbox_id: &SandboxId);
     /// Counts records by state, for the node's metrics.
     async fn record_counts(&self) -> MobilityRecordCounts;
+    /// Publishes those counts as gauges.
+    async fn publish_metrics(&self);
 }
 
 #[async_trait::async_trait]
@@ -84,6 +86,10 @@ impl<S: MobilityStore + 'static> MobilityHooks for MobilityRuntime<S> {
 
     async fn record_counts(&self) -> MobilityRecordCounts {
         MobilityRuntime::record_counts(self).await
+    }
+
+    async fn publish_metrics(&self) {
+        MobilityRuntime::publish_metrics(self).await
     }
 }
 
@@ -188,6 +194,25 @@ impl<S: MobilityStore> MobilityRuntime<S> {
         // Layer sets come from committed snapshots, which a paused sandbox does
         // not have yet; the empty map is what says so.
         plan_evacuation(&records, candidates, &std::collections::HashMap::new())
+    }
+
+    /// Publishes the record counts as gauges.
+    ///
+    /// Without these the subsystem is invisible: a node where every paused
+    /// sandbox is unmovable and one where none are paused at all export
+    /// exactly the same nothing, and the difference is what decides whether a
+    /// drain will do anything.
+    pub async fn publish_metrics(&self) {
+        let counts = self.record_counts().await;
+        for (state, value) in [
+            ("parked", counts.parked),
+            ("claimed", counts.claimed),
+            ("evacuated", counts.evacuated),
+        ] {
+            metrics::gauge!("agentenv_mobility_records", "state" => state).set(value as f64);
+        }
+        metrics::gauge!("agentenv_mobility_stranded_sandboxes")
+            .set(counts.stranded_uncommitted as f64);
     }
 
     /// Counts records by state, for the node's metrics.

@@ -1945,6 +1945,12 @@ where
             .await?;
         metrics.create_successes = self.counters.create_successes();
         metrics.create_fails = self.counters.create_fails();
+        if let Some(mobility) = self.mobility() {
+            // Sampled here rather than on a timer, so the gauges move on the
+            // same cadence as everything else on the node snapshot and cannot
+            // drift from the counts they are meant to describe.
+            mobility.publish_metrics().await;
+        }
         Ok(metrics)
     }
 

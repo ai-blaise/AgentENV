@@ -5144,8 +5144,16 @@ struct RecordingMobility {
 }
 
 impl RecordingMobility {
+    /// Lifecycle calls only. Metrics sampling happens on every node-snapshot
+    /// request and would otherwise drown the sequence being asserted.
     fn calls(&self) -> Vec<String> {
-        self.calls.lock().unwrap().clone()
+        self.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| *call != "publish_metrics")
+            .cloned()
+            .collect()
     }
 
     fn fence_with(&self, fence: crate::orchestrator::ResumeFence) {
@@ -5186,6 +5194,13 @@ impl crate::orchestrator::MobilityHooks for RecordingMobility {
 
     async fn record_counts(&self) -> crate::orchestrator::MobilityRecordCounts {
         crate::orchestrator::MobilityRecordCounts::default()
+    }
+
+    async fn publish_metrics(&self) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push("publish_metrics".to_string());
     }
 }
 
