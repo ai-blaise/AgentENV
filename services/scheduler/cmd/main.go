@@ -71,6 +71,11 @@ func main() {
 			registry,
 			scheduler.NewStrategy(cfg.Scheduler.Strategy),
 			store,
+			// Without this the service validates the TTL ordering against the
+			// hardcoded default rather than the TTL its store was actually
+			// built with, so an operator raising binding_ttl changed the store
+			// and nothing else.
+			scheduler.WithBindingTTL(cfg.Scheduler.BindingTTL),
 			scheduler.WithArtifactStore(scheduler.NewInMemoryArtifactStore(
 				cfg.Scheduler.ArtifactStoreCapacity,
 				cfg.Scheduler.ArtifactLookupNodeLimit,
@@ -163,11 +168,25 @@ func main() {
 }
 
 func createBindingStore(logger *zap.Logger, cfg config.Config) (scheduler.BindingStore, func()) {
-	if strings.TrimSpace(cfg.Scheduler.RedisAddr) == "" {
-		return scheduler.NewInMemoryBindingStore(cfg.Scheduler.BindingTTL), func() {}
+	// Passing the three timings together is what lets the store refuse a
+	// combination it cannot honour — a reconcile grace that outlives the
+	// binding TTL, or one too short to cover a node's reporting interval.
+	// Constructing with the TTL alone silently accepted both.
+	opts := scheduler.BindingStoreOptions{
+		BindingTTL:        cfg.Scheduler.BindingTTL,
+		ReconcileGrace:    cfg.Scheduler.ReconcileGrace,
+		HeartbeatInterval: cfg.Scheduler.HeartbeatInterval,
 	}
 
-	store, err := scheduler.NewRedisBindingStore(cfg.Scheduler.RedisAddr, cfg.Scheduler.BindingTTL)
+	if strings.TrimSpace(cfg.Scheduler.RedisAddr) == "" {
+		store, err := scheduler.NewInMemoryBindingStoreWithOptions(opts)
+		if err != nil {
+			logger.Fatal("create binding store failed", zap.Error(err))
+		}
+		return store, func() {}
+	}
+
+	store, err := scheduler.NewRedisBindingStoreWithOptions(cfg.Scheduler.RedisAddr, opts)
 	if err != nil {
 		logger.Fatal("create redis binding store failed", zap.Error(err), zap.String("addr", cfg.Scheduler.RedisAddr))
 	}

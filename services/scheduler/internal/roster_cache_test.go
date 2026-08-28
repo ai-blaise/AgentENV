@@ -275,3 +275,69 @@ func TestElidedHeartbeatDoesNotPromoteARecoveringRoster(t *testing.T) {
 		t.Fatal("a roster the node never claimed was complete must not delete anything")
 	}
 }
+
+// The cache is keyed by a digest the node computes, so the one thing it cannot
+// do is take that digest on trust. remember is its only writer.
+func TestRememberRefusesARosterThatDoesNotMatchItsDigest(t *testing.T) {
+	cache := newRosterCache()
+	roster := []string{"sandbox-1", "sandbox-2"}
+	honest := RosterDigest(roster)
+	wrong := RosterDigest(nil)
+
+	if !cache.remember("node-a", honest, roster, true) {
+		t.Fatal("a roster that matches its digest must be cached")
+	}
+	if cache.remember("node-a", wrong, roster, true) {
+		t.Fatal("a roster that does not match its digest must be refused")
+	}
+	if _, _, ok := cache.lookup("node-a", wrong); ok {
+		t.Fatal("a refused digest must not resolve to anything")
+	}
+	cached, _, ok := cache.lookup("node-a", honest)
+	if !ok || len(cached) != 2 {
+		t.Fatalf("the verified entry must survive the refused one, got %v ok=%v", cached, ok)
+	}
+}
+
+// A heartbeat whose ids and digest describe different rosters contradicts
+// itself, and both halves of it are load-bearing: the ids decide what is
+// reconciled now, the digest decides what every later elided heartbeat
+// resolves to. Believing either one means acting on a roster the node did not
+// send — here, dropping a sandbox it still owns and then keeping it dropped
+// for as long as the digest stays unchanged.
+func TestAHeartbeatThatContradictsItsOwnDigestReconcilesNothing(t *testing.T) {
+	service, store := rosterService(t)
+	roster := []string{"sandbox-1", "sandbox-2"}
+	digest := RosterDigest(roster)
+
+	if _, err := service.Heartbeat(context.Background(), rosterHeartbeat("node-a", digest, roster, true)); err != nil {
+		t.Fatalf("seed heartbeat: %v", err)
+	}
+
+	// The same digest, but only half the roster arrives with it.
+	truncated, err := service.Heartbeat(context.Background(), rosterHeartbeat("node-a", digest, roster[:1], true))
+	if err != nil {
+		t.Fatalf("truncated heartbeat: %v", err)
+	}
+	if !truncated.GetRequestFullRoster() {
+		t.Fatal("a heartbeat that contradicts its own digest must be sent back for the roster")
+	}
+	if _, ok := boundNode(t, store, "sandbox-2"); !ok {
+		t.Fatal("a roster the node's own digest disowns must not delete bindings")
+	}
+
+	// The cache must still hold what was verified, so the node's next elided
+	// heartbeat resolves to the roster it really sent.
+	elided, err := service.Heartbeat(context.Background(), rosterHeartbeat("node-a", digest, nil, false))
+	if err != nil {
+		t.Fatalf("elided heartbeat: %v", err)
+	}
+	if elided.GetRequestFullRoster() {
+		t.Fatal("the verified entry should still resolve the digest")
+	}
+	for _, sandboxID := range roster {
+		if node, ok := boundNode(t, store, sandboxID); !ok || node != "node-a" {
+			t.Fatalf("%s should still be bound to node-a, got %q ok=%v", sandboxID, node, ok)
+		}
+	}
+}

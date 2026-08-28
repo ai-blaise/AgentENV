@@ -921,6 +921,71 @@ mod file_and_config_tests {
         SnapshotSealing::from_secret(Some(&hex::encode([1_u8; 16])))
             .expect_err("a too-short secret must fail startup");
     }
+
+    /// `from_secret` is covered above; this is the step in front of it, and it
+    /// is the one the server actually calls. Nothing else in this file reaches
+    /// `from_config`, so a version of it that ignores what was configured —
+    /// passing `None`, swallowing the parse error, deriving from material of
+    /// its own — turns sealing off or makes it unreadable to peers while every
+    /// assertion that starts from an `ArtifactSealingKey` keeps passing. That
+    /// is the failure this pins: artifacts ship in the clear, or ship
+    /// unopenable, and the suite says nothing.
+    #[test]
+    fn the_configured_secret_is_the_one_the_node_seals_with() {
+        // Set explicitly rather than inferred from the default. `AppConfig::default`
+        // does not read the environment — only `load_config_file` pushes that
+        // layer — so the field is already `None` here, and saying so is what
+        // keeps this case from depending on that staying true.
+        let mut config = crate::cfg::AppConfig::default();
+        config.snapshot.artifact_sealing_secret = None;
+        assert!(
+            !SnapshotSealing::from_config(&config)
+                .expect("an unconfigured secret is not a startup failure")
+                .is_enabled(),
+            "an unconfigured secret must leave sealing off"
+        );
+
+        let hex = hex::encode([0x5A_u8; KEY_LEN]);
+        config.snapshot.artifact_sealing_secret = Some(hex.clone());
+        let sealing = SnapshotSealing::from_config(&config).expect("configured secret");
+        assert!(
+            sealing.is_enabled(),
+            "a configured secret must enable sealing"
+        );
+
+        // Enabled is not enough. A node sealing with anything other than the
+        // configured secret looks protected and is unopenable by every peer,
+        // which is the failure the module docs argue is worse than none — so
+        // the check is that the configured hex opens what the node sealed.
+        let sealed = seal_slice(sealing.key().expect("key"), &scope(), b"guest memory")
+            .expect("seal with the configured key");
+        assert_eq!(
+            open_slice(
+                &ArtifactSealingKey::from_hex(&hex).expect("key"),
+                &scope(),
+                &sealed
+            )
+            .expect("the configured secret must open what the node sealed"),
+            b"guest memory"
+        );
+
+        config.snapshot.artifact_sealing_secret = Some("  \n".to_string());
+        assert!(
+            !SnapshotSealing::from_config(&config)
+                .expect("a blank secret is not a startup failure")
+                .is_enabled(),
+            "a blank secret must leave sealing off"
+        );
+
+        // Right length, wrong alphabet: the shape a mistyped provisioning
+        // value takes, and it must stop the node rather than pass through.
+        config.snapshot.artifact_sealing_secret = Some("z".repeat(KEY_LEN * 2));
+        let error = SnapshotSealing::from_config(&config).expect_err("a malformed secret");
+        assert!(
+            error.to_string().contains("artifact_sealing_secret"),
+            "the error should name the setting: {error:#}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1117,6 +1182,133 @@ mod staging_tests {
         assert_eq!(
             open_slice(&key(), &scope(), &sealed).expect("open"),
             plaintext
+        );
+    }
+}
+
+/// The one-byte probe both `seal` and `open` run after the last chunk.
+///
+/// Every production reader here is a file or an in-memory slice, and those
+/// signal exhaustion with `Ok(0)`; the `UnexpectedEof` arm exists because a
+/// reader is allowed to report exhaustion that way and treating it as a
+/// failure would reject artifacts that are entirely well formed. Nothing in
+/// the suite reached either error arm, so both the arm and the discrimination
+/// it makes — this kind is the end, every other kind is a real I/O failure —
+/// went unpinned. A reader that fails on demand is the only way to reach them.
+#[cfg(test)]
+mod trailing_probe_tests {
+    use super::*;
+
+    fn key() -> ArtifactSealingKey {
+        ArtifactSealingKey::from_bytes(vec![7_u8; KEY_LEN]).expect("key")
+    }
+
+    fn scope() -> SealScope<'static> {
+        SealScope::new("snap-1", "vm_state.bin")
+    }
+
+    /// Hands out `body`, then fails every later read with `kind`.
+    struct FailsAtTheEnd {
+        body: Vec<u8>,
+        position: usize,
+        kind: io::ErrorKind,
+    }
+
+    impl FailsAtTheEnd {
+        fn new(body: Vec<u8>, kind: io::ErrorKind) -> Self {
+            Self {
+                body,
+                position: 0,
+                kind,
+            }
+        }
+    }
+
+    impl Read for FailsAtTheEnd {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let remaining = &self.body[self.position..];
+            if remaining.is_empty() {
+                return Err(io::Error::from(self.kind));
+            }
+            let taken = remaining.len().min(buffer.len());
+            buffer[..taken].copy_from_slice(&remaining[..taken]);
+            self.position += taken;
+            Ok(taken)
+        }
+    }
+
+    /// Sized to span two chunks so the probe runs after a real chunk loop
+    /// rather than after a single-chunk special case.
+    fn plaintext() -> Vec<u8> {
+        (0..DEFAULT_CHUNK_SIZE as usize + 9)
+            .map(|index| (index % 251) as u8)
+            .collect()
+    }
+
+    #[test]
+    fn an_unexpected_eof_from_the_probe_is_exhaustion_not_failure() {
+        let plaintext = plaintext();
+
+        let mut sealed = Vec::new();
+        let written = seal(
+            &key(),
+            &scope(),
+            plaintext.len() as u64,
+            &mut FailsAtTheEnd::new(plaintext.clone(), io::ErrorKind::UnexpectedEof),
+            &mut sealed,
+        )
+        .expect("a reader that reports exhaustion as UnexpectedEof still seals");
+        assert_eq!(written, plaintext.len() as u64);
+
+        let mut reopened = Vec::new();
+        open(
+            &key(),
+            &scope(),
+            &mut FailsAtTheEnd::new(sealed, io::ErrorKind::UnexpectedEof),
+            &mut reopened,
+        )
+        .expect("a reader that reports exhaustion as UnexpectedEof still opens");
+        assert_eq!(
+            reopened, plaintext,
+            "the artifact must come back whole, not short"
+        );
+    }
+
+    /// The other half of the discrimination: a genuine read failure at the
+    /// same position must not be mistaken for a clean end of stream, or a
+    /// half-read memory image is sealed as if it were the whole thing.
+    #[test]
+    fn any_other_probe_failure_is_reported_rather_than_swallowed() {
+        let plaintext = plaintext();
+
+        let mut sealed = Vec::new();
+        let error = seal(
+            &key(),
+            &scope(),
+            plaintext.len() as u64,
+            &mut FailsAtTheEnd::new(plaintext.clone(), io::ErrorKind::BrokenPipe),
+            &mut sealed,
+        )
+        .expect_err("a broken pipe at the probe is not an end of stream");
+        assert!(
+            error.to_string().contains("check for trailing plaintext"),
+            "unexpected error: {error:#}"
+        );
+
+        let sealed = seal_slice(&key(), &scope(), &plaintext).expect("seal");
+        let mut reopened = Vec::new();
+        let error = open(
+            &key(),
+            &scope(),
+            &mut FailsAtTheEnd::new(sealed, io::ErrorKind::BrokenPipe),
+            &mut reopened,
+        )
+        .expect_err("a broken pipe at the probe is not an end of stream");
+        assert!(
+            error
+                .to_string()
+                .contains("check for trailing sealed bytes"),
+            "unexpected error: {error:#}"
         );
     }
 }

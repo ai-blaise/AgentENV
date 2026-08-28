@@ -572,7 +572,18 @@ mod tests {
                 )
                 .await
                 .expect("within limit");
+            assert_eq!(controller.pending.creates.load(Ordering::Acquire), 1);
+
             guard.commit();
+
+            // Read while the guard is still alive. Once `Drop` has reconciled
+            // the counters a `commit` that did nothing looks exactly like one
+            // that worked, so the post-scope assertion below proves nothing on
+            // its own.
+            assert_eq!(controller.pending.creates.load(Ordering::Acquire), 0);
+            assert_eq!(controller.pending.cpu.load(Ordering::Acquire), 0);
+            assert_eq!(controller.pending.memory_bytes.load(Ordering::Acquire), 0);
+            assert_eq!(controller.pending.network_slots.load(Ordering::Acquire), 0);
         }
 
         assert_eq!(controller.pending.creates.load(Ordering::Acquire), 0);
@@ -678,9 +689,30 @@ mod tests {
                 .await
                 .expect("within limit");
 
+            assert_eq!(controller.pending.creates.load(Ordering::Acquire), 4);
+            assert_eq!(controller.pending.cpu.load(Ordering::Acquire), 8);
+            assert_eq!(
+                controller.pending.memory_bytes.load(Ordering::Acquire),
+                4 * 256 * 1024 * 1024
+            );
+            assert_eq!(controller.pending.network_slots.load(Ordering::Acquire), 4);
+
             // Two children registered, two failed to start.
             guard.commit_one(resources(2, 256));
             guard.commit_one(resources(2, 256));
+
+            // Each partial commit has to hand back one child's share as it
+            // happens, so that the capacity is usable again before the rest of
+            // the fork finishes. Only the live counters distinguish that from a
+            // `commit_one` that released nothing and left the whole reservation
+            // for `Drop` to return.
+            assert_eq!(controller.pending.creates.load(Ordering::Acquire), 2);
+            assert_eq!(controller.pending.cpu.load(Ordering::Acquire), 4);
+            assert_eq!(
+                controller.pending.memory_bytes.load(Ordering::Acquire),
+                2 * 256 * 1024 * 1024
+            );
+            assert_eq!(controller.pending.network_slots.load(Ordering::Acquire), 2);
         }
 
         assert_eq!(controller.pending.creates.load(Ordering::Acquire), 0);
@@ -718,8 +750,25 @@ mod tests {
                 )
                 .await
                 .expect("within limit");
-            for _ in 0..3 {
+
+            // Walked down one child at a time rather than only checked at the
+            // end: the reservation has to shrink step by step, not all at once
+            // when the guard drops.
+            for still_owed in (0..3).rev() {
                 guard.commit_one(resources(1, 128));
+                assert_eq!(
+                    controller.pending.creates.load(Ordering::Acquire),
+                    still_owed
+                );
+                assert_eq!(controller.pending.cpu.load(Ordering::Acquire), still_owed);
+                assert_eq!(
+                    controller.pending.memory_bytes.load(Ordering::Acquire),
+                    u64::from(still_owed) * 128 * 1024 * 1024
+                );
+                assert_eq!(
+                    controller.pending.network_slots.load(Ordering::Acquire),
+                    still_owed
+                );
             }
         }
 
@@ -746,6 +795,15 @@ mod tests {
             for _ in 0..5 {
                 guard.commit_one(resources(1, 128));
             }
+
+            // The first call clears the reservation; the four after it must
+            // find nothing left to give back rather than wrapping the pool.
+            // Read inside the scope, because after the drop a `commit_one`
+            // that released nothing is indistinguishable from one that did.
+            assert_eq!(controller.pending.creates.load(Ordering::Acquire), 0);
+            assert_eq!(controller.pending.cpu.load(Ordering::Acquire), 0);
+            assert_eq!(controller.pending.memory_bytes.load(Ordering::Acquire), 0);
+            assert_eq!(controller.pending.network_slots.load(Ordering::Acquire), 0);
         }
 
         assert_eq!(controller.pending.creates.load(Ordering::Acquire), 0);
@@ -759,13 +817,13 @@ mod every_limit_tests {
     use super::tests::{config, empty_metrics, resources};
     use super::*;
 
-    fn capacity(slots: usize) -> NodeCapacityInputs {
+    pub(super) fn capacity(slots: usize) -> NodeCapacityInputs {
         NodeCapacityInputs {
             available_network_slots: slots,
         }
     }
 
-    fn metrics(
+    pub(super) fn metrics(
         sandboxes: u32,
         starting: u32,
         cpu: u32,
@@ -926,6 +984,15 @@ mod every_limit_tests {
 
         guard.commit();
 
+        // The handover happens at the commit, not at the drop: the guard is
+        // still in scope here and must already owe nothing. Without this read
+        // the test passes just as happily against a `commit` that does nothing
+        // at all, since the rejection below is what an unreleased reservation
+        // produces too.
+        assert_eq!(controller.pending.creates.load(Ordering::Acquire), 0);
+        assert_eq!(controller.pending.cpu.load(Ordering::Acquire), 0);
+        assert_eq!(controller.pending.network_slots.load(Ordering::Acquire), 0);
+
         // Committed, not released: the sandboxes now exist, so a metrics
         // snapshot that reports them must still fill the gate.
         controller
@@ -934,5 +1001,83 @@ mod every_limit_tests {
             })
             .await
             .expect_err("committed creates must still occupy the limit");
+    }
+}
+
+/// The snapshot cache had no test of its own: every other test in this file
+/// feeds the same reading on every call, so the cache could be bypassed
+/// entirely, or its freshness comparison inverted, without any of them
+/// noticing.
+#[cfg(test)]
+mod metrics_cache_tests {
+    use super::every_limit_tests::{capacity, metrics};
+    use super::tests::{config, resources};
+    use super::*;
+
+    /// `metrics_snapshot` walks every sandbox under the store's read lock, so
+    /// the gate must not take a fresh one per decision — that would make it the
+    /// bottleneck under exactly the burst it exists to survive.
+    #[tokio::test]
+    async fn a_fresh_snapshot_answers_the_next_admission_without_a_second_reading() {
+        let mut config = config();
+        config.max_sandbox_count = Some(4);
+        config.snapshot_max_age_ms = 60_000;
+        let controller = AdmissionController::new(config);
+
+        let readings = Arc::new(AtomicU32::new(0));
+
+        let first = Arc::clone(&readings);
+        let _held = controller
+            .try_admit(1, resources(1, 128), capacity(64), move || async move {
+                first.fetch_add(1, Ordering::AcqRel);
+                Some(metrics(0, 0, 0, 0, 0))
+            })
+            .await
+            .expect("an idle node admits");
+
+        // A second reading would report four running sandboxes and push the
+        // total past the limit. This admission succeeding is what proves the
+        // first reading was reused rather than merely that no error occurred.
+        let second = Arc::clone(&readings);
+        let _also_held = controller
+            .try_admit(1, resources(1, 128), capacity(64), move || async move {
+                second.fetch_add(1, Ordering::AcqRel);
+                Some(metrics(4, 0, 0, 0, 0))
+            })
+            .await
+            .expect("the cached snapshot must answer inside the freshness window");
+
+        assert_eq!(
+            readings.load(Ordering::Acquire),
+            1,
+            "the store must be walked once per freshness window, not once per admission"
+        );
+    }
+
+    /// A reading that fails falls back to the last one taken. Falling back to
+    /// zeroes instead would let a node that is already full admit freely for as
+    /// long as its own metrics kept failing.
+    #[tokio::test]
+    async fn a_failed_reading_falls_back_to_the_last_snapshot_rather_than_to_zero() {
+        let mut config = config();
+        config.max_allocated_cpu = Some(8);
+        // Zero freshness, so the second admission genuinely reaches the failing
+        // reading instead of being answered from the cache.
+        config.snapshot_max_age_ms = 0;
+        let controller = AdmissionController::new(config);
+
+        let seed = controller
+            .try_admit(1, resources(1, 128), capacity(64), || async {
+                Some(metrics(0, 0, 6, 0, 0))
+            })
+            .await
+            .expect("6 allocated plus 1 requested is inside the limit of 8");
+        drop(seed);
+
+        let rejection = controller
+            .try_admit(1, resources(4, 128), capacity(64), || async { None })
+            .await
+            .expect_err("the last known 6 CPU plus 4 requested is past the limit of 8");
+        assert_eq!(rejection, AdmissionRejectReason::AllocatedCpu);
     }
 }

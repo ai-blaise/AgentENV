@@ -15,7 +15,7 @@ mod scheduler_store;
 pub use claim::{ClaimOutcome, MobilityCoordinator, ResumeFence, DEFAULT_CLAIM_TTL};
 pub use evacuation::{
     drain, plan_evacuation, DestinationCandidate, DrainBudget, DrainReport, EvacuationPlan,
-    MoveExecutor, PlannedMove, SandboxLayers, UnplaceableReason, UnplaceableSandbox,
+    MoveCancel, MoveExecutor, PlannedMove, SandboxLayers, UnplaceableReason, UnplaceableSandbox,
 };
 pub use lease::{LeaseGuardian, LeaseLost, LeasePacing, LeaseWatch, RenewOutcome};
 pub use record::{

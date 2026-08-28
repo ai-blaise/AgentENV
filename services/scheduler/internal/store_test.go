@@ -3,6 +3,8 @@ package scheduler
 import (
 	"testing"
 	"time"
+
+	dto "github.com/prometheus/client_model/go"
 )
 
 func TestBindingStoreExpiresBindingsOnLookup(t *testing.T) {
@@ -391,5 +393,165 @@ func TestReconcileFinalRosterIgnoresGrace(t *testing.T) {
 	}
 	if _, ok, _ := store.Get("sbx-fresh", base); ok {
 		t.Fatal("unregister left a freshly recorded binding pointing at a departed node")
+	}
+}
+
+// reconcileOutcomeCount reads one node's counter for one outcome. The counters
+// are process-global, so the tests below compare deltas and use node ids no
+// other test touches.
+func reconcileOutcomeCount(t *testing.T, nodeID string, outcome string) float64 {
+	t.Helper()
+	counter, err := schedulerReconcileBindingsTotal.GetMetricWithLabelValues(nodeID, outcome)
+	if err != nil {
+		t.Fatalf("read reconcile counter for %s/%s failed: %v", nodeID, outcome, err)
+	}
+	metric := &dto.Metric{}
+	if err := counter.Write(metric); err != nil {
+		t.Fatalf("write reconcile counter for %s/%s failed: %v", nodeID, outcome, err)
+	}
+	return metric.GetCounter().GetValue()
+}
+
+// TestReconcileCountsDeletesAndRetentions pins that reconcile reports what it
+// did with the bindings a roster omitted.
+//
+// A delete that beat the grace window is indistinguishable, from inside the
+// process, from a sandbox that legitimately went away: both leave no binding,
+// no error and no log line. The per-node split between deletes and retentions
+// is the only thing that separates a fleet whose grace covers its roster
+// latency from one whose grace is quietly too short.
+func TestReconcileCountsDeletesAndRetentions(t *testing.T) {
+	store := NewInMemoryBindingStore(time.Minute)
+	node := Node{ID: "node-reconcile-counts", Endpoint: "http://node-a"}
+	base := time.Unix(800, 0)
+	now := base.Add(2 * defaultReconcileGracePeriod)
+
+	// Two deletable against one retained. With one of each the labels are
+	// interchangeable and swapping them at the recording sites stays green,
+	// which makes the metric worse than absent: it would report deletes as
+	// retentions.
+	store.Record("sbx-old", node, base)
+	store.Record("sbx-older", node, base)
+	store.Record("sbx-fresh", node, now)
+
+	deletedBefore := reconcileOutcomeCount(t, node.ID, reconcileOutcomeDeleted)
+	retainedBefore := reconcileOutcomeCount(t, node.ID, reconcileOutcomeRetained)
+
+	if err := store.ReconcileNode(node, []string{"sbx-reported"}, now); err != nil {
+		t.Fatalf("ReconcileNode: %v", err)
+	}
+
+	if got := reconcileOutcomeCount(t, node.ID, reconcileOutcomeDeleted) - deletedBefore; got != 2 {
+		t.Fatalf("delete count rose by %v, want 2", got)
+	}
+	if got := reconcileOutcomeCount(t, node.ID, reconcileOutcomeRetained) - retainedBefore; got != 1 {
+		t.Fatalf("retention count rose by %v, want 1", got)
+	}
+}
+
+// TestReconcileCountsDeletesFromEmptyRoster covers the branch an authoritative
+// empty roster takes, which deletes without ever consulting the desired set and
+// so counts at a different site.
+func TestReconcileCountsDeletesFromEmptyRoster(t *testing.T) {
+	store := NewInMemoryBindingStore(time.Minute)
+	node := Node{ID: "node-empty-roster-counts", Endpoint: "http://node-a"}
+	base := time.Unix(900, 0)
+	now := base.Add(2 * defaultReconcileGracePeriod)
+
+	// Distinct counts per label, for the reason given above.
+	store.Record("sbx-old", node, base)
+	store.Record("sbx-older", node, base)
+	store.Record("sbx-fresh", node, now)
+
+	deletedBefore := reconcileOutcomeCount(t, node.ID, reconcileOutcomeDeleted)
+	retainedBefore := reconcileOutcomeCount(t, node.ID, reconcileOutcomeRetained)
+
+	if err := store.ReconcileNodeRoster(node, nil, RosterComplete, now); err != nil {
+		t.Fatalf("ReconcileNodeRoster: %v", err)
+	}
+
+	if got := reconcileOutcomeCount(t, node.ID, reconcileOutcomeDeleted) - deletedBefore; got != 2 {
+		t.Fatalf("delete count rose by %v, want 2", got)
+	}
+	if got := reconcileOutcomeCount(t, node.ID, reconcileOutcomeRetained) - retainedBefore; got != 1 {
+		t.Fatalf("retention count rose by %v, want 1", got)
+	}
+}
+
+// TestValidateReconcileGraceRejectsGraceAtOrPastBindingTTL pins the far end of
+// the range. Equal is not a harmless boundary: a grace that reaches the TTL
+// protects a binding for longer than the TTL itself, so a sandbox created and
+// deleted inside one TTL can only be reaped by expiry. It is a narrower claim
+// than "reconcile can never delete anything" — recordedAt is not restamped on
+// refresh, so a long-lived binding does age out of the grace and reconcile can
+// still reap it.
+func TestValidateReconcileGraceRejectsGraceAtOrPastBindingTTL(t *testing.T) {
+	const ttl = 30 * time.Second
+
+	if err := ValidateReconcileGrace(ttl, ttl, 0); err == nil {
+		t.Fatal("a grace equal to the binding ttl was accepted")
+	}
+	if err := ValidateReconcileGrace(ttl, ttl+time.Second, 0); err == nil {
+		t.Fatal("a grace longer than the binding ttl was accepted")
+	}
+	if err := ValidateReconcileGrace(ttl, ttl-time.Second, 0); err != nil {
+		t.Fatalf("a grace shorter than the binding ttl was rejected: %v", err)
+	}
+}
+
+// TestValidateReconcileGraceRejectsGraceShorterThanReportingWindow pins the
+// near end. The grace has to outlast the reporting cycle it is protecting
+// against, including one retry of the heartbeat that carries the roster.
+func TestValidateReconcileGraceRejectsGraceShorterThanReportingWindow(t *testing.T) {
+	const interval = 5 * time.Second
+	// Written out rather than derived from minReconcileGraceHeartbeats. Deriving
+	// it makes the test agree with whatever the constant says, so weakening the
+	// constant — the direction that removes the protection — keeps it green.
+	const minimum = 10 * time.Second
+
+	if err := ValidateReconcileGrace(time.Minute, minimum-time.Millisecond, interval); err == nil {
+		t.Fatalf("a grace of %s was accepted against a %s reporting interval", minimum-time.Millisecond, interval)
+	}
+	if err := ValidateReconcileGrace(time.Minute, minimum, interval); err != nil {
+		t.Fatalf("a grace of exactly %s was rejected: %v", minimum, err)
+	}
+	// With no configured interval there is nothing to check the grace against,
+	// which is the shipped case: scheduler.heartbeat_interval is optional.
+	if err := ValidateReconcileGrace(time.Minute, time.Millisecond, 0); err != nil {
+		t.Fatalf("an unconfigured reporting interval rejected a short grace: %v", err)
+	}
+}
+
+// TestBindingStoreOptionsAcceptShippedDefaults pins that the ordering check does
+// not reject the configuration the service ships with: a 30s binding TTL, the
+// default grace, and the 5s interval nodes report at. A check that a correct
+// deployment fails is a check that gets deleted, not a deployment that gets
+// fixed.
+func TestBindingStoreOptionsAcceptShippedDefaults(t *testing.T) {
+	store, err := NewInMemoryBindingStoreWithOptions(BindingStoreOptions{
+		BindingTTL:        30 * time.Second,
+		HeartbeatInterval: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("shipped defaults were rejected: %v", err)
+	}
+	if store.bindingTTL != 30*time.Second {
+		t.Fatalf("binding ttl = %s, want 30s", store.bindingTTL)
+	}
+	if store.reconcileGrace != defaultReconcileGracePeriod {
+		t.Fatalf("reconcile grace = %s, want %s", store.reconcileGrace, defaultReconcileGracePeriod)
+	}
+}
+
+// TestNewInMemoryBindingStoreWithOptionsRejectsUnusableGrace covers a caller
+// that lowers the binding TTL and leaves the grace alone, which is how the two
+// end up crossed in practice.
+func TestNewInMemoryBindingStoreWithOptionsRejectsUnusableGrace(t *testing.T) {
+	store, err := NewInMemoryBindingStoreWithOptions(BindingStoreOptions{BindingTTL: 5 * time.Second})
+	if err == nil {
+		t.Fatalf("a 5s binding ttl with the %s default grace was accepted", defaultReconcileGracePeriod)
+	}
+	if store != nil {
+		t.Fatal("a rejected configuration still returned a store")
 	}
 }

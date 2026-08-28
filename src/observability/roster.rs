@@ -160,7 +160,11 @@ pub fn roster_digest(sandbox_ids: &[SandboxId]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::observability::reporter::HeartbeatNodeNotConfigured;
+    use crate::observability::ObservabilityReporter;
 
     fn ids(count: usize) -> Vec<SandboxId> {
         (0..count).map(|_| SandboxId::new()).collect()
@@ -293,6 +297,42 @@ mod tests {
             state.report(&roster, true).sandbox_ids.is_some(),
             "a reconnected node must reintroduce itself"
         );
+    }
+
+    /// The same reintroduction, on the path where the scheduler answers rather
+    /// than goes away. It rejects the heartbeat inside its own node lookup,
+    /// before anything resolves the roster, so it kept none of the ids — and
+    /// because the call returns an error there is no response to renew or
+    /// withdraw the permission to elide, which `report` has already acted on by
+    /// stamping the roster as acknowledged.
+    ///
+    /// Driven through the reporter because that is where the invariant is
+    /// enforced: a heartbeat error of any kind has to forget the acknowledgement.
+    #[test]
+    fn a_rejected_heartbeat_resends_the_roster() {
+        for err in [
+            anyhow::Error::new(HeartbeatNodeNotConfigured),
+            anyhow::anyhow!("connection reset by peer"),
+        ] {
+            let mut state = accepted();
+            let roster = ids(3);
+            state.report(&roster, true);
+            assert_eq!(state.report(&roster, true).sandbox_ids, None);
+
+            ObservabilityReporter::record_heartbeat_failure(
+                &err,
+                &mut state,
+                "node-a",
+                "http://scheduler:9090",
+                Duration::from_secs(5),
+            );
+
+            assert!(
+                state.report(&roster, true).sandbox_ids.is_some(),
+                "a roster no scheduler acknowledged must go out again, not be \
+                 elided after {err}"
+            );
+        }
     }
 
     /// A rollout or rollback puts an older scheduler in front of a node that

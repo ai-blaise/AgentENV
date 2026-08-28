@@ -22,12 +22,20 @@
 //! Among compatible destinations, the one with the most room left wins. A
 //! drain that packs destinations tight converts one node's problem into
 //! several nodes' problems, and the next drain has nowhere to go at all.
+//!
+//! # Stopping a move
+//!
+//! A move that overruns is asked to stop; it is never dropped. A migration
+//! holds a claim and a half-built guest on the destination and gives them up
+//! in a fixed order, and a dropped future runs none of that — see
+//! [`MoveCancel`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
+use tokio::sync::watch;
 use tracing::{info, warn};
 
 use super::record::{MobilityRecord, MobilityState};
@@ -241,14 +249,79 @@ fn choose_destination(
     }
 }
 
+/// A request to stop a move, which the move itself can see.
+///
+/// A migration owns a claim and a half-restored guest on the destination, and
+/// it gives them up in a fixed order so that every failure leaves exactly one
+/// node owning the sandbox. Dropping its future — which is what
+/// `tokio::time::timeout` does when it elapses — stops it at whichever await
+/// it was suspended at and runs none of that: the partial restore stays up on
+/// the destination, the claim is never released, and once the claim lapses the
+/// origin resumes a sandbox the destination is still holding open. Two live
+/// copies, arrived at by a timeout rather than by any step failing.
+///
+/// So a drain asks, and the move unwinds itself through its own compensations.
+#[derive(Clone, Debug)]
+pub struct MoveCancel {
+    requested: Arc<watch::Sender<bool>>,
+}
+
+impl MoveCancel {
+    pub fn new() -> Self {
+        Self {
+            requested: Arc::new(watch::channel(false).0),
+        }
+    }
+
+    /// Asks the move to stop. Idempotent, and cheap enough to call on a move
+    /// that has already finished.
+    pub fn request(&self) {
+        self.requested.send_replace(true);
+    }
+
+    /// Whether a stop has already been asked for.
+    pub fn is_requested(&self) -> bool {
+        *self.requested.borrow()
+    }
+
+    /// Resolves once a stop has been asked for, and stays resolved.
+    ///
+    /// Meant for an arm of a `select!` inside the move, alongside the work
+    /// that has to be unwound.
+    pub async fn requested(&self) {
+        let mut rx = self.requested.subscribe();
+        loop {
+            if *rx.borrow_and_update() {
+                return;
+            }
+            // The sender lives in this handle, so the only way `changed`
+            // fails is a shutdown that has already taken the move with it.
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+impl Default for MoveCancel {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Performs one planned move.
 ///
 /// A migration is driven by the destination, so an implementation here is
 /// whatever asks the destination to claim and restore. It is a trait so the
 /// drain's bounds can be exercised without a fleet.
+///
+/// An implementation must watch `cancel` at every point it can still unwind
+/// from, and must not treat it as a licence to return early with work half
+/// done: the drain stops waiting for a move that overruns, so an executor
+/// that ignores the request leaves the sandbox owned by nobody.
 #[async_trait::async_trait]
 pub trait MoveExecutor: Send + Sync {
-    async fn execute(&self, planned: &PlannedMove) -> anyhow::Result<()>;
+    async fn execute(&self, planned: &PlannedMove, cancel: &MoveCancel) -> anyhow::Result<()>;
 }
 
 /// How hard a drain is allowed to push.
@@ -266,8 +339,14 @@ pub struct DrainBudget {
     /// unreachable repository, a fleet-wide version skew — burns the whole
     /// plan discovering the same thing once per sandbox.
     pub max_failures: usize,
-    /// Ceiling on one move.
+    /// Ceiling on one move, after which it is asked to stop.
     pub move_timeout: Duration,
+    /// How long a move gets to unwind once it has been asked to stop.
+    ///
+    /// Past this the drain stops waiting, but it still does not sever the
+    /// move: an unwind that is merely slow is left to finish, because the
+    /// alternative is dropping a migration between its compensations.
+    pub unwind_grace: Duration,
 }
 
 impl Default for DrainBudget {
@@ -276,6 +355,9 @@ impl Default for DrainBudget {
             max_concurrent: 4,
             max_failures: 3,
             move_timeout: Duration::from_secs(300),
+            // An unwind is a teardown and two store writes, so this is
+            // generous. It is a bound on a failing path, not a target.
+            unwind_grace: Duration::from_secs(30),
         }
     }
 }
@@ -294,6 +376,55 @@ pub struct DrainReport {
     pub stopped_early: bool,
 }
 
+/// Runs one move, bounded but never severed.
+///
+/// The move runs on its own task so that the drain giving up on it is a
+/// decision to stop *waiting*. Dropping the future instead would cancel the
+/// migration wherever it happened to be suspended, which skips the
+/// compensations that make a failed migration leave exactly one owner.
+async fn run_move(
+    executor: Arc<dyn MoveExecutor>,
+    planned: PlannedMove,
+    cancel: MoveCancel,
+    budget: DrainBudget,
+) -> anyhow::Result<()> {
+    let mut task = tokio::spawn({
+        let cancel = cancel.clone();
+        async move { executor.execute(&planned, &cancel).await }
+    });
+
+    // Both awaits take the handle by reference: a `JoinHandle` dropped at the
+    // end of this function detaches its task rather than aborting it, and a
+    // move still unwinding then gets to finish.
+    let joined = match tokio::time::timeout(budget.move_timeout, &mut task).await {
+        Ok(joined) => joined,
+        Err(_) => {
+            cancel.request();
+            let unwound = tokio::time::timeout(budget.unwind_grace, &mut task)
+                .await
+                .is_ok();
+            // A failure either way: the move overran its ceiling and was
+            // asked to give the sandbox back. Reported as a timeout rather
+            // than as whatever the unwind returned, because what the drain
+            // knows is that it stopped the move, not why it was slow.
+            return Err(if unwound {
+                anyhow::anyhow!(
+                    "move timed out after {:?} and was unwound",
+                    budget.move_timeout
+                )
+            } else {
+                anyhow::anyhow!(
+                    "move timed out after {:?} and had not unwound {:?} later; it is still running",
+                    budget.move_timeout,
+                    budget.unwind_grace
+                )
+            });
+        }
+    };
+
+    joined.unwrap_or_else(|error| Err(anyhow::anyhow!("the move panicked: {error}")))
+}
+
 /// Executes a plan under `budget`.
 pub async fn drain(
     plan: &EvacuationPlan,
@@ -302,20 +433,17 @@ pub async fn drain(
 ) -> DrainReport {
     let mut report = DrainReport::default();
     let concurrency = budget.max_concurrent.max(1);
+    let cancels: Vec<MoveCancel> = plan.moves.iter().map(|_| MoveCancel::new()).collect();
 
     let mut results = stream::iter(plan.moves.iter().enumerate())
         .map(|(index, planned)| {
             let executor = Arc::clone(&executor);
+            let cancel = cancels[index].clone();
+            let sandbox_id = planned.sandbox_id;
+            let planned = planned.clone();
             async move {
-                let outcome = tokio::time::timeout(budget.move_timeout, executor.execute(planned))
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(anyhow::anyhow!(
-                            "move timed out after {:?}",
-                            budget.move_timeout
-                        ))
-                    });
-                (index, planned.sandbox_id, outcome)
+                let outcome = run_move(executor, planned, cancel, budget).await;
+                (index, sandbox_id, outcome)
             }
         })
         .buffer_unordered(concurrency);
@@ -335,12 +463,24 @@ pub async fn drain(
             break;
         }
     }
+
     drop(results);
 
     if report.stopped_early {
+        // The moves still in flight are asked to stop for the same reason a
+        // move that overran its ceiling is: the drain is no longer waiting on
+        // them, and a migration nobody is waiting for still has to put the
+        // sandbox back somewhere. Requests to moves that already finished, or
+        // that never started, do nothing.
+        for (cancel, attempted) in cancels.iter().zip(attempted.iter()) {
+            if !*attempted {
+                cancel.request();
+            }
+        }
+
         // Everything the stream had not yet delivered is unattempted. Moves
-        // still in flight when the budget ran out are counted here too: their
-        // outcome was dropped with the stream, so claiming either result would
+        // still in flight when the budget ran out are counted here too: the
+        // drain has stopped waiting on them, so claiming either result would
         // be a guess.
         report.not_attempted = plan
             .moves
@@ -374,7 +514,7 @@ mod tests {
     use crate::virtualization::VirtualizationMode;
     use std::sync::Mutex;
 
-    fn fingerprint(kernel: &str) -> MigrationFingerprint {
+    pub(super) fn fingerprint(kernel: &str) -> MigrationFingerprint {
         MigrationFingerprint::from_runtime(
             &SnapshotRuntimeVersions {
                 kernel_version: kernel.to_string(),
@@ -389,7 +529,7 @@ mod tests {
         )
     }
 
-    fn record(memory_mib: u32, kernel: &str) -> MobilityRecord {
+    pub(super) fn record(memory_mib: u32, kernel: &str) -> MobilityRecord {
         let metadata = SandboxMetadata {
             runtime_versions: SnapshotRuntimeVersions {
                 kernel_version: kernel.to_string(),
@@ -483,6 +623,71 @@ mod tests {
             vec!["node-b", "node-c"],
             "the second sandbox should follow the reservation, not repeat the first choice"
         );
+    }
+
+    /// The rule itself, rather than its consequence for a second sandbox: of
+    /// two compatible destinations the emptier one wins.
+    ///
+    /// Scanned both ways round because one order proves nothing. The scan
+    /// keeps a running best, so an inverted comparison still lands on the
+    /// right node whenever that node happened to be seen first.
+    #[test]
+    fn the_emptiest_compatible_destination_wins_whichever_order_it_is_scanned_in() {
+        for candidates in [
+            vec![
+                candidate("node-b", 4096, "k1"),
+                candidate("node-c", 8192, "k1"),
+            ],
+            vec![
+                candidate("node-c", 8192, "k1"),
+                candidate("node-b", 4096, "k1"),
+            ],
+        ] {
+            let order: Vec<&str> = candidates
+                .iter()
+                .map(|candidate| candidate.node_id.as_str())
+                .collect();
+            let plan = plan_evacuation(&[record(1024, "k1")], &candidates, &no_layers());
+
+            assert_eq!(plan.moves.len(), 1, "scanned as {order:?}");
+            assert_eq!(
+                plan.moves[0].to_node_id, "node-c",
+                "the emptier node must win, scanned as {order:?}"
+            );
+        }
+    }
+
+    /// Equal room is broken by the lower node id, so the same fleet plans the
+    /// same way however it was listed.
+    ///
+    /// Both orders again, and for a sharper reason: a comparison that lets an
+    /// equally-empty candidate displace the incumbent gives the sandbox to
+    /// whichever node was scanned last, which is the right answer in exactly
+    /// one of these two orders.
+    #[test]
+    fn destinations_with_equal_room_are_broken_by_the_lower_node_id() {
+        for candidates in [
+            vec![
+                candidate("node-b", 8192, "k1"),
+                candidate("node-c", 8192, "k1"),
+            ],
+            vec![
+                candidate("node-c", 8192, "k1"),
+                candidate("node-b", 8192, "k1"),
+            ],
+        ] {
+            let order: Vec<&str> = candidates
+                .iter()
+                .map(|candidate| candidate.node_id.as_str())
+                .collect();
+            let plan = plan_evacuation(&[record(1024, "k1")], &candidates, &no_layers());
+
+            assert_eq!(plan.moves.len(), 1, "scanned as {order:?}");
+            assert_eq!(
+                plan.moves[0].to_node_id, "node-b",
+                "a tie must go to the lower id, scanned as {order:?}"
+            );
+        }
     }
 
     /// The plan must not over-commit: reserving as it goes is the difference
@@ -612,7 +817,7 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MoveExecutor for ScriptedExecutor {
-        async fn execute(&self, planned: &PlannedMove) -> anyhow::Result<()> {
+        async fn execute(&self, planned: &PlannedMove, _cancel: &MoveCancel) -> anyhow::Result<()> {
             if let Some(delay) = self.delay {
                 tokio::time::sleep(delay).await;
             }
@@ -686,7 +891,9 @@ mod tests {
     }
 
     /// A move that hangs must not hold the drain open forever; the budget is
-    /// what makes a drain something an operator can wait on.
+    /// what makes a drain something an operator can wait on. This executor
+    /// never looks at the request to stop, which is the case the unwind grace
+    /// bounds.
     #[tokio::test]
     async fn a_hung_move_is_timed_out_and_counted_as_a_failure() {
         let plan = plan_of(1);
@@ -696,12 +903,18 @@ mod tests {
         });
         let budget = DrainBudget {
             move_timeout: Duration::from_millis(50),
+            unwind_grace: Duration::from_millis(50),
             ..DrainBudget::default()
         };
 
         let report = drain(&plan, executor, budget).await;
         assert_eq!(report.failed.len(), 1);
         assert!(report.failed[0].1.contains("timed out"));
+        assert!(
+            report.failed[0].1.contains("still running"),
+            "an executor that ignores the request is reported as such: {}",
+            report.failed[0].1
+        );
     }
 
     /// Concurrency is what keeps a drain from competing with the live traffic
@@ -717,7 +930,11 @@ mod tests {
 
         #[async_trait::async_trait]
         impl MoveExecutor for CountingExecutor {
-            async fn execute(&self, _planned: &PlannedMove) -> anyhow::Result<()> {
+            async fn execute(
+                &self,
+                _planned: &PlannedMove,
+                _cancel: &MoveCancel,
+            ) -> anyhow::Result<()> {
                 let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                 self.peak.fetch_max(current, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -741,6 +958,149 @@ mod tests {
             executor.peak.load(Ordering::SeqCst) <= 3,
             "peaked at {}",
             executor.peak.load(Ordering::SeqCst)
+        );
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::tests::{fingerprint, record};
+    use super::*;
+    use crate::orchestrator::mobility::claim::MobilityCoordinator;
+    use crate::orchestrator::mobility::record::{LocalMobilityStore, MobilityStore};
+    use crate::orchestrator::mobility::saga::{MigrationOutcome, MigrationSaga, MigrationSteps};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A restore that gets as far as holding the sandbox's state open on the
+    /// destination and then makes no further progress. This is where a
+    /// per-move timeout finds a real migration: the expensive step, with the
+    /// destination already committed to devices it has to give back.
+    struct HangingRestore {
+        entered_restore: Arc<AtomicBool>,
+        held_by_destination: Arc<AtomicBool>,
+        discarded: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl MigrationSteps for HangingRestore {
+        async fn restore(&self, _record: &MobilityRecord) -> anyhow::Result<()> {
+            self.entered_restore.store(true, Ordering::SeqCst);
+            self.held_by_destination.store(true, Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Ok(())
+        }
+
+        async fn discard_restored(&self, _record: &MobilityRecord) -> anyhow::Result<()> {
+            self.held_by_destination.store(false, Ordering::SeqCst);
+            self.discarded.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn release_origin_state(&self, _record: &MobilityRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What a drain executes in production: the migration saga, on behalf of
+    /// the destination.
+    struct SagaExecutor {
+        saga: MigrationSaga<LocalMobilityStore>,
+        host: MigrationFingerprint,
+    }
+
+    #[async_trait::async_trait]
+    impl MoveExecutor for SagaExecutor {
+        async fn execute(&self, planned: &PlannedMove, cancel: &MoveCancel) -> anyhow::Result<()> {
+            match self
+                .saga
+                .migrate(&planned.sandbox_id, &self.host, &[], &[], cancel)
+                .await?
+            {
+                MigrationOutcome::Migrated => Ok(()),
+                other => anyhow::bail!("the migration did not complete: {other:?}"),
+            }
+        }
+    }
+
+    /// The per-move timeout used to drop the migration's future, which stops
+    /// it at whichever await it was suspended at. Every compensation in the
+    /// saga is a step it has to *run*, so none of them did: the destination
+    /// kept the half-restored sandbox open and the claim was never released,
+    /// and once that claim lapsed the origin was free to resume a sandbox the
+    /// destination still had. Two live owners, reached by a timeout rather
+    /// than by any step failing.
+    #[tokio::test]
+    async fn a_move_that_overruns_leaves_exactly_one_owner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalMobilityStore::open(dir.path().join("mobility"))
+            .await
+            .expect("open store");
+        let paused = record(2048, "k1");
+        store.upsert(&paused).await.expect("seed record");
+
+        let entered_restore = Arc::new(AtomicBool::new(false));
+        let held_by_destination = Arc::new(AtomicBool::new(false));
+        let discarded = Arc::new(AtomicBool::new(false));
+        let ttl = Duration::from_secs(30);
+        let saga = MigrationSaga::new(
+            Arc::new(MobilityCoordinator::new(store.clone(), "node-b").with_claim_ttl(ttl)),
+            Arc::new(HangingRestore {
+                entered_restore: Arc::clone(&entered_restore),
+                held_by_destination: Arc::clone(&held_by_destination),
+                discarded: Arc::clone(&discarded),
+            }),
+        )
+        .with_claim_ttl(ttl);
+
+        let plan = EvacuationPlan {
+            moves: vec![PlannedMove {
+                sandbox_id: paused.sandbox_id,
+                to_node_id: "node-b".to_string(),
+                resources: paused.resources,
+            }],
+            unplaceable: Vec::new(),
+        };
+        let report = drain(
+            &plan,
+            Arc::new(SagaExecutor {
+                saga,
+                host: fingerprint("k1"),
+            }),
+            DrainBudget {
+                move_timeout: Duration::from_millis(300),
+                unwind_grace: Duration::from_secs(5),
+                ..DrainBudget::default()
+            },
+        )
+        .await;
+
+        assert!(
+            entered_restore.load(Ordering::SeqCst),
+            "the timeout has to land mid-restore or this test proves nothing"
+        );
+        assert_eq!(report.failed.len(), 1, "an overrun move is a failed move");
+        assert!(
+            report.failed[0].1.contains("timed out"),
+            "unexpected failure: {}",
+            report.failed[0].1
+        );
+        assert!(
+            discarded.load(Ordering::SeqCst),
+            "the timeout must unwind the saga through its compensations"
+        );
+        assert!(
+            !held_by_destination.load(Ordering::SeqCst),
+            "the destination must not be left holding a sandbox it half-restored"
+        );
+        assert_eq!(
+            store
+                .get(&paused.sandbox_id)
+                .await
+                .expect("get")
+                .expect("record")
+                .state,
+            MobilityState::Parked,
+            "the claim must be given back, leaving the origin the sandbox's only owner"
         );
     }
 }

@@ -92,20 +92,32 @@ func TestSkewOldNodeReportsNoEventCount(t *testing.T) {
 }
 
 // An older node reports no heartbeat interval. The scheduler must not validate
-// its TTL ordering against a zero it invented.
+// its TTL ordering against a zero it invented — a zero interval would make
+// every TTL too short and take the node's permission to elide away for a field
+// it does not know exists.
 func TestSkewOldNodeReportsNoHeartbeatInterval(t *testing.T) {
-	service, _ := skewService(t)
+	// A TTL far too short for any interval a node could report, so the check
+	// would fail if it ran at all.
+	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, time.Minute)
+	store := NewInMemoryBindingStoreWithGrace(time.Millisecond, 0)
+	service := NewService(nil, registry, NewStrategy("round_robin"), store, WithBindingTTL(time.Millisecond))
 
 	beat := readyHeartbeat("node-a")
 	beat.HeartbeatIntervalMs = 0
-	if _, err := service.Heartbeat(context.Background(), beat); err != nil {
+	response, err := service.Heartbeat(context.Background(), beat)
+	if err != nil {
 		t.Fatalf("a heartbeat without an interval must be accepted: %v", err)
+	}
+	if !response.GetRosterDigestAccepted() {
+		t.Fatal("an absent interval must read as \"older node\", not as a violated TTL ordering")
 	}
 }
 
-// A new scheduler always advertises that it understands digests, which is what
-// lets a node start eliding. It must do so even on the very first heartbeat
-// from a node it has never seen, or no node would ever begin.
+// A new scheduler advertises that it understands digests, which is what lets a
+// node start eliding. It must do so on the very first heartbeat from a node it
+// has never seen, or no node would ever begin. The one thing that withholds it
+// is a TTL that cannot cover a skipped round; nothing about the node being new
+// does.
 func TestSkewNewSchedulerAlwaysAdvertisesDigestSupport(t *testing.T) {
 	service, _ := skewService(t)
 

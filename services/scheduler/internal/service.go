@@ -40,6 +40,13 @@ type Service struct {
 	candidateSampleSize int
 	// rosters lets a node skip resending an unchanged sandbox roster.
 	rosters *rosterCache
+	// bindingTTL mirrors the TTL the binding store was built with. The store
+	// does not expose it, and resolveRoster needs it to judge whether a node's
+	// reported heartbeat interval leaves room for a skipped reconcile round.
+	bindingTTL time.Duration
+	// ttlOrderingWarned keeps a misordered TTL from being logged on every
+	// heartbeat of every node that reports one.
+	ttlOrderingWarned *nodeWarnSet
 	// eventLoss turns silently dropped lifecycle event batches into a number.
 	eventLoss *eventLossTracker
 	// sweepMu guards lastSweep, which paces the departed-node sweep.
@@ -67,6 +74,8 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		ledger:              NewReservationLedger(0),
 		candidateSampleSize: defaultCandidateSampleSize,
 		rosters:             newRosterCache(),
+		bindingTTL:          defaultBindingTTL,
+		ttlOrderingWarned:   newNodeWarnSet(),
 		eventLoss:           newEventLossTracker(),
 		mobility:            NewInMemoryMobilityStore(),
 		store:               store,
@@ -114,6 +123,20 @@ func WithReportTTL(ttl time.Duration) ServiceOption {
 	return func(s *Service) {
 		if ttl > 0 {
 			s.reportTTL = ttl
+		}
+	}
+}
+
+// WithBindingTTL tells the service the TTL its binding store was built with.
+//
+// The store owns the value and does not report it, but the service is the only
+// place that sees what interval each node heartbeats at, so the two have to be
+// brought together here. Left unset it assumes the store's own default, which
+// is what a store built with a non-positive TTL falls back to.
+func WithBindingTTL(ttl time.Duration) ServiceOption {
+	return func(s *Service) {
+		if ttl > 0 {
+			s.bindingTTL = ttl
 		}
 	}
 }
@@ -424,23 +447,76 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 	return &schedulerv1.HeartbeatResponse{
 		CpuConfigJson:        cpuConfigJSON,
 		RequestFullRoster:    requestFullRoster,
-		RosterDigestAccepted: true,
+		RosterDigestAccepted: s.mayElideRoster(nodeID, req.GetHeartbeatIntervalMs()),
 	}, nil
+}
+
+// maxReportedHeartbeatIntervalMs bounds what a node's reported interval is
+// allowed to be before it is treated as the largest interval worth reasoning
+// about. The node converts its own interval with a saturating cast, so a
+// misconfigured one arrives as something no TTL could ever be ordered against;
+// clamping keeps the arithmetic below from overflowing without changing the
+// answer, which is "too short" either way.
+const maxReportedHeartbeatIntervalMs = uint64(24 * 60 * 60 * 1000)
+
+// mayElideRoster reports whether this node may keep eliding its roster.
+//
+// Eliding costs one unreconciled round whenever the scheduler cannot resolve
+// the digest, which is only free while the binding TTL outlives the gap. Where
+// it does not, the permission is withheld rather than the risk taken: a node
+// that never elides sends more bytes, whereas a node that elides into a TTL
+// too short to cover the miss loses bindings it still owns.
+//
+// Withholding works because the permission is not latched — the node reads it
+// from the most recent response — so it takes effect on the next heartbeat and
+// is given back the moment the ordering holds again.
+//
+// Zero means the node did not report an interval. That is an older node, not a
+// node heartbeating infinitely fast, so there is nothing to check and nothing
+// to withhold.
+func (s *Service) mayElideRoster(nodeID string, intervalMs uint64) bool {
+	if intervalMs == 0 {
+		return true
+	}
+	if intervalMs > maxReportedHeartbeatIntervalMs {
+		intervalMs = maxReportedHeartbeatIntervalMs
+	}
+	interval := time.Duration(intervalMs) * time.Millisecond
+	minimum := config.MinTTLForHeartbeatInterval(interval)
+	if s.bindingTTL >= minimum {
+		return true
+	}
+	if s.ttlOrderingWarned.mark(nodeID) {
+		s.logger.Warn("scheduler binding TTL is too short for a node's heartbeat interval",
+			zap.String("node_id", nodeID),
+			zap.Duration("heartbeat_interval", interval),
+			zap.Duration("binding_ttl", s.bindingTTL),
+			zap.Duration("required_binding_ttl", minimum),
+		)
+	}
+	return false
 }
 
 // resolveRoster returns the roster to reconcile against, or asks for it back.
 //
-// A node that sent its roster is authoritative and its digest is cached. A
-// node that elided it is served from the cache, so bindings are still
-// refreshed and only the wire cost is saved. A digest the scheduler cannot
-// resolve — it restarted, or the roster changed and the node has not caught up
-// — means nothing is reconciled this round and the roster is requested back:
-// an elided roster and an empty one look identical on the wire and mean
-// opposite things, and guessing wrong deletes a node's entire data plane.
+// A node that sent its roster is authoritative, and its digest is cached once
+// the ids it arrived with are shown to produce it. A node that elided it is
+// served from the cache, so bindings are still refreshed and only the wire
+// cost is saved. A digest the scheduler cannot resolve — it restarted, the
+// roster changed and the node has not caught up, or the heartbeat that would
+// have cached it contradicted itself — means nothing is reconciled this round
+// and the roster is requested back: an elided roster and an empty one look
+// identical on the wire and mean opposite things, and guessing wrong deletes a
+// node's entire data plane.
 //
-// Skipping one round is safe because the binding TTL is required to be several
-// heartbeats long, which the registry validates against the node's reported
-// interval.
+// Skipping one round costs nothing only while the binding TTL outlives the
+// gap. The rule is stated in config.validateSchedulerTTLOrdering — binding_ttl
+// at least three heartbeat intervals — but that check is opt-in: it runs only
+// when the operator sets scheduler.heartbeat_interval, which no shipped config
+// does, so on a real deployment nothing has verified the relation. What holds
+// it up here is mayElideRoster, which re-checks the same relation on every
+// heartbeat against the interval the node reports and takes the permission to
+// elide away from a node the TTL cannot cover.
 //
 // The completeness to reconcile with is returned rather than taken from the
 // caller, because an elided heartbeat carries none. A node that elides sets
@@ -458,8 +534,21 @@ func (s *Service) resolveRoster(
 
 	// No digest, or the roster came along anyway: the wire is authoritative.
 	if digest == "" || req.GetRosterFull() {
-		if digest != "" {
-			s.rosters.remember(nodeID, digest, req.GetSandboxIds(), completeness == RosterComplete)
+		if digest != "" && !s.rosters.remember(nodeID, digest, req.GetSandboxIds(), completeness == RosterComplete) {
+			// The ids and the digest describe different rosters, so the
+			// heartbeat contradicts itself and neither half can be acted on:
+			// caching would key a roster the node never sent to a digest it
+			// will keep sending, and reconciling would apply that same roster
+			// now. Ask for it again instead — a node that repeats the
+			// contradiction never gets its roster reconciled, which is loud,
+			// where a believed one is silent.
+			s.logger.Warn("scheduler received a roster that does not match its digest",
+				zap.String("node_id", nodeID),
+				zap.String("roster_digest", digest),
+				zap.Int("sandbox_ids", len(req.GetSandboxIds())),
+			)
+			schedulerRosterFullRequestTotal.Inc()
+			return nil, completeness, true
 		}
 		return req.GetSandboxIds(), completeness, false
 	}
@@ -482,13 +571,53 @@ func (s *Service) resolveRoster(
 	// elided "no ids here to speak for" undo what its full roster established,
 	// and every elided round would stop reaping.
 	if completeness == RosterComplete && !cachedComplete {
-		s.rosters.remember(nodeID, digest, cached, true)
+		s.rosters.markComplete(nodeID, digest)
 		cachedComplete = true
 	}
 	if cachedComplete {
 		return cached, RosterComplete, false
 	}
 	return cached, RosterIncomplete, false
+}
+
+// nodeWarnSet remembers which nodes a condition has already been reported for.
+//
+// The conditions it guards are configuration rather than events: once true for
+// a node they are true on every heartbeat it sends, and at fleet scale a
+// per-heartbeat warning would bury everything else in the log while saying the
+// same thing.
+type nodeWarnSet struct {
+	mu    sync.Mutex
+	nodes map[string]struct{}
+}
+
+func newNodeWarnSet() *nodeWarnSet {
+	return &nodeWarnSet{nodes: make(map[string]struct{})}
+}
+
+// mark records a node and reports whether this is the first time.
+func (w *nodeWarnSet) mark(nodeID string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, seen := w.nodes[nodeID]; seen {
+		return false
+	}
+	w.nodes[nodeID] = struct{}{}
+	return true
+}
+
+// retain drops every node `keep` no longer recognises, and returns how many.
+func (w *nodeWarnSet) retain(keep func(nodeID string) bool) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	dropped := 0
+	for nodeID := range w.nodes {
+		if !keep(nodeID) {
+			delete(w.nodes, nodeID)
+			dropped++
+		}
+	}
+	return dropped
 }
 
 // departedSweepInterval bounds how often the per-node side maps are swept.
@@ -500,12 +629,12 @@ const departedSweepInterval = 60 * time.Second
 // pruneDepartedNodes drops per-node bookkeeping for nodes the registry no
 // longer recognises.
 //
-// The roster cache, the event-loss counters and the reservation ledger are all
-// keyed by node and are cleared by UnregisterNode — the graceful path. A node
-// that is removed from discovery, renamed, or simply never comes back never
-// calls it, so without this each map grows with fleet churn for the lifetime
-// of the process. The roster cache is the worst of the three: every entry
-// holds a node's full sandbox roster.
+// The roster cache, the event-loss counters, the reservation ledger and the
+// warn-once set are all keyed by node, and all but the last are cleared by
+// UnregisterNode — the graceful path. A node that is removed from discovery,
+// renamed, or simply never comes back never calls it, so without this each map
+// grows with fleet churn for the lifetime of the process. The roster cache is
+// the worst of them: every entry holds a node's full sandbox roster.
 //
 // Membership is the registry's answer, so a node that is still discovered but
 // merely unhealthy keeps its state — this reclaims what has left, not what is
@@ -524,7 +653,8 @@ func (s *Service) pruneDepartedNodes() {
 		_, ok := s.nodes.Resolve(nodeID)
 		return ok
 	}
-	dropped := s.rosters.retain(known) + s.eventLoss.retain(known) + s.ledger.Retain(known)
+	dropped := s.rosters.retain(known) + s.eventLoss.retain(known) + s.ledger.Retain(known) +
+		s.ttlOrderingWarned.retain(known)
 	if dropped > 0 {
 		s.logger.Debug("scheduler dropped bookkeeping for departed nodes",
 			zap.Int("entries", dropped),

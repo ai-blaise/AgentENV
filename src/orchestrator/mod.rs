@@ -22,9 +22,9 @@ pub use mobility::{
     EvacuationPlan, LeaseGuardian, LeaseLost, LeasePacing, LeaseWatch, LocalMobilityStore,
     MigrationOutcome, MigrationSaga, MigrationSteps, MobilityCoordinator, MobilityGeneration,
     MobilityHooks, MobilityRecord, MobilityRecordCounts, MobilityRuntime, MobilityState,
-    MobilityStore, MobilityWrite, MoveExecutor, NodeMobilityFacts, PlannedMove, RenewOutcome,
-    ResumeFence, SandboxLayers, SchedulerMobilityStore, UnplaceableReason, UnplaceableSandbox,
-    DEFAULT_CLAIM_TTL,
+    MobilityStore, MobilityWrite, MoveCancel, MoveExecutor, NodeMobilityFacts, PlannedMove,
+    RenewOutcome, ResumeFence, SandboxLayers, SchedulerMobilityStore, UnplaceableReason,
+    UnplaceableSandbox, DEFAULT_CLAIM_TTL,
 };
 pub use persistence::{
     DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,

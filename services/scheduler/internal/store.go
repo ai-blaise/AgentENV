@@ -1,20 +1,145 @@
 package scheduler
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 const defaultBindingTTL = 30 * time.Second
 
 // defaultReconcileGracePeriod is how recently a binding must have been written
 // for reconcile to leave it alone even when the reporting node's roster omits
-// it. It only has to cover the interval between a node collecting its roster
-// and the scheduler applying that heartbeat.
+// it.
+//
+// The window it has to cover is roster collection through heartbeat apply, and
+// it has to cover it with margin rather than merely reach it: a binding one
+// tick older than the grace is deleted while its sandbox is still running, with
+// no migration, no error and nothing in a log. Nothing in the request path can
+// measure that margin, which is why a caller building a store from
+// BindingStoreOptions has the relations checked for it, and why every reconcile
+// delete and retention is counted per node.
 const defaultReconcileGracePeriod = 10 * time.Second
+
+// minReconcileGraceHeartbeats is the smallest number of reporting intervals a
+// grace period may span.
+//
+// One interval covers a report that lands first time and nothing else. When the
+// report carrying a roster is dropped, the next roster is collected a full
+// interval later, so a binding written just after the first collection is that
+// much older by the time a delete is considered. Two intervals is the smallest
+// bound that still holds across one retry.
+const minReconcileGraceHeartbeats = 2
+
+// Outcomes of considering one binding a node's roster omitted. The in-memory
+// store can only delete or retain; the Redis store also sees bindings that
+// expired underneath it or moved to another node between the roster being
+// collected and the delete being attempted.
+const (
+	reconcileOutcomeDeleted  = "deleted"
+	reconcileOutcomeRetained = "retained"
+	reconcileOutcomeMoved    = "moved"
+	reconcileOutcomeAbsent   = "absent"
+	reconcileOutcomeUnknown  = "unknown"
+)
+
+// schedulerReconcileBindingsTotal counts what reconcile did with each binding a
+// node's roster omitted.
+//
+// Reconcile deleting a live binding is silent by construction: the sandbox
+// keeps running on the node, the client keeps an id the scheduler has
+// forgotten, and nothing fails until the next request for that sandbox. The
+// delete rate per node is the only place that shows up early. A node whose
+// deletes track its genuine teardowns is healthy; one that deletes steadily
+// while its retention count sits at zero is running with a grace period too
+// short for its roster latency.
+var schedulerReconcileBindingsTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "agentenv_scheduler_reconcile_bindings_total",
+		Help: "Bindings omitted from a node's heartbeat roster, by node and by what reconcile did with them.",
+	},
+	[]string{"node_id", "outcome"},
+)
+
+func recordReconcileOutcome(nodeID string, outcome string, count int) {
+	if nodeID == "" || count <= 0 {
+		return
+	}
+	schedulerReconcileBindingsTotal.WithLabelValues(nodeID, outcome).Add(float64(count))
+}
+
+// ValidateReconcileGrace checks the timing relations the grace period depends on
+// but that nothing states or measures.
+//
+// heartbeatInterval is the interval nodes are expected to report at. Zero means
+// no expectation is configured, as in the shared scheduler config, and leaves
+// the grace-versus-interval relation unchecked because there is nothing to
+// check it against.
+func ValidateReconcileGrace(bindingTTL time.Duration, reconcileGrace time.Duration, heartbeatInterval time.Duration) error {
+	if bindingTTL <= 0 {
+		return fmt.Errorf("binding ttl (%s) must be greater than zero", bindingTTL)
+	}
+	if reconcileGrace < 0 {
+		return fmt.Errorf("reconcile grace (%s) must not be negative", reconcileGrace)
+	}
+	if reconcileGrace >= bindingTTL {
+		return fmt.Errorf(
+			"reconcile grace (%s) must be shorter than the binding ttl (%s); "+
+				"a grace that reaches the ttl protects a binding for longer than one ttl, "+
+				"so a sandbox created and deleted inside a single ttl can only be reaped by expiry",
+			reconcileGrace, bindingTTL,
+		)
+	}
+	if heartbeatInterval <= 0 {
+		return nil
+	}
+	minimum := time.Duration(minReconcileGraceHeartbeats) * heartbeatInterval
+	if reconcileGrace < minimum {
+		return fmt.Errorf(
+			"reconcile grace (%s) must be at least %d heartbeat intervals (%s); "+
+				"a shorter grace deletes bindings written while the reporting node was still collecting the roster that omits them",
+			reconcileGrace, minReconcileGraceHeartbeats, minimum,
+		)
+	}
+	return nil
+}
+
+// BindingStoreOptions carries the timings a binding store needs, so a caller
+// can pass the configured binding TTL and reporting interval together and have
+// the store reject a combination it cannot honour. The grace period is only
+// meaningful relative to those two, and validating it here keeps that check
+// next to the code that uses it.
+type BindingStoreOptions struct {
+	// BindingTTL is how long a binding survives without a refresh. Zero uses
+	// the default.
+	BindingTTL time.Duration
+	// ReconcileGrace is how recently a binding must have been written for
+	// reconcile to leave it alone. Zero uses the default. There is no way to
+	// ask for no grace at all through here: that is a test affordance, and it
+	// goes through NewInMemoryBindingStoreWithGrace.
+	ReconcileGrace time.Duration
+	// HeartbeatInterval is the interval nodes are expected to report at, from
+	// scheduler.heartbeat_interval. Zero leaves the grace unchecked against it.
+	HeartbeatInterval time.Duration
+}
+
+func (o BindingStoreOptions) resolve() (BindingStoreOptions, error) {
+	if o.BindingTTL <= 0 {
+		o.BindingTTL = defaultBindingTTL
+	}
+	if o.ReconcileGrace <= 0 {
+		o.ReconcileGrace = defaultReconcileGracePeriod
+	}
+	if err := ValidateReconcileGrace(o.BindingTTL, o.ReconcileGrace, o.HeartbeatInterval); err != nil {
+		return BindingStoreOptions{}, err
+	}
+	return o, nil
+}
 
 // RosterCompleteness states whether a heartbeat's sandbox roster is the node's
 // authoritative view of what it owns.
@@ -121,9 +246,23 @@ func NewInMemoryBindingStore(bindingTTL time.Duration) *InMemoryBindingStore {
 	return NewInMemoryBindingStoreWithGrace(bindingTTL, defaultReconcileGracePeriod)
 }
 
+// NewInMemoryBindingStoreWithOptions builds a store whose grace period has been
+// checked against the binding TTL and the reporting interval.
+func NewInMemoryBindingStoreWithOptions(opts BindingStoreOptions) (*InMemoryBindingStore, error) {
+	resolved, err := opts.resolve()
+	if err != nil {
+		return nil, err
+	}
+	return NewInMemoryBindingStoreWithGrace(resolved.BindingTTL, resolved.ReconcileGrace), nil
+}
+
 // NewInMemoryBindingStoreWithGrace builds a store with an explicit reconcile
 // grace period. A zero grace makes reconcile delete every binding a complete
 // roster omits, however recently it was written.
+//
+// Nothing here is validated against the binding TTL: a zero grace is a valid
+// instruction, and the relations only bind a caller that means the grace to
+// protect anything. Those callers go through NewInMemoryBindingStoreWithOptions.
 func NewInMemoryBindingStoreWithGrace(bindingTTL time.Duration, reconcileGrace time.Duration) *InMemoryBindingStore {
 	if bindingTTL <= 0 {
 		bindingTTL = defaultBindingTTL
@@ -211,12 +350,17 @@ func (s *InMemoryBindingStore) ReconcileNodeRoster(node Node, sandboxIDs []strin
 			return nil
 		}
 		if bindings, ok := s.nodeBinding[node.ID]; ok {
+			deleted, retained := 0, 0
 			for sandboxID := range bindings {
 				if completeness == RosterComplete && s.recordedWithinGraceLocked(sandboxID, now) {
+					retained++
 					continue
 				}
 				s.deleteLocked(sandboxID)
+				deleted++
 			}
+			recordReconcileOutcome(node.ID, reconcileOutcomeDeleted, deleted)
+			recordReconcileOutcome(node.ID, reconcileOutcomeRetained, retained)
 		}
 		return nil
 	}
@@ -231,15 +375,20 @@ func (s *InMemoryBindingStore) ReconcileNodeRoster(node Node, sandboxIDs []strin
 		return nil
 	}
 
+	deleted, retained := 0, 0
 	for sandboxID := range current {
 		if _, ok := normalized[sandboxID]; ok {
 			continue
 		}
 		if s.recordedWithinGraceLocked(sandboxID, now) {
+			retained++
 			continue
 		}
 		s.deleteLocked(sandboxID)
+		deleted++
 	}
+	recordReconcileOutcome(node.ID, reconcileOutcomeDeleted, deleted)
+	recordReconcileOutcome(node.ID, reconcileOutcomeRetained, retained)
 	return nil
 }
 
@@ -251,6 +400,13 @@ func (s *InMemoryBindingStore) ReconcileNodeRoster(node Node, sandboxIDs []strin
 // sandbox created inside it is absent from the roster while already bound.
 // Without this, that binding is deleted and the client holds an id the
 // scheduler has just forgotten.
+//
+// The comparison is one-sided and unforgiving on the far side: a binding a
+// microsecond older than the grace is deleted exactly as if it had been there
+// for an hour. Widening it to <= would move that cliff by a microsecond and
+// leave it a cliff. What keeps the cliff away from live bindings is the size of
+// the grace relative to the reporting interval, checked once at construction,
+// and the per-node delete counter that makes a wrong choice visible.
 func (s *InMemoryBindingStore) recordedWithinGraceLocked(sandboxID string, now time.Time) bool {
 	record, ok := s.bindings[sandboxID]
 	if !ok || record.recordedAt.IsZero() {

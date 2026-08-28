@@ -38,10 +38,21 @@ func newRosterCache() *rosterCache {
 	return &rosterCache{entries: make(map[string]rosterEntry)}
 }
 
-// remember stores the roster a node just sent under its digest.
-func (c *rosterCache) remember(nodeID, digest string, sandboxIDs []string, complete bool) {
+// remember stores the roster a node just sent under its digest, and reports
+// whether it did.
+//
+// The digest is recomputed over the ids rather than believed. Every later
+// elided heartbeat is resolved by digest alone, so a single heartbeat whose
+// digest and ids disagree would be cached under a key the node will keep
+// sending and reconciled against a roster it never sent — one inconsistent
+// message poisoning every round after it. Recomputing costs a hash on the
+// full-send path, which elision has already made the rare one.
+func (c *rosterCache) remember(nodeID, digest string, sandboxIDs []string, complete bool) bool {
 	if nodeID == "" || digest == "" {
-		return
+		return false
+	}
+	if RosterDigest(sandboxIDs) != digest {
+		return false
 	}
 	stored := make([]string, len(sandboxIDs))
 	copy(stored, sandboxIDs)
@@ -53,6 +64,23 @@ func (c *rosterCache) remember(nodeID, digest string, sandboxIDs []string, compl
 		sandboxIDs:  stored,
 		rosterFinal: complete,
 	}
+	return true
+}
+
+// markComplete raises a cached roster to authoritative.
+//
+// Separate from remember because the ids are not re-presented: they are the
+// ones already verified on the way in, and only what the node claims about
+// them has changed.
+func (c *rosterCache) markComplete(nodeID, digest string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	entry, ok := c.entries[nodeID]
+	if !ok || entry.digest != digest {
+		return
+	}
+	entry.rosterFinal = true
+	c.entries[nodeID] = entry
 }
 
 // lookup returns the cached roster for a node when the digest matches.
@@ -109,10 +137,10 @@ func (c *rosterCache) retain(keep func(nodeID string) bool) int {
 // RosterDigest hashes a roster the same way a node does.
 //
 // Order-independent by construction, because the two sides build the list from
-// different structures and neither should have to promise an order. Used by
-// the scheduler only to verify a node's digest in tests; in production the
-// node's value is taken as given, since a wrong digest costs a re-send and
-// nothing else.
+// different structures and neither should have to promise an order. The
+// scheduler recomputes it over every roster it is sent: the digest is the key
+// the cache is later read by, so believing a value that does not describe the
+// ids beside it is how one bad heartbeat becomes a permanently wrong roster.
 func RosterDigest(sandboxIDs []string) string {
 	normalized := make([]string, 0, len(sandboxIDs))
 	for _, id := range sandboxIDs {

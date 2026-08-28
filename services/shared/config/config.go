@@ -78,6 +78,12 @@ type SchedulerConfig struct {
 	// used only to validate that the TTLs above leave room for a node to miss
 	// a heartbeat and retry; zero disables that check.
 	HeartbeatInterval time.Duration `json:"heartbeat_interval"`
+	// ReconcileGrace is how recently a binding must have been written for a
+	// heartbeat reconcile to leave it alone. It covers the gap between a node
+	// collecting its roster and the scheduler acting on it, during which a
+	// newly placed sandbox is bound but not yet in any roster. Zero uses the
+	// store default.
+	ReconcileGrace time.Duration `json:"reconcile_grace"`
 }
 
 // HealthGateEnabled reports whether health-gated placement is on, defaulting
@@ -101,6 +107,7 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		NodeResourceLimit       *NodeResourceLimit        `json:"node_resource_limit"`
 		ScheduleHealthGate      *bool                     `json:"schedule_health_gate"`
 		HeartbeatInterval       json.RawMessage           `json:"heartbeat_interval"`
+		ReconcileGrace          json.RawMessage           `json:"reconcile_grace"`
 	}
 
 	parsed := wire{}
@@ -159,6 +166,13 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		s.HeartbeatInterval = d
+	}
+	if len(bytes.TrimSpace(parsed.ReconcileGrace)) > 0 {
+		d, err := parseSchedulerDuration(parsed.ReconcileGrace, "scheduler.reconcile_grace")
+		if err != nil {
+			return err
+		}
+		s.ReconcileGrace = d
 	}
 
 	return nil
@@ -545,6 +559,23 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 // gives the node a retry before anything is torn down.
 const minHeartbeatsBeforeExpiry = 3
 
+// MinTTLForHeartbeatInterval is the shortest TTL that still leaves a node room
+// to miss a heartbeat and retry before its state is torn down. A
+// non-positive interval returns zero, which every TTL satisfies.
+//
+// Exported because the ordering has to be checked twice. Here it is checked
+// once at startup against scheduler.heartbeat_interval, which is optional and
+// which no shipped config sets — so on a real deployment this check does not
+// run at all. The scheduler re-checks the same relation on every heartbeat
+// against the interval the node actually reports, and both need to agree on
+// what "long enough" means.
+func MinTTLForHeartbeatInterval(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	return time.Duration(minHeartbeatsBeforeExpiry) * interval
+}
+
 // validateSchedulerTTLOrdering checks the timing relations the control plane
 // depends on but never stated.
 //
@@ -555,13 +586,12 @@ const minHeartbeatsBeforeExpiry = 3
 // after expiry. An implicit relation that is already false is worth turning
 // into a startup error rather than an intermittent outage.
 func validateSchedulerTTLOrdering(cfg SchedulerConfig) error {
-	interval := cfg.HeartbeatInterval
-	if interval <= 0 {
+	minimum := MinTTLForHeartbeatInterval(cfg.HeartbeatInterval)
+	if minimum <= 0 {
 		// Nodes report their interval on every heartbeat; without a configured
 		// expectation there is nothing to check here.
 		return nil
 	}
-	minimum := time.Duration(minHeartbeatsBeforeExpiry) * interval
 	if cfg.ReportTTL < minimum {
 		return fmt.Errorf(
 			"scheduler.report_ttl (%s) must be at least %d heartbeat intervals (%s); "+

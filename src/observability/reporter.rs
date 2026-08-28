@@ -22,11 +22,12 @@ const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Returned by [`ObservabilityReporter::send_heartbeat`] when the scheduler
 /// rejects the heartbeat because this node's ID is not in its configured node
-/// list. Detected in the reporter loop to emit an `error!`-level log with an
-/// actionable remediation hint rather than a generic transient-failure warning.
+/// list. Detected in [`ObservabilityReporter::record_heartbeat_failure`] to
+/// emit an `error!`-level log with an actionable remediation hint rather than a
+/// generic transient-failure warning.
 #[derive(Debug, thiserror::Error)]
 #[error("node is not in the scheduler's configured node list")]
-struct HeartbeatNodeNotConfigured;
+pub(super) struct HeartbeatNodeNotConfigured;
 
 #[derive(Clone)]
 struct ReporterConfig {
@@ -140,30 +141,14 @@ impl ObservabilityReporter {
                         backoff = config.interval;
                         wait = config.interval;
                     }
-                    Err(ref err) if err.is::<HeartbeatNodeNotConfigured>() => {
-                        error!(
-                            node_id = %service.node_id(),
-                            scheduler_endpoint = %config.scheduler_endpoint,
-                            retry_after_secs = backoff.as_secs(),
-                            "scheduler rejected heartbeat: this node is not in the \
-                             scheduler's configured node list — ensure \
-                             AENV_NODE_ID matches a node name in the scheduler \
-                             nodes configuration"
-                        );
-                        wait = backoff;
-                        backoff = cmp::min(backoff.saturating_mul(2), MAX_REPORT_BACKOFF);
-                    }
                     Err(err) => {
-                        warn!(
-                            error = %err,
-                            retry_after_secs = backoff.as_secs(),
-                            "observability heartbeat failed"
+                        Self::record_heartbeat_failure(
+                            &err,
+                            &mut rosters,
+                            service.node_id(),
+                            &config.scheduler_endpoint,
+                            backoff,
                         );
-                        // A failed heartbeat may mean the scheduler restarted
-                        // or moved. The next one reintroduces the roster in
-                        // full rather than assuming the new process inherited
-                        // what the old one knew.
-                        rosters.reset();
                         wait = backoff;
                         backoff = cmp::min(backoff.saturating_mul(2), MAX_REPORT_BACKOFF);
                     }
@@ -327,6 +312,46 @@ impl ObservabilityReporter {
         );
 
         Ok(())
+    }
+
+    /// Logs a heartbeat that did not land, and forgets what the scheduler
+    /// knows about this node's roster.
+    ///
+    /// One function rather than one arm per diagnosis, because the roster
+    /// consequence is the same for all of them and the diagnosis is only a
+    /// choice of log line. A rejected heartbeat needs the reset as much as a
+    /// lost one does: the scheduler refuses it before it resolves the roster,
+    /// so it recorded nothing, while [`RosterDigestState::report`] has already
+    /// stamped that roster as acknowledged and would elide it from here on.
+    pub(super) fn record_heartbeat_failure(
+        err: &anyhow::Error,
+        rosters: &mut RosterDigestState,
+        node_id: &str,
+        scheduler_endpoint: &str,
+        retry_after: Duration,
+    ) {
+        // A failed heartbeat may mean the scheduler restarted or moved. The
+        // next one reintroduces the roster in full rather than assuming the
+        // new process inherited what the old one knew.
+        rosters.reset();
+
+        if err.is::<HeartbeatNodeNotConfigured>() {
+            error!(
+                node_id = %node_id,
+                scheduler_endpoint = %scheduler_endpoint,
+                retry_after_secs = retry_after.as_secs(),
+                "scheduler rejected heartbeat: this node is not in the \
+                 scheduler's configured node list — ensure \
+                 AENV_NODE_ID matches a node name in the scheduler \
+                 nodes configuration"
+            );
+        } else {
+            warn!(
+                error = %err,
+                retry_after_secs = retry_after.as_secs(),
+                "observability heartbeat failed"
+            );
+        }
     }
 
     /// Drains a batch of lifecycle events, counting every event the node

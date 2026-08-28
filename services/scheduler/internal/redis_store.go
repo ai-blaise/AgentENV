@@ -13,7 +13,19 @@ import (
 
 const defaultRedisOperationTimeout = 2 * time.Second
 const defaultRedisBindingKeyPrefix = "agentenv:scheduler:bindings"
-const defaultRedisNodeIndexTTL = time.Hour
+
+// nodeIndexTTLMultiple bounds how far a node index may outlive the bindings it
+// names, as a multiple of the binding TTL.
+//
+// The index accumulates entries no binding backs: queueIndexMove can only drop
+// a sandbox from its old node's index when the SET script could name that node,
+// and a binding key that had already expired names nobody. Expiry is therefore
+// the only thing that ever removes those entries. A flat hour against a
+// thirty-second binding TTL let one survive its binding by two orders of
+// magnitude; deriving it keeps the two in step whatever the TTL is configured
+// to. Four leaves slack for a node that misses several reports and still holds
+// bindings, since every write and every reconcile pushes the expiry back out.
+const nodeIndexTTLMultiple = 4
 
 type redisBindingRecord struct {
 	Node Node `json:"node"`
@@ -53,7 +65,14 @@ type redisBindingRecord struct {
 // What must not happen is deleting a binding that has moved on, and that is
 // prevented per key rather than by a lock: a delete only fires when the
 // binding still names the node being reconciled, and never inside the grace
-// window that covers a binding written after the node collected its roster.
+// window.
+//
+// The grace is the one guard here that is a bet rather than a proof. It holds
+// only while it is longer than the time from a node collecting its roster to
+// this delete running, and nothing in the request path can observe that time.
+// So a caller that knows the reporting interval has the value checked against
+// it (NewRedisBindingStoreWithOptions), and every outcome below is counted per
+// node.
 type RedisBindingStore struct {
 	client           redis.UniversalClient
 	bindingTTL       time.Duration
@@ -97,6 +116,22 @@ func NewRedisBindingStore(addr string, bindingTTL time.Duration) (*RedisBindingS
 		_ = store.Close()
 		return nil, fmt.Errorf("load redis scripts: %w", err)
 	}
+	return store, nil
+}
+
+// NewRedisBindingStoreWithOptions is NewRedisBindingStore with the grace period
+// checked against the binding TTL and the interval nodes report at, for callers
+// that have both to hand.
+func NewRedisBindingStoreWithOptions(addr string, opts BindingStoreOptions) (*RedisBindingStore, error) {
+	resolved, err := opts.resolve()
+	if err != nil {
+		return nil, err
+	}
+	store, err := NewRedisBindingStore(addr, resolved.BindingTTL)
+	if err != nil {
+		return nil, err
+	}
+	store.reconcileGrace = resolved.ReconcileGrace
 	return store, nil
 }
 
@@ -415,6 +450,11 @@ func (s *RedisBindingStore) ReconcileNodeRoster(node Node, sandboxIDs []string, 
 // Each delete is guarded on the binding still naming this node, so a sandbox
 // that moved elsewhere between the roster being collected and this running is
 // left alone rather than deleted out from under its new owner.
+//
+// Every outcome the script reports is counted against the node, deletes
+// included. A delete that beats the grace window by a millisecond leaves a
+// running sandbox with no binding, and produces no error and no log line; the
+// per-node delete rate is where it shows.
 func (s *RedisBindingStore) deleteDeparted(
 	ctx context.Context,
 	nodeID string,
@@ -448,18 +488,35 @@ func (s *RedisBindingStore) deleteDeparted(
 	}
 
 	removed = make([]string, 0, len(departed))
+	outcomes := make(map[string]int, 4)
 	for i, cmd := range commands {
-		switch commandString(cmd) {
-		case "retained":
+		outcome := reconcileOutcomeLabel(commandString(cmd))
+		outcomes[outcome]++
+		if outcome == reconcileOutcomeRetained {
 			// Written after the node collected its roster; the next pass sees it.
 			retained++
-		default:
-			// Deleted, absent, or owned by someone else — either way it does
-			// not belong in this node's index.
-			removed = append(removed, departed[i])
+			continue
 		}
+		// Deleted, absent, or owned by someone else — either way it does not
+		// belong in this node's index.
+		removed = append(removed, departed[i])
+	}
+	for outcome, count := range outcomes {
+		recordReconcileOutcome(nodeID, outcome, count)
 	}
 	return removed, retained, nil
+}
+
+// reconcileOutcomeLabel maps a delete-script result onto a metric label. An
+// unrecognised result folds into one bucket rather than letting server output
+// grow the label set.
+func reconcileOutcomeLabel(result string) string {
+	switch result {
+	case reconcileOutcomeDeleted, reconcileOutcomeRetained, reconcileOutcomeMoved, reconcileOutcomeAbsent:
+		return result
+	default:
+		return reconcileOutcomeUnknown
+	}
 }
 
 // refreshRoster writes every binding the node reports and returns, per
@@ -525,7 +582,7 @@ func (s *RedisBindingStore) updateNodeIndex(
 		}
 	}
 	if len(desired) > 0 || retained > 0 {
-		pipe.PExpire(ctx, nodeKey, defaultRedisNodeIndexTTL)
+		pipe.PExpire(ctx, nodeKey, s.nodeIndexTTL())
 	} else {
 		pipe.Del(ctx, nodeKey)
 	}
@@ -537,7 +594,20 @@ func (s *RedisBindingStore) updateNodeIndex(
 }
 
 // queueIndexMove adds the sandbox to its new node's index and removes it from
-// the old one's.
+// the old one's, when the SET script was able to say who the old one was.
+//
+// Often it cannot. The previous owner is read out of the binding key, so a
+// sandbox rebound after its binding expired names nobody, and the node that
+// used to hold it keeps an index entry for it. Two node indexes then list the
+// same sandbox, and that is tolerated rather than fixed.
+//
+// It is tolerable because the index is a hint, not an answer. It names nodes
+// that may no longer hold a sandbox, and every consumer has to treat it that
+// way: reconciliation re-reads the binding key for each entry and deletes only
+// while the binding still names the reconciling node, so an entry in the wrong
+// index costs one wasted read. Nothing else reads it, and nothing may start
+// reading it as an ownership record. What a stale entry must not do is outlive
+// its binding indefinitely, which is what the derived TTL bounds.
 func (s *RedisBindingStore) queueIndexMove(
 	ctx context.Context,
 	pipe redis.Pipeliner,
@@ -549,7 +619,13 @@ func (s *RedisBindingStore) queueIndexMove(
 		pipe.SRem(ctx, s.nodeKey(previousNodeID), sandboxID)
 	}
 	pipe.SAdd(ctx, s.nodeKey(nodeID), sandboxID)
-	pipe.PExpire(ctx, s.nodeKey(nodeID), defaultRedisNodeIndexTTL)
+	pipe.PExpire(ctx, s.nodeKey(nodeID), s.nodeIndexTTL())
+}
+
+// nodeIndexTTL is read by every site that refreshes an index key, so the write
+// path and the reconcile path cannot drift apart.
+func (s *RedisBindingStore) nodeIndexTTL() time.Duration {
+	return nodeIndexTTLMultiple * s.bindingTTL
 }
 
 func (s *RedisBindingStore) context() (context.Context, context.CancelFunc) {

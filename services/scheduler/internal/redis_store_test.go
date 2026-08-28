@@ -362,3 +362,133 @@ func TestRedisReconcileFinalIgnoresGrace(t *testing.T) {
 	}
 	assertRedisMissing(t, store, "sbx-fresh")
 }
+
+// TestRedisReconcileCountsOutcomes mirrors the in-memory counters against a
+// real Redis, and covers the two outcomes only this store can produce: a
+// binding that expired underneath the index, and one that moved to another node
+// between the roster being collected and the delete being attempted.
+//
+// Bindings written through writeRawRedisBinding carry no recorded_at stamp, so
+// the grace check cannot apply to them and the outcome does not depend on how
+// long the test took to run.
+func TestRedisReconcileCountsOutcomes(t *testing.T) {
+	store := newRedisBindingStoreForTestWithGrace(t, time.Minute, time.Hour)
+	node := Node{ID: "node-redis-outcome-counts", Endpoint: "http://node-a"}
+	other := Node{ID: "node-redis-outcome-other", Endpoint: "http://node-b"}
+
+	// A distinct number of each, so no two labels can be swapped at their
+	// recording sites and leave this green. One of each would make the labels
+	// interchangeable, and a metric that reports deletes as retentions is
+	// worse than no metric.
+	want := map[string]float64{
+		reconcileOutcomeDeleted:  3,
+		reconcileOutcomeRetained: 1,
+		reconcileOutcomeMoved:    2,
+		reconcileOutcomeAbsent:   4,
+	}
+
+	// Stamped by the server on write, so the hour-long grace covers it.
+	store.Record("sbx-retained", node, time.Now())
+	// Unstamped, still owned by this node: deleted.
+	deleted := []string{"sbx-deleted", "sbx-deleted-2", "sbx-deleted-3"}
+	for _, sandboxID := range deleted {
+		writeRawRedisBinding(t, store, sandboxID, node)
+	}
+	// Unstamped, owned by someone else: not this node's to delete.
+	moved := []string{"sbx-moved", "sbx-moved-2"}
+	for _, sandboxID := range moved {
+		writeRawRedisBinding(t, store, sandboxID, other)
+	}
+	// In the index with no binding behind it at all.
+	absent := []string{"sbx-absent", "sbx-absent-2", "sbx-absent-3", "sbx-absent-4"}
+	indexed := append(append(append([]string{}, deleted...), moved...), absent...)
+	for _, sandboxID := range indexed {
+		if err := store.client.SAdd(context.Background(), store.nodeKey(node.ID), sandboxID).Err(); err != nil {
+			t.Fatalf("seed node index with %s failed: %v", sandboxID, err)
+		}
+	}
+
+	before := map[string]float64{}
+	for outcome := range want {
+		before[outcome] = reconcileOutcomeCount(t, node.ID, outcome)
+	}
+
+	if err := store.ReconcileNodeRoster(node, nil, RosterComplete, time.Now()); err != nil {
+		t.Fatalf("ReconcileNodeRoster: %v", err)
+	}
+
+	for outcome, expected := range want {
+		if got := reconcileOutcomeCount(t, node.ID, outcome) - before[outcome]; got != expected {
+			t.Fatalf("%s count rose by %v, want %v", outcome, got, expected)
+		}
+	}
+
+	assertRedisMissing(t, store, "sbx-deleted")
+	assertRedisBinding(t, store, "sbx-retained", node)
+	assertRedisBinding(t, store, "sbx-moved", other)
+}
+
+// TestRedisNodeIndexTTLTracksBindingTTL pins the index expiry to the binding
+// TTL at both sites that set it.
+//
+// The index is a hint that may name a node no longer holding the sandbox:
+// queueIndexMove can only drop the old entry when the SET script could name the
+// old owner, so an entry whose binding had already expired is never removed by
+// anything but expiry. It used to expire after an hour against a thirty-second
+// binding TTL. The write path and the reconcile path have drifted apart before,
+// so both are checked here.
+func TestRedisNodeIndexTTLTracksBindingTTL(t *testing.T) {
+	const bindingTTL = 5 * time.Second
+	store := newRedisBindingStoreForTest(t, bindingTTL)
+	node := Node{ID: "node-a", Endpoint: "http://node-a"}
+	want := nodeIndexTTLMultiple * bindingTTL
+
+	store.Record("sbx-1", node, time.Now())
+	assertRedisIndexTTLWithin(t, store, store.nodeKey(node.ID), bindingTTL, want)
+
+	if err := store.ReconcileNode(node, []string{"sbx-1"}, time.Now()); err != nil {
+		t.Fatalf("ReconcileNode: %v", err)
+	}
+	assertRedisIndexTTLWithin(t, store, store.nodeKey(node.ID), bindingTTL, want)
+}
+
+// assertRedisIndexTTLWithin checks a node index expires later than the bindings
+// it names but not by an unbounded margin. Below the binding TTL it would drop
+// entries that are still live; far above it, a stale entry outlives its binding
+// for as long as the larger value.
+func assertRedisIndexTTLWithin(t *testing.T, store *RedisBindingStore, key string, low time.Duration, high time.Duration) {
+	t.Helper()
+	ttl, err := store.client.PTTL(context.Background(), key).Result()
+	if err != nil {
+		t.Fatalf("read pttl for %s failed: %v", key, err)
+	}
+	if ttl <= low || ttl > high {
+		t.Fatalf("index ttl for %s is %s, want within (%s, %s]", key, ttl, low, high)
+	}
+}
+
+// TestNewRedisBindingStoreWithOptionsValidatesGrace covers the constructor a
+// caller reaches for when it has the configured TTL and reporting interval to
+// hand, rather than only a TTL.
+func TestNewRedisBindingStoreWithOptionsValidatesGrace(t *testing.T) {
+	addr := startRedisServerForTest(t)
+
+	if _, err := NewRedisBindingStoreWithOptions(addr, BindingStoreOptions{BindingTTL: 5 * time.Second}); err == nil {
+		t.Fatalf("a 5s binding ttl with the %s default grace was accepted", defaultReconcileGracePeriod)
+	}
+
+	store, err := NewRedisBindingStoreWithOptions(addr, BindingStoreOptions{
+		BindingTTL:        time.Minute,
+		ReconcileGrace:    20 * time.Second,
+		HeartbeatInterval: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("a valid configuration was rejected: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = store.Close()
+	})
+	if store.reconcileGrace != 20*time.Second {
+		t.Fatalf("reconcile grace = %s, want 20s", store.reconcileGrace)
+	}
+}

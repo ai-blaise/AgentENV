@@ -32,6 +32,15 @@
 //! Rollback tears down the destination's partial restore before releasing the
 //! claim, never the other way round. Releasing first would let a second
 //! destination begin while the first is still holding devices open.
+//!
+//! # Giving up
+//!
+//! A caller that wants the migration to stop asks through a
+//! [`MoveCancel`](super::evacuation::MoveCancel) rather than by dropping the
+//! future. Every compensation above is a step this saga has to *run*, and a
+//! dropped future runs none of them; the request is honoured at the two points
+//! where there is still something to unwind, and ignored past the point of no
+//! return, where abandoning is what creates the ambiguity.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,6 +50,7 @@ use async_trait::async_trait;
 use tracing::{info, warn};
 
 use super::claim::{ClaimOutcome, MobilityCoordinator, DEFAULT_CLAIM_TTL};
+use super::evacuation::MoveCancel;
 use super::lease::{LeaseGuardian, LeaseLost, LeasePacing, LeaseWatch, RenewOutcome};
 use super::record::{MobilityRecord, MobilityStore};
 use crate::snapshot::{
@@ -108,12 +118,16 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
     }
 
     /// Migrates `sandbox_id` onto this node.
+    ///
+    /// `cancel` is how a caller asks for the migration to stop. It is watched
+    /// only where the saga can still unwind; see the module's "Giving up".
     pub async fn migrate(
         &self,
         sandbox_id: &SandboxId,
         host: &MigrationFingerprint,
         rootfs_layers: &[OverlaybdLayerRef],
         attached_drives: &[DriveForMigration<'_>],
+        cancel: &MoveCancel,
     ) -> Result<MigrationOutcome> {
         let Some(record) = self.coordinator.store().get(sandbox_id).await? else {
             return Ok(MigrationOutcome::NotClaimable(ClaimOutcome::Unknown));
@@ -123,6 +137,16 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
         // node cannot run would block a destination that can.
         if let Err(blocker) = record.can_move_to(host, rootfs_layers, attached_drives) {
             return Ok(MigrationOutcome::Refused(blocker));
+        }
+
+        // Same reasoning as the compatibility check, for the same cost: a
+        // migration told to stop before it started has nothing to unwind, and
+        // claiming only to release again leaves a destination that could have
+        // taken the sandbox racing a claim that was never going to be used.
+        if cancel.is_requested() {
+            return Ok(MigrationOutcome::RolledBack {
+                reason: "the migration was cancelled before it claimed the sandbox".to_string(),
+            });
         }
 
         let claimed = match self.coordinator.claim(sandbox_id).await? {
@@ -144,6 +168,12 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
                 // already built.
                 Err(lost.to_string())
             }
+            // The restore is the long step, so it is the one a caller giving
+            // up is waiting on. Dropping it here is safe for the same reason
+            // it is safe above, and only because the rollback below runs.
+            () = cancel.requested() => {
+                Err("the migration was cancelled before the restore finished".to_string())
+            }
             result = self.steps.restore(&claimed) => result.map_err(|error| error.to_string()),
         };
 
@@ -158,6 +188,12 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
         // releasing it when the restore returned would let the claim go stale
         // during the commit, and a slow or wedged commit would then let the
         // origin resume while this guest is already running.
+        //
+        // `cancel` is deliberately not consulted from here on. A caller that
+        // gives up between a live guest and the record that names its owner
+        // is asking for exactly the ambiguity this ordering exists to remove;
+        // what remains is one store write, and finishing it is faster than
+        // tearing down a restore that worked.
         let committed = self.coordinator.complete(sandbox_id).await;
         guardian.release();
 
@@ -264,7 +300,7 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
 mod tests {
     use super::*;
     use crate::orchestrator::mobility::record::{
-        LocalMobilityStore, MobilityRecord, MobilityState,
+        LocalMobilityStore, MobilityRecord, MobilityState, MobilityWrite,
     };
     use crate::orchestrator::store::SandboxMetadata;
     use crate::snapshot::{ArtifactReach, SnapshotRuntimeVersions};
@@ -374,7 +410,7 @@ mod tests {
         );
 
         assert_eq!(
-            saga.migrate(&f.sandbox_id, &f.fingerprint, &[], &[])
+            saga.migrate(&f.sandbox_id, &f.fingerprint, &[], &[], &MoveCancel::new())
                 .await
                 .expect("migrate"),
             MigrationOutcome::Migrated
@@ -411,7 +447,7 @@ mod tests {
             ..f.fingerprint.clone()
         };
         match saga
-            .migrate(&f.sandbox_id, &host, &[], &[])
+            .migrate(&f.sandbox_id, &host, &[], &[], &MoveCancel::new())
             .await
             .expect("migrate")
         {
@@ -449,7 +485,7 @@ mod tests {
         );
 
         match saga
-            .migrate(&f.sandbox_id, &f.fingerprint, &[], &[])
+            .migrate(&f.sandbox_id, &f.fingerprint, &[], &[], &MoveCancel::new())
             .await
             .expect("migrate")
         {
@@ -487,7 +523,7 @@ mod tests {
             Duration::from_secs(30),
         );
 
-        saga.migrate(&f.sandbox_id, &f.fingerprint, &[], &[])
+        saga.migrate(&f.sandbox_id, &f.fingerprint, &[], &[], &MoveCancel::new())
             .await
             .expect("migrate");
 
@@ -522,7 +558,7 @@ mod tests {
         );
 
         match saga
-            .migrate(&f.sandbox_id, &f.fingerprint, &[], &[])
+            .migrate(&f.sandbox_id, &f.fingerprint, &[], &[], &MoveCancel::new())
             .await
             .expect("migrate")
         {
@@ -548,7 +584,7 @@ mod tests {
         let saga = saga(f.store.clone(), "node-b", steps.clone(), ttl);
 
         assert_eq!(
-            saga.migrate(&f.sandbox_id, &f.fingerprint, &[], &[])
+            saga.migrate(&f.sandbox_id, &f.fingerprint, &[], &[], &MoveCancel::new())
                 .await
                 .expect("migrate"),
             MigrationOutcome::Migrated,
@@ -613,28 +649,49 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(120)).await;
             let thief = MobilityCoordinator::new(thief_store, "node-c").with_claim_ttl(ttl);
             // The claim is node-b's and still live, so force the takeover the
-            // way an expiry would: write a newer generation directly.
-            let record = thief
-                .store()
-                .get(&sandbox_id)
-                .await
-                .expect("get")
-                .expect("record");
-            // Stamped now, not at the epoch: a claim that is already expired
-            // would simply be re-taken by node-b's next renewal, and the test
-            // would prove nothing.
-            let stolen = record.transitioned_to(MobilityState::Claimed {
-                by_node_id: "node-c".to_string(),
-                at_unix_ms: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .expect("clock after the epoch")
-                    .as_millis() as u64,
-            });
-            thief.store().upsert(&stolen).await.expect("steal");
+            // way an expiry would: write a newer generation.
+            //
+            // Arbitrated rather than written over the top. An `upsert` here
+            // races node-b's renewals: it is refused outright if a renewal
+            // landed first, and the test would then sit through the whole
+            // thirty-second restore proving nothing, because node-b never
+            // lost a claim it never had taken from it.
+            for attempt in 0.. {
+                let record = thief
+                    .store()
+                    .get(&sandbox_id)
+                    .await
+                    .expect("get")
+                    .expect("record");
+                // Stamped now, not at the epoch: a claim that is already
+                // expired would simply be re-taken by node-b's next renewal,
+                // and the test would prove nothing.
+                let stolen = record.transitioned_to(MobilityState::Claimed {
+                    by_node_id: "node-c".to_string(),
+                    at_unix_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock after the epoch")
+                        .as_millis() as u64,
+                });
+                match thief
+                    .store()
+                    .compare_and_set(Some(record.generation), &stolen)
+                    .await
+                    .expect("steal")
+                {
+                    MobilityWrite::Applied => break,
+                    // A renewal landed between the read and the write. Re-read
+                    // and decide again, which is what any real claimant does.
+                    MobilityWrite::Superseded => assert!(
+                        attempt < 100,
+                        "the steal never won a generation race against node-b's renewals"
+                    ),
+                }
+            }
         });
 
         let outcome = saga
-            .migrate(&f.sandbox_id, &f.fingerprint, &[], &[])
+            .migrate(&f.sandbox_id, &f.fingerprint, &[], &[], &MoveCancel::new())
             .await
             .expect("migrate");
         thief.await.expect("thief");
@@ -655,6 +712,161 @@ mod tests {
         );
     }
 
+    /// Cancelling has to run the compensations, not skip them. The reason the
+    /// caller asks instead of dropping the future is that a dropped future
+    /// leaves the destination holding a partial restore under a claim nobody
+    /// releases.
+    #[tokio::test]
+    async fn a_cancellation_mid_restore_rolls_back_and_leaves_the_sandbox_parked() {
+        let f = fixture().await;
+        let steps = Arc::new(RecordingSteps {
+            restore_delay: Some(Duration::from_secs(30)),
+            ..RecordingSteps::default()
+        });
+        let saga = saga(
+            f.store.clone(),
+            "node-b",
+            steps.clone(),
+            Duration::from_secs(30),
+        );
+
+        let cancel = MoveCancel::new();
+        let stopper = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                cancel.request();
+            })
+        };
+
+        match saga
+            .migrate(&f.sandbox_id, &f.fingerprint, &[], &[], &cancel)
+            .await
+            .expect("migrate")
+        {
+            MigrationOutcome::RolledBack { reason } => {
+                assert!(reason.contains("cancelled"), "unexpected reason: {reason}")
+            }
+            other => panic!("expected a rollback, got {other:?}"),
+        }
+        stopper.await.expect("stopper");
+
+        assert_eq!(
+            steps.calls(),
+            vec!["discard"],
+            "the restore must be cut short and torn down, not allowed to finish"
+        );
+        assert_eq!(
+            f.store
+                .get(&f.sandbox_id)
+                .await
+                .expect("get")
+                .expect("record")
+                .state,
+            MobilityState::Parked
+        );
+    }
+
+    /// A migration told to stop before it started has nothing to unwind, so it
+    /// must not take the claim at all: a destination that could actually run
+    /// the sandbox would find it claimed by a move already giving up.
+    #[tokio::test]
+    async fn a_migration_cancelled_before_it_claims_touches_nothing() {
+        let f = fixture().await;
+        let steps = Arc::new(RecordingSteps::default());
+        let saga = saga(
+            f.store.clone(),
+            "node-b",
+            steps.clone(),
+            Duration::from_secs(30),
+        );
+
+        let cancel = MoveCancel::new();
+        cancel.request();
+        match saga
+            .migrate(&f.sandbox_id, &f.fingerprint, &[], &[], &cancel)
+            .await
+            .expect("migrate")
+        {
+            MigrationOutcome::RolledBack { reason } => {
+                assert!(reason.contains("cancelled"), "unexpected reason: {reason}")
+            }
+            other => panic!("expected a rollback, got {other:?}"),
+        }
+
+        assert!(steps.calls().is_empty(), "nothing should have been touched");
+        assert_eq!(
+            f.store
+                .get(&f.sandbox_id)
+                .await
+                .expect("get")
+                .expect("record")
+                .state,
+            MobilityState::Parked,
+            "the sandbox must stay available to a destination that will finish"
+        );
+    }
+
+    /// Past the restore the guest is live here and only the record disagrees.
+    /// Honouring a cancellation in that window is what produces the ambiguity
+    /// the ordering exists to remove, so the commit finishes regardless.
+    #[tokio::test]
+    async fn a_cancellation_after_the_restore_does_not_abandon_the_handover() {
+        struct CancelWhenRestored {
+            cancel: MoveCancel,
+        }
+
+        #[async_trait]
+        impl MigrationSteps for CancelWhenRestored {
+            async fn restore(&self, _record: &MobilityRecord) -> Result<()> {
+                // The guest is up on this node the instant this returns.
+                self.cancel.request();
+                Ok(())
+            }
+
+            async fn discard_restored(&self, _record: &MobilityRecord) -> Result<()> {
+                panic!("a restore that succeeded must not be torn down");
+            }
+
+            async fn release_origin_state(&self, _record: &MobilityRecord) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let f = fixture().await;
+        let cancel = MoveCancel::new();
+        let coordinator = Arc::new(
+            MobilityCoordinator::new(f.store.clone(), "node-b")
+                .with_claim_ttl(Duration::from_secs(30)),
+        );
+        let saga = MigrationSaga::new(
+            coordinator,
+            Arc::new(CancelWhenRestored {
+                cancel: cancel.clone(),
+            }),
+        )
+        .with_claim_ttl(Duration::from_secs(30));
+
+        assert_eq!(
+            saga.migrate(&f.sandbox_id, &f.fingerprint, &[], &[], &cancel)
+                .await
+                .expect("migrate"),
+            MigrationOutcome::Migrated
+        );
+        assert!(
+            matches!(
+                f.store
+                    .get(&f.sandbox_id)
+                    .await
+                    .expect("get")
+                    .expect("record")
+                    .state,
+                MobilityState::Evacuated { ref to_node_id, .. } if to_node_id == "node-b"
+            ),
+            "the record must name the node the guest is actually running on"
+        );
+    }
+
     #[tokio::test]
     async fn an_unknown_sandbox_is_not_migrated() {
         let f = fixture().await;
@@ -667,9 +879,15 @@ mod tests {
         );
 
         assert_eq!(
-            saga.migrate(&SandboxId::new(), &f.fingerprint, &[], &[])
-                .await
-                .expect("migrate"),
+            saga.migrate(
+                &SandboxId::new(),
+                &f.fingerprint,
+                &[],
+                &[],
+                &MoveCancel::new()
+            )
+            .await
+            .expect("migrate"),
             MigrationOutcome::NotClaimable(ClaimOutcome::Unknown)
         );
         assert!(steps.calls().is_empty());
@@ -798,7 +1016,7 @@ mod lost_claim_tests {
         .with_claim_ttl(Duration::from_secs(30));
 
         let outcome = saga
-            .migrate(&sandbox_id, &fingerprint, &[], &[])
+            .migrate(&sandbox_id, &fingerprint, &[], &[], &MoveCancel::new())
             .await
             .expect("migrate");
 
@@ -840,7 +1058,7 @@ mod lost_claim_tests {
 
         let coordinator = Arc::new(MobilityCoordinator::new(store, "node-b"));
         let outcome = MigrationSaga::new(coordinator, Arc::new(NoopSteps))
-            .migrate(&sandbox_id, &fingerprint, &[], &[])
+            .migrate(&sandbox_id, &fingerprint, &[], &[], &MoveCancel::new())
             .await
             .expect("migrate");
 
