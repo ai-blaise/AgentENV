@@ -99,7 +99,9 @@ General config notes:
 - `scheduler.binding_ttl` must be a duration string such as `"30s"` in JSON config files.
 - `scheduler.report_ttl` controls how long an observed node heartbeat stays healthy.
 - `scheduler.binding_ttl` controls how long sandbox-to-node bindings survive without a fresh `RecordAssignment` or heartbeat roster refresh.
-- `scheduler.redis_addr` selects Redis-backed sandbox binding storage when set; when empty, the scheduler uses the in-memory binding store. It accepts either `host:port` or a Redis URL such as `redis://[:password@]host:6379/db`.
+- `scheduler.redis_addr` selects Redis-backed sandbox binding storage when set; when empty, the scheduler uses the in-memory binding store. It accepts `host:port`, a comma-separated list of cluster seeds (`host1:6379,host2:6379,host3:6379`), or a Redis URL such as `redis://[:password@]host:6379/db`.
+
+  Whether to speak the cluster protocol is asked of the server rather than inferred from the address, so a single-seed cluster works and a misconfiguration fails at startup rather than on the first `MOVED`. Bindings are keyed by sandbox id and node indexes by node id, each with its own hash tag, so they shard across the cluster instead of piling into one slot — the read path that every proxied request takes is a single key in a single slot.
 - `--query-only` starts a read-only scheduler that supports only `LookupNode`; it requires `scheduler.redis_addr` and does not need node discovery config.
 - `scheduler.artifact_store_capacity` controls how many distinct P2P artifact keys the in-memory artifact index keeps before LRU eviction; defaults to `1000000`.
 - `scheduler.artifact_lookup_node_limit` controls how many node IDs a P2P artifact lookup returns; values `<= 0` return all matching nodes.

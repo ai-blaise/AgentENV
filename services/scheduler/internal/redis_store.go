@@ -23,48 +23,215 @@ type redisBindingRecord struct {
 	RecordedAtMs int64 `json:"recorded_at_ms,omitempty"`
 }
 
+// RedisBindingStore keeps sandbox-to-node bindings in Redis, on a single
+// instance or across a cluster.
+//
+// # Why no operation spans two keys
+//
+// Redis Cluster shards by key, and a script may only touch keys in one slot.
+// The obvious layout — a binding key and a per-node index set, mutated
+// together — cannot satisfy that: a node's sandboxes hash all over the
+// keyspace. Pinning everything into one slot with a shared hash tag would make
+// it legal and pointless, since every binding in the fleet would land on one
+// shard.
+//
+// So each key stands alone. A binding is tagged by its sandbox id, a node
+// index by its node id, and every script touches exactly one of them. What
+// used to be one atomic script is now a sequence of single-key operations, and
+// the guards below are what make that safe.
+//
+// # Why losing atomicity is affordable here
+//
+// Reconciliation is a convergence loop, not a transaction: it runs again on
+// the next heartbeat. The two ways a sequence can be interrupted both heal.
+//
+//   - An index entry whose binding is gone is skipped, then dropped from the
+//     index on the pass that notices.
+//   - A binding missing from its node's index is untouched by reconciliation
+//     and re-added the next time the node reports it in a roster.
+//
+// What must not happen is deleting a binding that has moved on, and that is
+// prevented per key rather than by a lock: a delete only fires when the
+// binding still names the node being reconciled, and never inside the grace
+// window that covers a binding written after the node collected its roster.
 type RedisBindingStore struct {
-	client           *redis.Client
+	client           redis.UniversalClient
 	bindingTTL       time.Duration
 	reconcileGrace   time.Duration
 	keyPrefix        string
 	operationTimeout time.Duration
 }
 
+// NewRedisBindingStore connects to `addr`, which may be a comma-separated list
+// of cluster seeds.
+//
+// Whether to speak the cluster protocol is asked of the server rather than
+// inferred from the address. A single-seed cluster is ordinary, and a client
+// that guessed "one address means one instance" would fail on the first MOVED
+// it received — at some arbitrary later moment rather than at startup.
 func NewRedisBindingStore(addr string, bindingTTL time.Duration) (*RedisBindingStore, error) {
-	addr = strings.TrimSpace(addr)
-	if addr == "" {
-		return nil, fmt.Errorf("redis address is required")
+	addrs, opts, err := parseRedisAddress(addr)
+	if err != nil {
+		return nil, err
 	}
 	if bindingTTL <= 0 {
 		bindingTTL = defaultBindingTTL
 	}
 
-	var opts *redis.Options
-	if strings.Contains(addr, "://") {
-		parsed, err := redis.ParseURL(addr)
-		if err != nil {
-			return nil, fmt.Errorf("parse redis address: %w", err)
-		}
-		opts = parsed
-	} else {
-		opts = &redis.Options{Addr: addr}
-	}
-
 	store := &RedisBindingStore{
-		client:           redis.NewClient(opts),
 		bindingTTL:       bindingTTL,
 		reconcileGrace:   defaultReconcileGracePeriod,
 		keyPrefix:        defaultRedisBindingKeyPrefix,
 		operationTimeout: defaultRedisOperationTimeout,
 	}
+
+	client, err := store.connect(addrs, opts)
+	if err != nil {
+		return nil, err
+	}
+	store.client = client
+
 	ctx, cancel := store.context()
 	defer cancel()
-	if err := store.client.Ping(ctx).Err(); err != nil {
-		_ = store.client.Close()
-		return nil, fmt.Errorf("connect redis: %w", err)
+	if err := store.loadScripts(ctx); err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("load redis scripts: %w", err)
 	}
 	return store, nil
+}
+
+// parseRedisAddress splits a configured address into seeds plus any options a
+// URL form carried.
+func parseRedisAddress(addr string) ([]string, *redis.Options, error) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return nil, nil, fmt.Errorf("redis address is required")
+	}
+
+	if strings.Contains(addr, "://") {
+		parsed, err := redis.ParseURL(addr)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse redis address: %w", err)
+		}
+		return []string{parsed.Addr}, parsed, nil
+	}
+
+	seeds := make([]string, 0, 1)
+	for _, seed := range strings.Split(addr, ",") {
+		seed = strings.TrimSpace(seed)
+		if seed != "" {
+			seeds = append(seeds, seed)
+		}
+	}
+	if len(seeds) == 0 {
+		return nil, nil, fmt.Errorf("redis address is required")
+	}
+	return seeds, nil, nil
+}
+
+func (s *RedisBindingStore) connect(addrs []string, opts *redis.Options) (redis.UniversalClient, error) {
+	single := redis.NewClient(singleOptions(addrs[0], opts))
+	ctx, cancel := s.context()
+	defer cancel()
+
+	// `INFO cluster`, not `CLUSTER INFO`: only the former reports whether
+	// cluster mode is enabled at all. `CLUSTER INFO` describes the state of a
+	// cluster and says nothing about whether this server is in one.
+	info, err := single.Info(ctx, "cluster").Result()
+	if err == nil && strings.Contains(info, "cluster_enabled:1") {
+		_ = single.Close()
+		cluster := redis.NewClusterClient(clusterOptions(addrs, opts))
+		ctx, cancel := s.context()
+		defer cancel()
+		if err := cluster.Ping(ctx).Err(); err != nil {
+			_ = cluster.Close()
+			return nil, fmt.Errorf("connect redis cluster: %w", err)
+		}
+		return cluster, nil
+	}
+	// A server with cluster support compiled out answers with an error rather
+	// than with cluster_enabled:0, so an error here is not itself a failure.
+	if err := single.Ping(ctx).Err(); err != nil {
+		_ = single.Close()
+		return nil, fmt.Errorf("connect redis: %w", err)
+	}
+	return single, nil
+}
+
+func singleOptions(addr string, opts *redis.Options) *redis.Options {
+	if opts == nil {
+		return &redis.Options{Addr: addr}
+	}
+	clone := *opts
+	clone.Addr = addr
+	return &clone
+}
+
+func clusterOptions(addrs []string, opts *redis.Options) *redis.ClusterOptions {
+	cluster := &redis.ClusterOptions{Addrs: addrs}
+	if opts != nil {
+		cluster.Username = opts.Username
+		cluster.Password = opts.Password
+		cluster.TLSConfig = opts.TLSConfig
+	}
+	return cluster
+}
+
+// loadScripts primes every server with the scripts, so the common path can use
+// EVALSHA.
+//
+// On a cluster this has to reach every master: a script is cached per server,
+// and a client that loaded it on one shard would find it missing the moment a
+// key hashed elsewhere.
+func (s *RedisBindingStore) loadScripts(ctx context.Context) error {
+	load := func(ctx context.Context, target redis.Scripter) error {
+		for _, script := range []*redis.Script{redisSetBindingScript, redisDeleteBindingScript} {
+			if err := script.Load(ctx, target).Err(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if cluster, ok := s.client.(*redis.ClusterClient); ok {
+		return cluster.ForEachMaster(ctx, func(ctx context.Context, shard *redis.Client) error {
+			return load(ctx, shard)
+		})
+	}
+	return load(ctx, s.client)
+}
+
+// runPipeline executes a batch of scripted commands, reloading the scripts and
+// retrying once if the server has forgotten them.
+//
+// `Script.Run` normally falls back from EVALSHA to EVAL on NOSCRIPT, but
+// inside a pipeline it cannot: the error only becomes visible after Exec, by
+// which point the batch is already sent. A Redis restart or a SCRIPT FLUSH
+// would otherwise fail every binding write until the process was restarted —
+// and, as the caller reports per-assignment errors rather than one, would fail
+// them quietly.
+func (s *RedisBindingStore) runPipeline(
+	ctx context.Context,
+	build func(redis.Pipeliner) []*redis.Cmd,
+) ([]*redis.Cmd, error) {
+	pipe := s.client.Pipeline()
+	commands := build(pipe)
+	_, err := pipe.Exec(ctx)
+	if err != nil && isNoScriptError(err) {
+		if loadErr := s.loadScripts(ctx); loadErr != nil {
+			return commands, fmt.Errorf("reload redis scripts: %w", loadErr)
+		}
+		pipe = s.client.Pipeline()
+		commands = build(pipe)
+		_, err = pipe.Exec(ctx)
+	}
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return commands, err
+	}
+	return commands, nil
+}
+
+func isNoScriptError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "NOSCRIPT")
 }
 
 func (s *RedisBindingStore) Close() error {
@@ -84,7 +251,7 @@ func (s *RedisBindingStore) Get(sandboxID string, _ time.Time) (Node, bool, erro
 	defer cancel()
 	raw, err := s.client.Get(ctx, s.bindingKey(sandboxID)).Bytes()
 	if err != nil {
-		if err == redis.Nil {
+		if errors.Is(err, redis.Nil) {
 			return Node{}, false, nil
 		}
 		return Node{}, false, fmt.Errorf("redis get binding: %w", err)
@@ -93,48 +260,29 @@ func (s *RedisBindingStore) Get(sandboxID string, _ time.Time) (Node, bool, erro
 	return node, ok, nil
 }
 
-func (s *RedisBindingStore) Record(sandboxID string, node Node, _ time.Time) error {
-	sandboxID = strings.TrimSpace(sandboxID)
-	node.ID = strings.TrimSpace(node.ID)
-	node.Endpoint = strings.TrimSpace(node.Endpoint)
-	if sandboxID == "" || node.ID == "" || node.Endpoint == "" {
+func (s *RedisBindingStore) Record(sandboxID string, node Node, now time.Time) error {
+	errs := s.RecordBatch([]BindingAssignment{{SandboxID: sandboxID, Node: node}}, now)
+	if len(errs) == 0 {
 		return nil
 	}
-	value, err := marshalRedisNode(node)
-	if err != nil {
-		return err
-	}
-
-	ctx, cancel := s.context()
-	defer cancel()
-	if err := redisRecordBindingScript.Run(ctx, s.client,
-		[]string{s.bindingKey(sandboxID), s.nodeKey(node.ID)},
-		value,
-		node.ID,
-		sandboxID,
-		int64(s.bindingTTL/time.Millisecond),
-		s.keyPrefix,
-		s.nodeIndexTTLMillis(),
-	).Err(); err != nil {
-		return fmt.Errorf("redis record binding: %w", err)
-	}
-	return nil
+	return errs[0]
 }
 
 func (s *RedisBindingStore) RecordBatch(assignments []BindingAssignment, _ time.Time) []error {
 	if len(assignments) == 0 {
 		return nil
 	}
-
 	errs := make([]error, len(assignments))
 
 	ctx, cancel := s.context()
 	defer cancel()
 
-	// One pipeline for the whole batch: a 100-way fork otherwise pays 100
-	// sequential round trips inside the caller's deadline.
-	pipe := s.client.Pipeline()
-	commands := make([]*redis.Cmd, len(assignments))
+	// Two pipelines rather than two round trips per assignment. A 100-way fork
+	// would otherwise pay 100 sequential round trips inside the caller's
+	// deadline; on a cluster go-redis splits each pipeline per shard, so the
+	// cost is one round trip per shard rather than per binding.
+	nodes := make([]Node, len(assignments))
+	values := make([]string, len(assignments))
 	for i, assignment := range assignments {
 		sandboxID := strings.TrimSpace(assignment.SandboxID)
 		node := assignment.Node
@@ -148,33 +296,53 @@ func (s *RedisBindingStore) RecordBatch(assignments []BindingAssignment, _ time.
 			errs[i] = err
 			continue
 		}
-		commands[i] = redisRecordBindingScript.Run(ctx, pipe,
-			[]string{s.bindingKey(sandboxID), s.nodeKey(node.ID)},
-			value,
-			node.ID,
-			sandboxID,
-			int64(s.bindingTTL/time.Millisecond),
-			s.keyPrefix,
-			s.nodeIndexTTLMillis(),
-		)
+		nodes[i] = node
+		values[i] = value
 	}
 
-	// Exec reports the first command error; per-command results are read below,
-	// so a single failure does not mask the outcome of its siblings.
-	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+	writes, err := s.runPipeline(ctx, func(pipe redis.Pipeliner) []*redis.Cmd {
+		commands := make([]*redis.Cmd, len(assignments))
+		for i, assignment := range assignments {
+			if values[i] == "" || errs[i] != nil {
+				continue
+			}
+			commands[i] = redisSetBindingScript.Run(ctx, pipe,
+				[]string{s.bindingKey(strings.TrimSpace(assignment.SandboxID))},
+				values[i],
+				nodes[i].ID,
+				int64(s.bindingTTL/time.Millisecond),
+			)
+		}
+		return commands
+	})
+	if err != nil {
 		for i := range errs {
-			if errs[i] == nil && commands[i] != nil {
+			if errs[i] == nil && values[i] != "" {
 				errs[i] = fmt.Errorf("redis record binding: %w", err)
 			}
 		}
 	}
-	for i, cmd := range commands {
+
+	// Second pass: move each sandbox into its new node's index, and out of the
+	// index of whichever node used to own it. Index membership is a hint used
+	// only by reconciliation, so a failure here costs a slower convergence
+	// rather than a wrong binding, and is not reported as a record failure.
+	index := s.client.Pipeline()
+	for i, cmd := range writes {
 		if cmd == nil || errs[i] != nil {
 			continue
 		}
 		if err := cmd.Err(); err != nil && !errors.Is(err, redis.Nil) {
 			errs[i] = fmt.Errorf("redis record binding: %w", err)
+			continue
 		}
+		sandboxID := strings.TrimSpace(assignments[i].SandboxID)
+		previous := commandString(cmd)
+		s.queueIndexMove(ctx, index, sandboxID, previous, nodes[i].ID)
+	}
+	if _, err := index.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		// Deliberately not an error for the caller. See above.
+		_ = err
 	}
 	return errs
 }
@@ -191,6 +359,11 @@ func (s *RedisBindingStore) ReconcileNodeRoster(node Node, sandboxIDs []string, 
 	}
 
 	desired := normalizeSandboxIDs(sandboxIDs)
+	desiredSet := make(map[string]struct{}, len(desired))
+	for _, sandboxID := range desired {
+		desiredSet[sandboxID] = struct{}{}
+	}
+
 	value := ""
 	if len(desired) > 0 {
 		if node.Endpoint == "" {
@@ -203,54 +376,216 @@ func (s *RedisBindingStore) ReconcileNodeRoster(node Node, sandboxIDs []string, 
 		}
 	}
 
-	rosterComplete := "0"
-	grace := int64(s.reconcileGrace / time.Millisecond)
-	switch completeness {
-	case RosterComplete:
-		rosterComplete = "1"
-	case RosterFinal:
-		// The node is gone; nothing is left to observe a binding it never saw.
-		rosterComplete = "1"
-		grace = 0
+	// An empty roster from a node that has not finished startup recovery says
+	// nothing about what it owns, so it is not grounds for deleting anything.
+	if len(desired) == 0 && completeness == RosterIncomplete {
+		return nil
 	}
 
-	args := make([]any, 0, 8+len(desired))
-	args = append(args,
-		node.ID,
-		value,
-		int64(s.bindingTTL/time.Millisecond),
-		s.keyPrefix,
-		s.nodeIndexTTLMillis(),
-		len(desired),
-		rosterComplete,
-		grace,
-	)
-	for _, sandboxID := range desired {
-		args = append(args, sandboxID)
+	grace := s.reconcileGrace
+	if completeness == RosterFinal {
+		// The node is gone; nothing is left to observe a binding it never saw.
+		grace = 0
 	}
 
 	ctx, cancel := s.context()
 	defer cancel()
-	if err := redisReconcileNodeScript.Run(ctx, s.client, []string{s.nodeKey(node.ID)}, args...).Err(); err != nil {
-		return fmt.Errorf("redis reconcile node bindings: %w", err)
+
+	nodeKey := s.nodeKey(node.ID)
+	current, err := s.client.SMembers(ctx, nodeKey).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("redis read node index: %w", err)
+	}
+
+	removed, retained, err := s.deleteDeparted(ctx, node.ID, current, desiredSet, grace)
+	if err != nil {
+		return err
+	}
+
+	previous, err := s.refreshRoster(ctx, desired, value, node.ID)
+	if err != nil {
+		return err
+	}
+
+	return s.updateNodeIndex(ctx, nodeKey, node.ID, desired, removed, previous, retained)
+}
+
+// deleteDeparted removes bindings the node no longer reports.
+//
+// Each delete is guarded on the binding still naming this node, so a sandbox
+// that moved elsewhere between the roster being collected and this running is
+// left alone rather than deleted out from under its new owner.
+func (s *RedisBindingStore) deleteDeparted(
+	ctx context.Context,
+	nodeID string,
+	current []string,
+	desired map[string]struct{},
+	grace time.Duration,
+) (removed []string, retained int, err error) {
+	departed := make([]string, 0, len(current))
+	for _, sandboxID := range current {
+		if _, ok := desired[sandboxID]; !ok {
+			departed = append(departed, sandboxID)
+		}
+	}
+	if len(departed) == 0 {
+		return nil, 0, nil
+	}
+
+	commands, execErr := s.runPipeline(ctx, func(pipe redis.Pipeliner) []*redis.Cmd {
+		commands := make([]*redis.Cmd, len(departed))
+		for i, sandboxID := range departed {
+			commands[i] = redisDeleteBindingScript.Run(ctx, pipe,
+				[]string{s.bindingKey(sandboxID)},
+				nodeID,
+				int64(grace/time.Millisecond),
+			)
+		}
+		return commands
+	})
+	if execErr != nil {
+		return nil, 0, fmt.Errorf("redis delete departed bindings: %w", execErr)
+	}
+
+	removed = make([]string, 0, len(departed))
+	for i, cmd := range commands {
+		switch commandString(cmd) {
+		case "retained":
+			// Written after the node collected its roster; the next pass sees it.
+			retained++
+		default:
+			// Deleted, absent, or owned by someone else — either way it does
+			// not belong in this node's index.
+			removed = append(removed, departed[i])
+		}
+	}
+	return removed, retained, nil
+}
+
+// refreshRoster writes every binding the node reports and returns, per
+// sandbox, whichever node previously owned it.
+func (s *RedisBindingStore) refreshRoster(
+	ctx context.Context,
+	desired []string,
+	value string,
+	nodeID string,
+) (map[string]string, error) {
+	if len(desired) == 0 {
+		return nil, nil
+	}
+
+	commands, err := s.runPipeline(ctx, func(pipe redis.Pipeliner) []*redis.Cmd {
+		commands := make([]*redis.Cmd, len(desired))
+		for i, sandboxID := range desired {
+			commands[i] = redisSetBindingScript.Run(ctx, pipe,
+				[]string{s.bindingKey(sandboxID)},
+				value,
+				nodeID,
+				int64(s.bindingTTL/time.Millisecond),
+			)
+		}
+		return commands
+	})
+	if err != nil {
+		return nil, fmt.Errorf("redis refresh node bindings: %w", err)
+	}
+
+	previous := make(map[string]string, len(desired))
+	for i, cmd := range commands {
+		if owner := commandString(cmd); owner != "" && owner != nodeID {
+			previous[desired[i]] = owner
+		}
+	}
+	return previous, nil
+}
+
+// updateNodeIndex brings the reverse index in line with what was just written.
+func (s *RedisBindingStore) updateNodeIndex(
+	ctx context.Context,
+	nodeKey string,
+	nodeID string,
+	desired []string,
+	removed []string,
+	previous map[string]string,
+	retained int,
+) error {
+	pipe := s.client.Pipeline()
+	if len(removed) > 0 {
+		pipe.SRem(ctx, nodeKey, toAny(removed)...)
+	}
+	if len(desired) > 0 {
+		pipe.SAdd(ctx, nodeKey, toAny(desired)...)
+	}
+	// A sandbox that moved here from another node has to leave that node's
+	// index, or its old owner would keep trying to reconcile a binding it no
+	// longer holds.
+	for sandboxID, owner := range previous {
+		if owner != nodeID {
+			pipe.SRem(ctx, s.nodeKey(owner), sandboxID)
+		}
+	}
+	if len(desired) > 0 || retained > 0 {
+		pipe.PExpire(ctx, nodeKey, defaultRedisNodeIndexTTL)
+	} else {
+		pipe.Del(ctx, nodeKey)
+	}
+
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		return fmt.Errorf("redis update node index: %w", err)
 	}
 	return nil
+}
+
+// queueIndexMove adds the sandbox to its new node's index and removes it from
+// the old one's.
+func (s *RedisBindingStore) queueIndexMove(
+	ctx context.Context,
+	pipe redis.Pipeliner,
+	sandboxID string,
+	previousNodeID string,
+	nodeID string,
+) {
+	if previousNodeID != "" && previousNodeID != nodeID {
+		pipe.SRem(ctx, s.nodeKey(previousNodeID), sandboxID)
+	}
+	pipe.SAdd(ctx, s.nodeKey(nodeID), sandboxID)
+	pipe.PExpire(ctx, s.nodeKey(nodeID), defaultRedisNodeIndexTTL)
 }
 
 func (s *RedisBindingStore) context() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), s.operationTimeout)
 }
 
+// bindingKey tags on the sandbox id so every binding shards independently and
+// the read path — one key, on every proxied request — never leaves its slot.
 func (s *RedisBindingStore) bindingKey(sandboxID string) string {
-	return s.keyPrefix + ":sandbox:" + sandboxID
+	return s.keyPrefix + ":sandbox:{" + sandboxID + "}"
 }
 
+// nodeKey tags on the node id so a node's index is one key in one slot.
 func (s *RedisBindingStore) nodeKey(nodeID string) string {
-	return s.keyPrefix + ":node:" + nodeID
+	return s.keyPrefix + ":node:{" + nodeID + "}"
 }
 
-func (s *RedisBindingStore) nodeIndexTTLMillis() int64 {
-	return int64(defaultRedisNodeIndexTTL / time.Millisecond)
+func toAny(values []string) []any {
+	out := make([]any, len(values))
+	for i, value := range values {
+		out[i] = value
+	}
+	return out
+}
+
+// commandString reads a script result that returns a string, treating any
+// other shape — including an error already reported elsewhere — as empty.
+func commandString(cmd *redis.Cmd) string {
+	if cmd == nil || cmd.Err() != nil {
+		return ""
+	}
+	value, err := cmd.Text()
+	if err != nil {
+		return ""
+	}
+	return value
 }
 
 func normalizeSandboxIDs(sandboxIDs []string) []string {
@@ -336,122 +671,58 @@ local function build_value(node_json, recorded_at)
 end
 `
 
-const redisRecordBindingScriptSource = redisLuaHelpers + `
--- KEYS[1]: sandbox binding key, e.g. {prefix}:sandbox:{sandbox_id}
--- KEYS[2]: target node reverse-index set key, e.g. {prefix}:node:{node_id}
+// redisSetBindingScript writes one binding and reports who held it before.
+//
+// The previous owner is returned rather than acted on, because that owner's
+// index lives in another slot and this script may not touch it. The caller
+// moves the index entry afterwards.
+const redisSetBindingScriptSource = redisLuaHelpers + `
+-- KEYS[1]: sandbox binding key
 -- ARGV[1]: node object JSON ({"node_id":"...","endpoint":"..."})
 -- ARGV[2]: target node ID
--- ARGV[3]: sandbox ID
--- ARGV[4]: binding TTL in milliseconds
--- ARGV[5]: redis binding key prefix, used to remove stale reverse-index entries from old nodes
--- ARGV[6]: node reverse-index set TTL in milliseconds
+-- ARGV[3]: binding TTL in milliseconds
 local raw = redis.call("GET", KEYS[1])
 local old_node_id = parse_node_id(raw)
-if old_node_id and old_node_id ~= ARGV[2] then
-  redis.call("SREM", ARGV[5] .. ":node:" .. old_node_id, ARGV[3])
-end
+
 -- recorded_at marks when this sandbox->node binding was established, so a
--- refresh of the same owner keeps the original stamp.
+-- refresh by the same owner keeps the original stamp and the reconcile grace
+-- window does not restart on every heartbeat.
 local recorded_at = now_ms()
 if old_node_id == ARGV[2] then
   recorded_at = parse_recorded_at(raw) or recorded_at
 end
-redis.call("SET", KEYS[1], build_value(ARGV[1], recorded_at), "PX", ARGV[4])
-redis.call("SADD", KEYS[2], ARGV[3])
-redis.call("PEXPIRE", KEYS[2], ARGV[6])
-return 1
+
+redis.call("SET", KEYS[1], build_value(ARGV[1], recorded_at), "PX", ARGV[3])
+return old_node_id or ""
 `
 
-const redisReconcileNodeScriptSource = redisLuaHelpers + `
--- KEYS[1]: reconciled node reverse-index set key, e.g. {prefix}:node:{node_id}
--- ARGV[1]: reconciled node ID
--- ARGV[2]: node object JSON for this node ({"node_id":"...","endpoint":"..."}); empty when desired_count is 0
--- ARGV[3]: binding TTL in milliseconds
--- ARGV[4]: redis binding key prefix, used to build sandbox binding keys and other node reverse-index keys
--- ARGV[5]: node reverse-index set TTL in milliseconds
--- ARGV[6]: desired sandbox ID count (N)
--- ARGV[7]: 1 when the reporting node considers its roster authoritative, else 0
--- ARGV[8]: reconcile grace period in milliseconds
--- ARGV[9..8+N]: desired sandbox IDs reported by the node heartbeat
-local node_key = KEYS[1]
-local node_id = ARGV[1]
-local value = ARGV[2]
-local ttl_ms = ARGV[3]
-local key_prefix = ARGV[4]
-local node_index_ttl_ms = ARGV[5]
-local desired_count = tonumber(ARGV[6]) or 0
-local roster_complete = ARGV[7] == "1"
-local grace_ms = tonumber(ARGV[8]) or 0
-local reconcile_now = now_ms()
-
--- within_grace reports whether a binding was written too recently to have been
--- visible when the reporting node collected its roster.
-local function within_grace(raw)
-  local recorded_at = parse_recorded_at(raw)
-  if not recorded_at then
-    return false
-  end
-  return (reconcile_now - recorded_at) < grace_ms
+// redisDeleteBindingScript removes a binding the reporting node no longer
+// claims, if it is still that node's to remove.
+const redisDeleteBindingScriptSource = redisLuaHelpers + `
+-- KEYS[1]: sandbox binding key
+-- ARGV[1]: reconciling node ID
+-- ARGV[2]: reconcile grace period in milliseconds
+local raw = redis.call("GET", KEYS[1])
+if not raw then
+  return "absent"
 end
 
-local function binding_key(sandbox_id)
-  return key_prefix .. ":sandbox:" .. sandbox_id
+-- Written too recently to have been visible when the node collected its
+-- roster, so its absence from that roster says nothing.
+local recorded_at = parse_recorded_at(raw)
+local grace_ms = tonumber(ARGV[2]) or 0
+if recorded_at and (now_ms() - recorded_at) < grace_ms then
+  return "retained"
 end
 
-local function node_key_for(id)
-  return key_prefix .. ":node:" .. id
+-- Owned by someone else now. Not ours to delete, and not ours to index.
+if parse_node_id(raw) ~= ARGV[1] then
+  return "moved"
 end
 
--- An empty roster from a node that has not finished startup recovery says
--- nothing about what it owns, so it is not grounds for deleting anything.
-if desired_count == 0 and not roster_complete then
-  return 1
-end
-
-local desired = {}
-for i = 1, desired_count do
-  local sandbox_id = ARGV[8 + i]
-  desired[sandbox_id] = true
-end
-
-local retained = 0
-local current = redis.call("SMEMBERS", node_key)
-for _, sandbox_id in ipairs(current) do
-  if not desired[sandbox_id] then
-    local raw = redis.call("GET", binding_key(sandbox_id))
-    if within_grace(raw) then
-      retained = retained + 1
-    else
-      local old_node_id = parse_node_id(raw)
-      if old_node_id == node_id then
-        redis.call("DEL", binding_key(sandbox_id))
-      end
-      redis.call("SREM", node_key, sandbox_id)
-    end
-  end
-end
-
-for sandbox_id, _ in pairs(desired) do
-  local raw = redis.call("GET", binding_key(sandbox_id))
-  local old_node_id = parse_node_id(raw)
-  if old_node_id and old_node_id ~= node_id then
-    redis.call("SREM", node_key_for(old_node_id), sandbox_id)
-  end
-  local recorded_at = reconcile_now
-  if old_node_id == node_id then
-    recorded_at = parse_recorded_at(raw) or recorded_at
-  end
-  redis.call("SET", binding_key(sandbox_id), build_value(value, recorded_at), "PX", ttl_ms)
-  redis.call("SADD", node_key, sandbox_id)
-end
-
-if desired_count > 0 or retained > 0 then
-  redis.call("PEXPIRE", node_key, node_index_ttl_ms)
-else
-  redis.call("DEL", node_key)
-end
-return 1
+redis.call("DEL", KEYS[1])
+return "deleted"
 `
 
-var redisRecordBindingScript = redis.NewScript(redisRecordBindingScriptSource)
-var redisReconcileNodeScript = redis.NewScript(redisReconcileNodeScriptSource)
+var redisSetBindingScript = redis.NewScript(redisSetBindingScriptSource)
+var redisDeleteBindingScript = redis.NewScript(redisDeleteBindingScriptSource)
