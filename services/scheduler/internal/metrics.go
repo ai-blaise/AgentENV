@@ -170,3 +170,21 @@ var schedulerStaleIncarnationTotal = promauto.NewCounterVec(
 	},
 	[]string{"node_id"},
 )
+
+// Roster-digest outcomes. Without these the elision is invisible: a fleet
+// where every heartbeat still carries a full roster and one where none do look
+// the same from outside.
+var (
+	schedulerRosterCacheHitTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_roster_cache_hit_total",
+			Help: "Heartbeats reconciled from a cached roster instead of the wire.",
+		},
+	)
+	schedulerRosterFullRequestTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_roster_full_request_total",
+			Help: "Heartbeats whose roster digest could not be resolved, so the full roster was requested.",
+		},
+	)
+)

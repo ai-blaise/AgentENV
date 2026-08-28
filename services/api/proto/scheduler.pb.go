@@ -1392,10 +1392,10 @@ func (x *ObservedNode) GetLastSeenUnixMs() int64 {
 //	10  roster_complete         (allocated, defined below)
 //	11  heartbeat_interval_ms   (allocated, defined below)
 //	12  p2p_artifacts           (reserved for the P2P index re-announce)
-//	13  roster_digest           (reserved for the sequenced worker outbox)
-//	14  last_event_seq          (reserved for the sequenced worker outbox)
-//	15  roster_generation       (reserved for the sequenced worker outbox)
-//	16  roster_full             (reserved for the sequenced worker outbox)
+//	13  roster_digest           (allocated, defined below)
+//	14  roster_full             (allocated, defined below)
+//	15  last_event_seq          (reserved for the sequenced worker outbox)
+//	16  roster_generation       (reserved for the sequenced worker outbox)
 //
 // Observed-usage fields are allocated on NodeSnapshot (17-19), not here.
 type HeartbeatRequest struct {
@@ -1420,8 +1420,27 @@ type HeartbeatRequest struct {
 	// that its own binding TTL is ordered correctly against it rather than
 	// assuming a value. Zero means the node did not report one.
 	HeartbeatIntervalMs uint64 `protobuf:"varint,11,opt,name=heartbeat_interval_ms,json=heartbeatIntervalMs,proto3" json:"heartbeat_interval_ms,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// A hash over the node's roster, sent on every heartbeat.
+	//
+	// The roster is almost always identical to the last one, and at fleet scale
+	// resending and re-reconciling it dominates both the wire cost of a
+	// heartbeat and the scheduler's work per heartbeat. The digest lets an
+	// unchanged roster be recognised in one comparison.
+	//
+	// Empty means the node does not compute one, in which case sandbox_ids is
+	// authoritative as before. It is never a substitute for the roster itself:
+	// a scheduler that has no digest recorded for a node must still reconcile.
+	RosterDigest string `protobuf:"bytes,13,opt,name=roster_digest,json=rosterDigest,proto3" json:"roster_digest,omitempty"`
+	// Whether sandbox_ids carries the roster this digest was computed over.
+	//
+	// False means the node elided it because the digest was unchanged. A
+	// scheduler that cannot use the digest — it restarted, or it never saw this
+	// node — asks for the roster back via HeartbeatResponse.request_full_roster
+	// rather than guessing, because an elided roster and an empty one are
+	// indistinguishable on the wire and mean opposite things.
+	RosterFull    bool `protobuf:"varint,14,opt,name=roster_full,json=rosterFull,proto3" json:"roster_full,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *HeartbeatRequest) Reset() {
@@ -1531,11 +1550,41 @@ func (x *HeartbeatRequest) GetHeartbeatIntervalMs() uint64 {
 	return 0
 }
 
+func (x *HeartbeatRequest) GetRosterDigest() string {
+	if x != nil {
+		return x.RosterDigest
+	}
+	return ""
+}
+
+func (x *HeartbeatRequest) GetRosterFull() bool {
+	if x != nil {
+		return x.RosterFull
+	}
+	return false
+}
+
 type HeartbeatResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	CpuConfigJson string                 `protobuf:"bytes,1,opt,name=cpu_config_json,json=cpuConfigJson,proto3" json:"cpu_config_json,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Asks the node to include its full roster on the next heartbeat.
+	//
+	// Set whenever the scheduler cannot resolve the node's digest against
+	// something it already holds, which is the case after a scheduler restart
+	// and for a node it has not seen before. Without it a node that never
+	// changes its roster would never resend it, and a restarted scheduler would
+	// hold no bindings for that node indefinitely.
+	RequestFullRoster bool `protobuf:"varint,2,opt,name=request_full_roster,json=requestFullRoster,proto3" json:"request_full_roster,omitempty"`
+	// Whether this scheduler understands roster digests at all.
+	//
+	// A node must keep sending its full roster until it sees this, because an
+	// older scheduler leaves it false and would otherwise read an elided roster
+	// as an empty one and delete every binding for the node. `request_full_roster`
+	// cannot carry that signal: false there means "no need", which is exactly
+	// what an older scheduler also sends.
+	RosterDigestAccepted bool `protobuf:"varint,3,opt,name=roster_digest_accepted,json=rosterDigestAccepted,proto3" json:"roster_digest_accepted,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *HeartbeatResponse) Reset() {
@@ -1573,6 +1622,20 @@ func (x *HeartbeatResponse) GetCpuConfigJson() string {
 		return x.CpuConfigJson
 	}
 	return ""
+}
+
+func (x *HeartbeatResponse) GetRequestFullRoster() bool {
+	if x != nil {
+		return x.RequestFullRoster
+	}
+	return false
+}
+
+func (x *HeartbeatResponse) GetRosterDigestAccepted() bool {
+	if x != nil {
+		return x.RosterDigestAccepted
+	}
+	return false
 }
 
 type SandboxEvent struct {
@@ -2604,7 +2667,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x06commit\x18\x06 \x01(\tR\x06commit\x12<\n" +
 	"\fmachine_info\x18\a \x01(\v2\x19.scheduler.v1.MachineInfoR\vmachineInfo\x126\n" +
 	"\bsnapshot\x18\b \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12)\n" +
-	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\xfc\x03\n" +
+	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\xb6\x04\n" +
 	"\x10HeartbeatRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
@@ -2619,9 +2682,14 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\x12'\n" +
 	"\x0froster_complete\x18\n" +
 	" \x01(\bR\x0erosterComplete\x122\n" +
-	"\x15heartbeat_interval_ms\x18\v \x01(\x04R\x13heartbeatIntervalMsJ\x04\b\f\x10\rJ\x04\b\r\x10\x0eJ\x04\b\x0e\x10\x0fJ\x04\b\x0f\x10\x10J\x04\b\x10\x10\x11\";\n" +
+	"\x15heartbeat_interval_ms\x18\v \x01(\x04R\x13heartbeatIntervalMs\x12#\n" +
+	"\rroster_digest\x18\r \x01(\tR\frosterDigest\x12\x1f\n" +
+	"\vroster_full\x18\x0e \x01(\bR\n" +
+	"rosterFullJ\x04\b\f\x10\rJ\x04\b\x0f\x10\x10J\x04\b\x10\x10\x11\"\xa1\x01\n" +
 	"\x11HeartbeatResponse\x12&\n" +
-	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\"\xf9\x01\n" +
+	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\x12.\n" +
+	"\x13request_full_roster\x18\x02 \x01(\bR\x11requestFullRoster\x124\n" +
+	"\x16roster_digest_accepted\x18\x03 \x01(\bR\x14rosterDigestAccepted\"\xf9\x01\n" +
 	"\fSandboxEvent\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12=\n" +

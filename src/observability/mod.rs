@@ -16,10 +16,12 @@ mod machine;
 mod model;
 pub mod prometheus;
 mod reporter;
+mod roster;
 mod service;
 
 pub use host::{DiskMetric, HostMetrics, HostMetricsCollector};
 pub use kill_switch::{global_kill_switch, KillSwitch, KillSwitchAction};
 pub use model::{MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
 pub use reporter::ObservabilityReporter;
+pub use roster::{roster_digest, RosterDigestState, RosterReport};
 pub use service::ObservabilityService;

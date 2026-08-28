@@ -155,7 +155,6 @@ func withinLimit(n RichNode, limit *config.NodeResourceLimit) bool {
 	return true
 }
 
-
 // FilterExcludedNodes removes nodes the caller has already tried.
 //
 // Unlike FilterByHealth this does not fail open: the exclusions are facts

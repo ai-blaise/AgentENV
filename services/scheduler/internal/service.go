@@ -37,6 +37,8 @@ type Service struct {
 	// candidateSampleSize bounds how many nodes one placement inspects. Zero
 	// disables sampling and restores whole-fleet evaluation.
 	candidateSampleSize int
+	// rosters lets a node skip resending an unchanged sandbox roster.
+	rosters *rosterCache
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -54,6 +56,7 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		healthGateEnabled:   true,
 		ledger:              NewReservationLedger(0),
 		candidateSampleSize: defaultCandidateSampleSize,
+		rosters:             newRosterCache(),
 		store:               store,
 		artifacts:           NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
 	}
@@ -370,14 +373,71 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 	if req.GetRosterComplete() {
 		completeness = RosterComplete
 	}
-	if err := s.store.ReconcileNodeRoster(node, req.GetSandboxIds(), completeness, now); err != nil {
-		s.logger.Warn("scheduler heartbeat binding reconcile failed",
-			zap.String("node_id", nodeID),
-			zap.Error(err),
-		)
-		return nil, status.Error(codes.Unavailable, "binding store unavailable")
+
+	roster, requestFullRoster := s.resolveRoster(req, nodeID, completeness)
+	if !requestFullRoster {
+		if err := s.store.ReconcileNodeRoster(node, roster, completeness, now); err != nil {
+			s.logger.Warn("scheduler heartbeat binding reconcile failed",
+				zap.String("node_id", nodeID),
+				zap.Error(err),
+			)
+			return nil, status.Error(codes.Unavailable, "binding store unavailable")
+		}
 	}
-	return &schedulerv1.HeartbeatResponse{CpuConfigJson: cpuConfigJSON}, nil
+
+	return &schedulerv1.HeartbeatResponse{
+		CpuConfigJson:        cpuConfigJSON,
+		RequestFullRoster:    requestFullRoster,
+		RosterDigestAccepted: true,
+	}, nil
+}
+
+// resolveRoster returns the roster to reconcile against, or asks for it back.
+//
+// A node that sent its roster is authoritative and its digest is cached. A
+// node that elided it is served from the cache, so bindings are still
+// refreshed and only the wire cost is saved. A digest the scheduler cannot
+// resolve — it restarted, or the roster changed and the node has not caught up
+// — means nothing is reconciled this round and the roster is requested back:
+// an elided roster and an empty one look identical on the wire and mean
+// opposite things, and guessing wrong deletes a node's entire data plane.
+//
+// Skipping one round is safe because the binding TTL is required to be several
+// heartbeats long, which the registry validates against the node's reported
+// interval.
+func (s *Service) resolveRoster(
+	req *schedulerv1.HeartbeatRequest,
+	nodeID string,
+	completeness RosterCompleteness,
+) (roster []string, requestFullRoster bool) {
+	digest := strings.TrimSpace(req.GetRosterDigest())
+
+	// No digest, or the roster came along anyway: the wire is authoritative.
+	if digest == "" || req.GetRosterFull() {
+		if digest != "" {
+			s.rosters.remember(nodeID, digest, req.GetSandboxIds(), completeness == RosterComplete)
+		}
+		return req.GetSandboxIds(), false
+	}
+
+	cached, cachedComplete, ok := s.rosters.lookup(nodeID, digest)
+	if !ok {
+		s.logger.Debug("scheduler asked a node for its full roster",
+			zap.String("node_id", nodeID),
+			zap.String("roster_digest", digest),
+		)
+		schedulerRosterFullRequestTotal.Inc()
+		return nil, true
+	}
+
+	// A node that has since finished startup recovery upgrades a cached
+	// incomplete roster: the ids are the same, but what an empty one means is
+	// no longer the same.
+	if completeness == RosterComplete && !cachedComplete {
+		s.rosters.remember(nodeID, digest, cached, true)
+	}
+	schedulerRosterCacheHitTotal.Inc()
+	return cached, false
 }
 
 func (s *Service) ReportSandboxEvent(_ context.Context, req *schedulerv1.ReportSandboxEventRequest) (*schedulerv1.ReportSandboxEventResponse, error) {
@@ -522,6 +582,9 @@ func (s *Service) UnregisterNode(_ context.Context, req *schedulerv1.UnregisterN
 
 	now := time.Now()
 	s.ledger.Forget(nodeID)
+	// A node that comes back is asked for a fresh roster rather than
+	// reconciled against whatever it had before it left.
+	s.rosters.forget(nodeID)
 	if err := s.store.ReconcileNodeRoster(Node{ID: nodeID}, nil, RosterFinal, now); err != nil {
 		s.logger.Warn("scheduler unregister binding reconcile failed",
 			zap.String("node_id", nodeID),

@@ -11,7 +11,7 @@ use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 use tracing::{debug, error, info, trace, warn};
 
-use super::ObservabilityService;
+use super::{ObservabilityService, RosterDigestState};
 use crate::cfg::{ClusterConfig, ObservabilitySchedulerReportConfig};
 use crate::orchestrator::{SandboxLifecycleEvent, SandboxLifecycleEventType};
 use crate::p2p::P2pEndpoint;
@@ -101,6 +101,7 @@ impl ObservabilityReporter {
             let mut backoff = config.interval;
             let mut wait = Duration::from_millis(100);
             let mut pending_cpu_config_json = service.take_cpu_config_json();
+            let mut rosters = RosterDigestState::default();
 
             loop {
                 if wait > Duration::ZERO {
@@ -121,6 +122,7 @@ impl ObservabilityReporter {
                     &scheduler_channel,
                     &mut pending_cpu_config_json,
                     p2p_endpoint.as_ref(),
+                    &mut rosters,
                 )
                 .await
                 {
@@ -152,6 +154,11 @@ impl ObservabilityReporter {
                             retry_after_secs = backoff.as_secs(),
                             "observability heartbeat failed"
                         );
+                        // A failed heartbeat may mean the scheduler restarted
+                        // or moved. The next one reintroduces the roster in
+                        // full rather than assuming the new process inherited
+                        // what the old one knew.
+                        rosters.reset();
                         wait = backoff;
                         backoff = cmp::min(backoff.saturating_mul(2), MAX_REPORT_BACKOFF);
                     }
@@ -261,6 +268,7 @@ impl ObservabilityReporter {
         scheduler_channel: &Channel,
         cpu_config_json: &mut Option<String>,
         p2p_endpoint: Option<&P2pEndpoint>,
+        rosters: &mut RosterDigestState,
     ) -> Result<()> {
         let mut snapshot = service
             .node_snapshot()
@@ -269,7 +277,9 @@ impl ObservabilityReporter {
         snapshot.machine_info.cpu_config_json = cpu_config_json.clone();
         let node_id = snapshot.node_id.clone();
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let req = Self::build_heartbeat_request(snapshot, now_ms, p2p_endpoint, config.interval);
+        let roster = rosters.report(&snapshot.sandbox_ids);
+        let req =
+            Self::build_heartbeat_request(snapshot, now_ms, p2p_endpoint, config.interval, roster);
 
         let mut request = Request::new(req);
         request.set_timeout(GRPC_CALL_TIMEOUT);
@@ -288,6 +298,10 @@ impl ObservabilityReporter {
             .into_inner();
 
         *cpu_config_json = None;
+        rosters.observe_response(
+            response.roster_digest_accepted,
+            response.request_full_roster,
+        );
 
         if !response.cpu_config_json.is_empty() {
             service.store_cluster_cpu_config(response.cpu_config_json);
@@ -371,6 +385,7 @@ impl ObservabilityReporter {
         now_ms: i64,
         p2p_endpoint: Option<&P2pEndpoint>,
         interval: Duration,
+        roster: super::RosterReport,
     ) -> scheduler::HeartbeatRequest {
         scheduler::HeartbeatRequest {
             node_id: snapshot.node_id,
@@ -421,11 +436,9 @@ impl ObservabilityReporter {
                 paused_allocated_cpu: snapshot.metrics.paused_allocated_cpu,
                 paused_allocated_memory_bytes: snapshot.metrics.paused_allocated_memory_bytes,
             }),
-            sandbox_ids: snapshot
-                .sandbox_ids
-                .into_iter()
-                .map(|id| id.to_string())
-                .collect(),
+            roster_full: roster.sandbox_ids.is_some(),
+            sandbox_ids: roster.sandbox_ids.unwrap_or_default(),
+            roster_digest: roster.digest,
             p2p_endpoint: p2p_endpoint.map(|endpoint| scheduler::P2pEndpoint {
                 backend: endpoint.backend.clone(),
                 address: endpoint.address.clone(),
