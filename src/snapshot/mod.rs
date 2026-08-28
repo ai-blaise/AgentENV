@@ -7,6 +7,7 @@ pub mod mock;
 mod p2p;
 pub mod repository;
 pub(crate) mod runtime_support;
+pub mod sealing;
 mod types;
 
 pub use manager::SnapshotManager;
@@ -15,6 +16,7 @@ pub use mobility::{
     MigrationFingerprint, MigrationIncompatibility, MobilityBlocker,
 };
 pub use repository::{RepositoryError, RepositoryResult, SnapshotListFilter};
+pub use sealing::{ArtifactSealingKey, SealScope};
 pub(crate) use types::rootfs_snapshot_image_tag;
 pub use types::{
     CommandContext, CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer,

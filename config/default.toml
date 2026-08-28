@@ -217,6 +217,17 @@ repository_backend = "posix_fs"
 # artifacts remain authoritative in their repository.
 p2p_enabled = true
 
+# Hex-encoded 32-byte cluster secret used to seal snapshot artifacts before
+# they are published to peers, e.g. `openssl rand -hex 32`. Every node that
+# may resolve a snapshot must be given the same value; provision it out of
+# band, the same way as [sandbox].access_token_hash_seed.
+#
+# When unset, snapshot fixed artifacts are not advertised to peers at all.
+# They carry guest CPU state and the manifest naming every layer the guest is
+# built from, and anyone in the mesh who can name the key would otherwise read
+# them. Resolution falls back to the repository, which costs bandwidth only.
+# artifact_sealing_secret = ""
+
 # OSS only: publish a compatible rootfs back to its source registry as
 # agentenv-snapshot-{snapshot_id}. Existing remote layers are reused by digest;
 # only new deltas are uploaded, and APIs return the tag as imageRef. Memory and

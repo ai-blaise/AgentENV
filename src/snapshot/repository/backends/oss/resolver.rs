@@ -18,6 +18,7 @@ use crate::snapshot::runtime_support::{
     hydrate_runtime_manifest, materialize_image_config_error, parse_firecracker_manifest,
     runtime_image_cache_key, RuntimeImageMaterializer,
 };
+use crate::snapshot::sealing::SealScope;
 use crate::snapshot::types::RuntimeArtifactLease;
 use crate::snapshot::{
     CommittedAttachedDrive, OverlaybdLayerRef, RepositoryError, RepositoryResult,
@@ -113,21 +114,22 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
         let vm_state_key = layout.artifact_key(SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
         let vm_state_client = Arc::clone(&self.client);
         let p2p_transport = self.p2p_transport.clone();
-        let vm_state_p2p_key = p2p::fixed_artifact_key(&id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
+        let vm_state_snapshot_id = id.to_string();
         let vm_state_handle = self
             .cache
             .ensure_cached(&vm_state_key, |dest| {
                 let client = Arc::clone(&vm_state_client);
                 let key = vm_state_key.clone();
                 let p2p_transport = p2p_transport.clone();
-                let p2p_key = vm_state_p2p_key.clone();
+                let snapshot_id = vm_state_snapshot_id.clone();
                 async move {
                     if let Some(transport) = p2p_transport.as_ref() {
-                        match p2p::fetch_artifact(transport, &p2p_key, &dest).await {
+                        let scope = SealScope::new(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
+                        match p2p::fetch_artifact(transport, &scope, &dest).await {
                             Ok(size) => return Ok(size),
                             Err(error) => {
                                 debug!(
-                                    key = %p2p_key,
+                                    snapshot_id = %snapshot_id,
                                     error = %error,
                                     "P2P vm_state fetch failed; using backend fallback"
                                 );
@@ -369,10 +371,15 @@ impl OssRuntimeResolver {
         layout: &OssSnapshotArtifactLayout<'_>,
         snapshot_id: &SnapshotId,
     ) -> RepositoryResult<crate::sandbox::FirecrackerSnapshotManifest> {
+        let snapshot_id_text = snapshot_id.to_string();
         let p2p_key =
             p2p::fixed_artifact_key(snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
+        let scope = SealScope::new(
+            &snapshot_id_text,
+            SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
+        );
         if let Some(transport) = self.p2p_transport.as_ref() {
-            match p2p::fetch_artifact_bytes(transport, &p2p_key).await {
+            match p2p::fetch_artifact_bytes(transport, &scope).await {
                 Ok(bytes) => match parse_firecracker_manifest(&bytes, &p2p_key) {
                     Ok(manifest) => return Ok(manifest),
                     Err(error) => {

@@ -391,6 +391,15 @@ pub struct SnapshotConfig {
     /// transport after each commit. Has no effect unless `[p2p].enabled` is also true.
     #[config(default = true)]
     pub p2p_enabled: bool,
+    /// Hex-encoded cluster secret used to seal snapshot artifacts before they
+    /// are published to peers.
+    ///
+    /// Every node that may resolve a snapshot must be given the same value.
+    /// When unset, snapshot fixed artifacts are not published to P2P at all:
+    /// they carry guest CPU and memory state, and a mesh participant that can
+    /// name the key would otherwise read it.
+    #[config(env = "AENV_SNAPSHOT_ARTIFACT_SEALING_SECRET", parse_env = parse_trimmed_string)]
+    pub artifact_sealing_secret: Option<String>,
     #[config(nested)]
     pub image_publish: SnapshotImagePublishConfig,
 }

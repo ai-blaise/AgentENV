@@ -14,9 +14,9 @@ use crate::sandbox::{
 use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter};
+use crate::snapshot::sealing::{global_snapshot_sealing, SnapshotSealing};
 use crate::snapshot::{
-    ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata,
-    SnapshotRecord,
+    OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
 };
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
@@ -32,13 +32,6 @@ fn managed_layer_uuids(layers: &[OverlaybdLayerRef]) -> HashSet<String> {
         .collect()
 }
 
-fn managed_layer_uuids_from_managed(layers: &[ManagedLayer]) -> HashSet<String> {
-    layers
-        .iter()
-        .filter_map(|layer| layer.uuid.clone())
-        .collect()
-}
-
 #[derive(Clone)]
 /// Coordinates committed snapshot lifecycle operations over repository-backed state.
 ///
@@ -51,6 +44,10 @@ pub struct SnapshotManager {
     repository: Arc<dyn SnapshotRepository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
+    /// Held rather than read from the process-wide state at publish time: what
+    /// may be advertised is a policy decision, and a policy decision that reads
+    /// a global cannot be exercised both ways in one test binary.
+    sealing: Arc<SnapshotSealing>,
 }
 
 impl SnapshotManager {
@@ -74,7 +71,14 @@ impl SnapshotManager {
             repository,
             runtime_resolver,
             p2p_transport,
+            sealing: global_snapshot_sealing(),
         }
+    }
+
+    /// Overrides the sealing state this manager publishes under.
+    pub fn with_sealing(mut self, sealing: Arc<SnapshotSealing>) -> Self {
+        self.sealing = sealing;
+        self
     }
 
     pub async fn create(
@@ -134,53 +138,58 @@ impl SnapshotManager {
             return;
         };
 
-        // Prepare the manifest and VM state.
-        let manifest_bytes = serde_json::to_vec(manifest).expect("manifest should serialize");
-        let mut artifacts = vec![
-            SnapshotP2pArtifact::fixed(
+        let mut artifacts = Vec::new();
+
+        // Fixed artifacts are the guest's CPU state and the manifest naming
+        // every layer it is built from, so they only leave the node sealed.
+        // Without a secret they are simply not advertised: resolution falls
+        // back to the repository, which costs bandwidth and nothing else.
+        if self.sealing.is_enabled() {
+            let manifest_bytes = serde_json::to_vec(manifest).expect("manifest should serialize");
+            artifacts.push(SnapshotP2pArtifact::fixed(
                 snapshot_id,
                 SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
                 manifest.vm_state.path.clone(),
-            ),
-            SnapshotP2pArtifact::bytes(
+            ));
+            artifacts.push(SnapshotP2pArtifact::bytes(
                 snapshot_id,
                 SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
                 manifest_bytes,
-            ),
-        ];
+            ));
+        } else {
+            warn!(
+                %snapshot_id,
+                "not advertising snapshot fixed artifacts to P2P because no sealing secret is \
+                 configured; set AENV_SNAPSHOT_ARTIFACT_SEALING_SECRET to the same value on \
+                 every node to enable peer-accelerated snapshot resolution"
+            );
+        }
 
-        // Collect any overlaybd layers referenced by this snapshot's runtime images.
+        // Rootfs layers are the only layers with a P2P consumer: the overlaybd
+        // facade resolves them by registry origin, so what it serves is content
+        // that is also a registry blob.
+        //
+        // Memory layers and attached-drive layers are deliberately not
+        // advertised. They are guest RAM and guest disk writes, they are
+        // materialized from the repository rather than from P2P, and the
+        // facade never looks them up — so publishing them exposed the most
+        // sensitive bytes on the node to anyone in the mesh in exchange for
+        // nothing. Advertising them again requires a fetch path that opens a
+        // sealed envelope, which the range-read facade does not have.
         let rootfs_uuids = managed_layer_uuids(&committed.rootfs_layers);
         artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
             &manifest.rootfs.image_config_path,
             &rootfs_uuids,
         ));
-        let memory_uuids = managed_layer_uuids_from_managed(&committed.memory_layers);
-        artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
-            &manifest.memory.image_config_path,
-            &memory_uuids,
-        ));
-        for drive in &manifest.attached_drives {
-            let drive_uuids = committed
-                .attached_drives
-                .iter()
-                .find_map(|committed_drive| match committed_drive {
-                    crate::snapshot::CommittedAttachedDrive::Overlaybd {
-                        drive_id, layers, ..
-                    } if drive_id == &drive.drive_id => Some(managed_layer_uuids(layers)),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
-                &drive.image_config_path,
-                &drive_uuids,
-            ));
+
+        if artifacts.is_empty() {
+            return;
         }
 
         // Publish all artifacts concurrently, but don't fail if any individual artifact fails to publish.
         stream::iter(artifacts)
             .for_each_concurrent(SNAPSHOT_P2P_PUBLISH_CONCURRENCY, |artifact| async move {
-                if let Err(error) = artifact.publish(transport).await {
+                if let Err(error) = artifact.publish(transport, self.sealing.as_ref()).await {
                     warn!(
                         key = %artifact.key,
                         source = %artifact.source,
@@ -430,8 +439,12 @@ mod tests {
         assert!(runnable.manifest().vm_state.path.exists());
     }
 
-    #[tokio::test]
-    async fn publish_advertises_snapshot_artifacts_to_p2p_after_commit() {
+    /// Publishes a mock snapshot under the given sealing state and returns the
+    /// transport it advertised to, along with the snapshot id and the digest of
+    /// the rootfs lower.
+    async fn publish_mock_snapshot(
+        sealing: Arc<SnapshotSealing>,
+    ) -> (Arc<MockTransport>, SnapshotId, String, TempDir, TempDir) {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let backend = PosixFsBackend::new(PosixFsBackendConfig {
             root: tempdir.path().join("repository"),
@@ -441,7 +454,8 @@ mod tests {
         .expect("posix backend");
         let (repository, runtime_resolver) = backend.into_parts();
         let p2p = Arc::new(MockTransport::default());
-        let manager = SnapshotManager::from_parts(repository, runtime_resolver, Some(p2p.clone()));
+        let manager = SnapshotManager::from_parts(repository, runtime_resolver, Some(p2p.clone()))
+            .with_sealing(sealing);
 
         let workspace = TempDir::new().expect("tempdir should exist");
         let (rootfs_lower, _, manifest) =
@@ -457,28 +471,100 @@ mod tests {
             .await
             .expect("publish should commit");
 
-        let vm_state_key = fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
-        let manifest_key =
-            fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
         let rootfs_layer_digest = crate::digest::FileDigest::describe(&rootfs_lower)
             .await
-            .expect("describe rootfs lower");
-        let rootfs_layer_key = layer_key_from_digest(&rootfs_layer_digest.sha256);
+            .expect("describe rootfs lower")
+            .sha256;
 
+        (p2p, snapshot_id, rootfs_layer_digest, tempdir, workspace)
+    }
+
+    fn test_sealing() -> Arc<SnapshotSealing> {
+        Arc::new(SnapshotSealing::with_key(
+            crate::snapshot::ArtifactSealingKey::from_bytes(vec![5_u8; 32]).expect("key"),
+        ))
+    }
+
+    #[tokio::test]
+    async fn publish_advertises_snapshot_artifacts_to_p2p_after_commit() {
+        let (p2p, snapshot_id, rootfs_digest, _repository, _workspace) =
+            publish_mock_snapshot(test_sealing()).await;
+
+        for key in [
+            fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
+            fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest),
+            layer_key_from_digest(&rootfs_digest),
+        ] {
+            assert!(
+                p2p.lookup(&key).await.expect("lookup").is_some(),
+                "{key} should have been advertised"
+            );
+        }
+    }
+
+    /// The fixed artifacts carry guest CPU state and the manifest naming every
+    /// layer the guest is built from. Without a sealing secret they must not be
+    /// advertised at all: resolution falls back to the repository, which costs
+    /// bandwidth rather than confidentiality.
+    #[tokio::test]
+    async fn unsealed_nodes_do_not_advertise_fixed_artifacts() {
+        let (p2p, snapshot_id, rootfs_digest, _repository, _workspace) =
+            publish_mock_snapshot(Arc::new(SnapshotSealing::disabled())).await;
+
+        for key in [
+            fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
+            fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest),
+        ] {
+            assert!(
+                p2p.lookup(&key).await.expect("lookup").is_none(),
+                "{key} must not be advertised without a sealing secret"
+            );
+        }
+
+        // Rootfs layers are registry-shaped content with a real P2P consumer,
+        // so they stay advertised either way.
         assert!(p2p
-            .lookup(&vm_state_key)
+            .lookup(&layer_key_from_digest(&rootfs_digest))
             .await
-            .expect("lookup vm state")
+            .expect("lookup")
             .is_some());
-        assert!(p2p
-            .lookup(&manifest_key)
+    }
+
+    /// What the transport holds must be ciphertext. This is the property the
+    /// whole change exists for, so it is asserted on the bytes rather than
+    /// inferred from the code path.
+    #[tokio::test]
+    async fn advertised_fixed_artifacts_are_ciphertext() {
+        let sealing = test_sealing();
+        let (p2p, snapshot_id, _rootfs_digest, _repository, _workspace) =
+            publish_mock_snapshot(sealing.clone()).await;
+
+        let key = fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest);
+        let descriptor = p2p
+            .lookup(&key)
             .await
-            .expect("lookup manifest")
-            .is_some());
-        assert!(p2p
-            .lookup(&rootfs_layer_key)
-            .await
-            .expect("lookup rootfs layer")
-            .is_some());
+            .expect("lookup")
+            .expect("manifest should be advertised");
+        let published = p2p.fetch_bytes(&descriptor).await.expect("fetch");
+
+        assert!(
+            crate::snapshot::sealing::has_sealed_magic(&published),
+            "the advertised manifest must be a sealed envelope"
+        );
+        assert!(
+            !published.windows(9).any(|window| window == b"vm_state."),
+            "the advertised manifest must not leak its plaintext"
+        );
+
+        let opened = crate::snapshot::sealing::open_slice(
+            sealing.key().expect("key"),
+            &crate::snapshot::SealScope::new(
+                &snapshot_id.to_string(),
+                SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
+            ),
+            &published,
+        )
+        .expect("a holder of the secret can open it");
+        serde_json::from_slice::<serde_json::Value>(&opened).expect("opens to the manifest");
     }
 }

@@ -102,6 +102,21 @@ async fn main() -> anyhow::Result<()> {
         warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
     }
 
+    // Installed before the snapshot manager, which decides at publish time
+    // whether fixed artifacts may be advertised at all.
+    let snapshot_sealing = Arc::new(agentenv::snapshot::sealing::SnapshotSealing::from_config(
+        config,
+    )?);
+    if !snapshot_sealing.is_enabled() && config.snapshot.p2p_enabled {
+        warn!(
+            target: "agentenv",
+            "snapshot artifact sealing is not configured; snapshot fixed artifacts will not be \
+             advertised to peers. Set AENV_SNAPSHOT_ARTIFACT_SEALING_SECRET to the same value on \
+             every node to enable peer-accelerated snapshot resolution"
+        );
+    }
+    agentenv::snapshot::sealing::set_global_snapshot_sealing(snapshot_sealing);
+
     let snapshot_p2p_transport = config
         .snapshot
         .p2p_enabled
