@@ -5202,6 +5202,17 @@ impl crate::orchestrator::MobilityHooks for RecordingMobility {
             .unwrap()
             .push("publish_metrics".to_string());
     }
+
+    async fn record_committed(
+        &self,
+        sandbox_id: &SandboxId,
+        snapshot_id: &crate::snapshot::SnapshotId,
+    ) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("record_committed:{sandbox_id}:{snapshot_id}"));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

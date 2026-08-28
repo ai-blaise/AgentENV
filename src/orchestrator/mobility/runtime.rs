@@ -64,6 +64,12 @@ pub trait MobilityHooks: Send + Sync {
     async fn claim_for_local_resume(&self, sandbox_id: &SandboxId) -> ResumeFence;
     /// Drops a record because the sandbox is running here again, or is gone.
     async fn forget(&self, sandbox_id: &SandboxId);
+    /// Records that a paused sandbox's state now lives in the repository.
+    async fn record_committed(
+        &self,
+        sandbox_id: &SandboxId,
+        snapshot_id: &crate::snapshot::SnapshotId,
+    );
     /// Counts records by state, for the node's metrics.
     async fn record_counts(&self) -> MobilityRecordCounts;
     /// Publishes those counts as gauges.
@@ -82,6 +88,14 @@ impl<S: MobilityStore + 'static> MobilityHooks for MobilityRuntime<S> {
 
     async fn forget(&self, sandbox_id: &SandboxId) {
         MobilityRuntime::forget(self, sandbox_id).await
+    }
+
+    async fn record_committed(
+        &self,
+        sandbox_id: &SandboxId,
+        snapshot_id: &crate::snapshot::SnapshotId,
+    ) {
+        MobilityRuntime::record_committed(self, sandbox_id, snapshot_id).await
     }
 
     async fn record_counts(&self) -> MobilityRecordCounts {
@@ -168,6 +182,33 @@ impl<S: MobilityStore> MobilityRuntime<S> {
                     by_node_id: "an unreadable mobility store".to_string(),
                 }
             }
+        }
+    }
+
+    /// Records that a paused sandbox's state now lives in the repository, so a
+    /// destination can restore it.
+    ///
+    /// Until this, the record truthfully says the sandbox cannot move: its
+    /// artifacts were files on this node's disk.
+    pub async fn record_committed(
+        &self,
+        sandbox_id: &SandboxId,
+        snapshot_id: &crate::snapshot::SnapshotId,
+    ) {
+        let Ok(Some(record)) = self.coordinator.store().get(sandbox_id).await else {
+            // No record means mobility was enabled after the pause, or the
+            // sandbox is not paused. Either way there is nothing to update,
+            // and inventing a record here would claim a paused sandbox this
+            // node never wrote down.
+            return;
+        };
+        let committed = record.committed_to(snapshot_id.to_string());
+        if let Err(error) = self.coordinator.store().upsert(&committed).await {
+            warn!(
+                %sandbox_id,
+                error = %error,
+                "published a paused sandbox but could not record it as movable"
+            );
         }
     }
 

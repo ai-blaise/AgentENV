@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 
+use super::config::FirecrackerSnapshotConfig;
+use crate::sandbox::ublk::OverlaybdConfig;
 use crate::sandbox::ExtraDrive;
 
 pub(crate) const MANIFEST_FORMAT_VERSION: u32 = 1;
@@ -264,5 +266,158 @@ mod tests {
             .expect_err("snapshot attached drive virtual size should be non-zero");
 
         assert!(err.to_string().contains("virtual size must be non-zero"));
+    }
+}
+
+impl FirecrackerSnapshotConfig {
+    /// Describes a paused sandbox's artifacts as a publishable manifest.
+    ///
+    /// A paused sandbox already has everything a committed snapshot needs —
+    /// the VM state file, the memory image, the rootfs and every attached
+    /// drive — written to disk by the pause. What it lacks is a repository
+    /// entry, which is why a paused sandbox cannot move: its artifacts are
+    /// node-local files no other node can read.
+    ///
+    /// This is the conversion that lets it be published. Nothing is copied or
+    /// moved here; the manifest points at the live paused artifacts, and the
+    /// repository's import copies or hard-links them, so the sandbox stays
+    /// resumable on this node either way.
+    pub fn to_publishable_manifest(&self) -> Result<FirecrackerSnapshotManifest> {
+        publishable_manifest(
+            &self.vm_state_path,
+            &self.mem_overlaybd_config,
+            self.mem_virtual_size,
+            self.common.rootfs_image_config.as_ref(),
+            self.common.rootfs_virtual_size,
+            &self.common.extra_drives,
+        )
+    }
+}
+
+/// The manifest a set of paused artifacts describes.
+///
+/// Free-standing so the refusals below can be exercised without assembling a
+/// whole runtime config, which is a hundred fields of which six matter here.
+pub(crate) fn publishable_manifest(
+    vm_state_path: &Path,
+    memory: &OverlaybdConfig,
+    mem_virtual_size: u64,
+    rootfs: Option<&OverlaybdConfig>,
+    rootfs_virtual_size: Option<u64>,
+    extra_drives: &[ExtraDrive],
+) -> Result<FirecrackerSnapshotManifest> {
+    let rootfs = rootfs.ok_or_else(|| {
+        anyhow!("paused sandbox has no rootfs image config, so there is nothing to publish")
+    })?;
+    // The recorded size is what a restoring node sizes its block device from,
+    // so an absent one has to refuse rather than default: guessing it wrong
+    // truncates the guest's disk.
+    let rootfs_virtual_size = rootfs_virtual_size.ok_or_else(|| {
+        anyhow!("paused sandbox has no recorded rootfs size, so it cannot be published")
+    })?;
+
+    FirecrackerSnapshotManifest::new(
+        vm_state_path,
+        memory.image_config_path.clone(),
+        mem_virtual_size,
+        rootfs.image_config_path.clone(),
+        rootfs_virtual_size,
+        extra_drives,
+    )
+}
+
+#[cfg(test)]
+mod publishable_manifest_tests {
+    use super::*;
+
+    fn overlaybd(path: &str, read_only: bool) -> OverlaybdConfig {
+        OverlaybdConfig {
+            image_config_path: PathBuf::from(path),
+            read_only,
+            runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+        }
+    }
+
+    fn drives() -> Vec<ExtraDrive> {
+        vec![ExtraDrive::Overlaybd {
+            drive_id: "data".to_string(),
+            image_config_path: PathBuf::from("/paused/drives/data/image.json"),
+            read_only: false,
+            mount_path: PathBuf::from("/mnt/data"),
+            virtual_size: Some(4096),
+            sub_path: None,
+        }]
+    }
+
+    fn manifest() -> Result<FirecrackerSnapshotManifest> {
+        publishable_manifest(
+            Path::new("/paused/vm_state.bin"),
+            &overlaybd("/paused/memory/image.json", true),
+            2 * 1024 * 1024 * 1024,
+            Some(&overlaybd("/paused/rootfs/image.json", false)),
+            Some(8 * 1024 * 1024 * 1024),
+            &drives(),
+        )
+    }
+
+    #[test]
+    fn a_paused_sandbox_describes_every_artifact_it_has() {
+        let manifest = manifest().expect("a complete paused config should be publishable");
+
+        assert_eq!(manifest.vm_state.path, Path::new("/paused/vm_state.bin"));
+        assert_eq!(
+            manifest.memory.image_config_path,
+            Path::new("/paused/memory/image.json"),
+            "the memory image must be the memory image, not the rootfs"
+        );
+        assert_eq!(manifest.memory.virtual_size, 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            manifest.rootfs.image_config_path,
+            Path::new("/paused/rootfs/image.json")
+        );
+        assert_eq!(manifest.rootfs.virtual_size, 8 * 1024 * 1024 * 1024);
+
+        // Drives have to come along: a snapshot missing one restores a guest
+        // whose disk is simply absent.
+        assert_eq!(manifest.attached_drives.len(), 1);
+        assert_eq!(manifest.attached_drives[0].drive_id, "data");
+        assert_eq!(
+            manifest.attached_drives[0].image_config_path,
+            Path::new("/paused/drives/data/image.json")
+        );
+    }
+
+    #[test]
+    fn a_rootfs_without_a_recorded_size_cannot_be_published() {
+        let error = publishable_manifest(
+            Path::new("/paused/vm_state.bin"),
+            &overlaybd("/paused/memory/image.json", true),
+            1024,
+            Some(&overlaybd("/paused/rootfs/image.json", false)),
+            None,
+            &[],
+        )
+        .expect_err("an unsized rootfs must not be publishable");
+        assert!(
+            error.to_string().contains("recorded rootfs size"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_paused_sandbox_without_a_rootfs_cannot_be_published() {
+        let error = publishable_manifest(
+            Path::new("/paused/vm_state.bin"),
+            &overlaybd("/paused/memory/image.json", true),
+            1024,
+            None,
+            Some(4096),
+            &[],
+        )
+        .expect_err("a sandbox with no rootfs must not be publishable");
+        assert!(
+            error.to_string().contains("rootfs image config"),
+            "unexpected error: {error}"
+        );
     }
 }

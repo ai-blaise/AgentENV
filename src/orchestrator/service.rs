@@ -15,10 +15,11 @@ use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
 use crate::sandbox::{
-    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerSandboxFactory,
-    FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator,
-    SandboxBackend, SandboxBackendFactory, SandboxForkSpec, SandboxLaunchConfig,
-    SandboxNetworkPolicy, SandboxRuntimeInfo,
+    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerPausedState,
+    FirecrackerSandboxFactory, FirecrackerSnapshotManifest, FreshSandboxBuildSpec,
+    PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator, SandboxBackend,
+    SandboxBackendFactory, SandboxForkSpec, SandboxLaunchConfig, SandboxNetworkPolicy,
+    SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
@@ -1642,6 +1643,71 @@ where
     }
 
     /// Captures a snapshot of a running sandbox.
+    /// Describes a paused sandbox's artifacts so they can be published.
+    ///
+    /// A paused sandbox already holds everything a committed snapshot needs;
+    /// what it lacks is a repository entry, which is exactly why it cannot
+    /// move. This is the read that lets one be created.
+    ///
+    /// Nothing is mutated and no state transition happens: the artifacts are
+    /// copied or hard-linked by the repository's import, so the sandbox stays
+    /// resumable here whether or not the publish succeeds. That is what makes
+    /// it safe to offer on a sandbox someone is about to resume.
+    pub async fn describe_paused_snapshot(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Result<(SandboxMetadata, FirecrackerSnapshotManifest)> {
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        if metadata.state != SandboxState::Paused {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            });
+        }
+
+        let paused_state = metadata.paused_state.as_ref().ok_or_else(|| {
+            OrchestratorError::InternalError(format!(
+                "sandbox {sandbox_id} is paused but carries no paused state to publish"
+            ))
+        })?;
+        let firecracker = paused_state
+            .downcast_ref::<FirecrackerPausedState>()
+            .ok_or_else(|| {
+                OrchestratorError::InternalError(format!(
+                    "sandbox {sandbox_id} was paused by a backend that cannot publish paused state"
+                ))
+            })?;
+
+        let manifest = firecracker
+            .snapshot_config()
+            .to_publishable_manifest()
+            .map_err(|error| {
+                OrchestratorError::InternalError(format!(
+                    "sandbox {sandbox_id} cannot be published: {error:#}"
+                ))
+            })?;
+        Ok((metadata, manifest))
+    }
+
+    /// Records that a paused sandbox's state now lives in the repository, so a
+    /// destination can restore it.
+    ///
+    /// Until this, the record says the sandbox cannot move — truthfully, since
+    /// its artifacts were node-local files.
+    pub async fn mark_paused_snapshot_committed(
+        &self,
+        sandbox_id: SandboxId,
+        snapshot_id: &crate::snapshot::SnapshotId,
+    ) {
+        if let Some(mobility) = self.mobility() {
+            mobility.record_committed(&sandbox_id, snapshot_id).await;
+        }
+    }
+
     pub async fn capture_snapshot(
         self: &Arc<Self>,
         sandbox_id: SandboxId,

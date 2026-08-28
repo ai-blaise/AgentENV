@@ -1174,6 +1174,41 @@ impl Sandboxes<()> for ApiImpl {
             None => None,
         };
 
+        // A paused sandbox is snapshotted from what it already wrote to disk
+        // rather than by capturing a live VM. That is worth having on its own,
+        // and it is also what makes a paused sandbox movable: until its state
+        // is in the repository, no other node can read it.
+        let paused = match timer
+            .time(
+                "describe_paused",
+                self.orchestrator.describe_paused_snapshot(sandbox_id),
+            )
+            .await
+        {
+            Ok(paused) => Some(paused),
+            // Not paused. Fall through to capturing a running sandbox, which
+            // reports its own state errors.
+            Err(OrchestratorError::InvalidSandboxState { .. }) => None,
+            Err(OrchestratorError::SandboxNotFound(id)) => {
+                return Ok(SandboxesSandboxIdSnapshotsPostResponse::Status404_NotFound(
+                    sandbox_not_found(id),
+                ));
+            }
+            Err(err) => {
+                return Ok(
+                    SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(
+                        Self::internal_error(&err),
+                    ),
+                );
+            }
+        };
+
+        if let Some((metadata, manifest)) = paused {
+            return self
+                .publish_paused_snapshot(sandbox_id, metadata, manifest, alias, &timer)
+                .await;
+        }
+
         let capture = match timer
             .time("capture", self.orchestrator.capture_snapshot(sandbox_id))
             .await
@@ -1476,6 +1511,71 @@ impl Sandboxes<()> for ApiImpl {
                 x_total_running,
             },
         )
+    }
+}
+
+impl ApiImpl {
+    /// Publishes a paused sandbox's existing artifacts.
+    ///
+    /// The repository copies or hard-links what it imports, so the sandbox is
+    /// still resumable here afterwards — publishing does not consume the
+    /// paused state, and a failure leaves it exactly as it was.
+    async fn publish_paused_snapshot(
+        &self,
+        sandbox_id: SandboxId,
+        metadata: crate::orchestrator::SandboxMetadata,
+        manifest: crate::sandbox::FirecrackerSnapshotManifest,
+        alias: Option<SnapshotAlias>,
+        timer: &SandboxStageTimer,
+    ) -> Result<SandboxesSandboxIdSnapshotsPostResponse, ()> {
+        let snapshot_id = SnapshotId::generate();
+        let published = match timer
+            .time(
+                "publish_paused",
+                self.snapshot_manager.publish(
+                    SnapshotPublishMetadata {
+                        id: snapshot_id.clone(),
+                        alias,
+                        source: SnapshotPublishSource::Sandbox {
+                            source_sandbox_id: metadata.id.to_string(),
+                        },
+                        context: metadata.context.clone(),
+                        startup: metadata.startup.clone(),
+                        resources: metadata.resources,
+                        runtime_versions: metadata.runtime_versions.clone(),
+                        virtualization_mode: metadata.virtualization_mode,
+                        image_configs: metadata.image_configs.clone(),
+                        custom_extension_params: metadata.custom_extension_params.clone(),
+                    },
+                    manifest,
+                ),
+            )
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                let error =
+                    Self::bad_request_for_repository_build_error(&err).unwrap_or_else(|| {
+                        warn!(error = ?err, %sandbox_id, "failed to publish paused snapshot");
+                        Self::error(500, err.to_string())
+                    });
+                return Ok(Self::client_or_server_response(
+                    error,
+                    SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest,
+                    SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError,
+                ));
+            }
+        };
+
+        // The sandbox's state is now somewhere another node can read, which is
+        // what makes it movable. Recorded after the publish succeeds, so a
+        // failed publish never advertises a sandbox as migratable.
+        self.orchestrator
+            .mark_paused_snapshot_committed(sandbox_id, &snapshot_id)
+            .await;
+
+        let info = models::SnapshotInfo::from(published);
+        Ok(SandboxesSandboxIdSnapshotsPostResponse::Status201_SnapshotCreatedSuccessfully(info))
     }
 }
 

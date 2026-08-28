@@ -161,6 +161,19 @@ impl MobilityRecord {
         )
     }
 
+    /// Returns this record with its paused state committed to a snapshot,
+    /// under a fresh generation.
+    ///
+    /// This is what turns an unmovable record into a movable one: the
+    /// artifacts are now somewhere a destination can read.
+    pub fn committed_to(&self, snapshot_id: String) -> Self {
+        Self {
+            generation: MobilityGeneration::now(),
+            snapshot_id: Some(snapshot_id),
+            ..self.clone()
+        }
+    }
+
     /// Returns this record advanced to `state` under a fresh generation.
     pub fn transitioned_to(&self, state: MobilityState) -> Self {
         Self {
