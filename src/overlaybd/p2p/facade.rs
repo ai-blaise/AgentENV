@@ -359,11 +359,20 @@ async fn lookup_descriptor(
             None
         }
         Err(_) => {
+            // Cache the timeout as a short miss, the same as a lookup error.
+            //
+            // Not caching it meant every subsequent block read of the same
+            // layer re-paid the full lookup budget before falling back to the
+            // origin. A slow or unreachable peer therefore added that budget to
+            // every read rather than to the first one, which is the opposite of
+            // what an acceleration path should do. The miss TTL is short, so a
+            // peer that recovers is picked up again quickly.
             debug!(
                 key = %artifact_key,
                 timeout_ms = state.lookup_timeout.as_millis(),
-                "p2p lookup timed out; retrying on next read rather than caching a miss"
+                "p2p lookup timed out; caching as a short miss"
             );
+            state.descriptor_cache.insert(artifact_key.clone(), None);
             return None;
         }
     };
@@ -1282,8 +1291,17 @@ mod tests {
         origin_handle.abort();
     }
 
+    /// A lookup timeout is cached as a short miss, like a lookup error.
+    ///
+    /// This previously retried on every read. The intent was that a timeout is
+    /// not a definite "no" — the peer may be slow but hold the data — so the
+    /// acceleration path should keep trying. In practice a layer is read many
+    /// times, so an unreachable peer added the full lookup budget to *every*
+    /// read before falling back to origin, which is worse than losing P2P for
+    /// one short miss TTL. The miss TTL is deliberately much shorter than the
+    /// hit TTL, so a peer that recovers is picked up again quickly.
     #[tokio::test]
-    async fn lookup_timeouts_are_not_cached_as_misses() {
+    async fn lookup_timeouts_are_cached_as_short_misses() {
         let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
         let hits = Arc::new(AtomicUsize::new(0));
         let (origin, origin_handle) = spawn_origin(OriginState {
@@ -1314,8 +1332,16 @@ mod tests {
         assert_eq!(first.status(), StatusCode::PARTIAL_CONTENT);
         let second = get_range(&format!("{}/{}", facade.address(), origin_url), 64, 127).await;
         assert_eq!(second.status(), StatusCode::PARTIAL_CONTENT);
-        assert_eq!(transport.lookup_count.load(Ordering::Relaxed), 2);
-        assert_eq!(hits.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            transport.lookup_count.load(Ordering::Relaxed),
+            1,
+            "the second read must not re-pay the lookup budget"
+        );
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            2,
+            "both reads served by origin"
+        );
         facade.shutdown().await.unwrap();
         origin_handle.abort();
     }
