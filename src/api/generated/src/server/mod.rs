@@ -490,12 +490,20 @@ struct SandboxesColdPostBodyValidator<'a> {
 
 #[tracing::instrument(skip_all)]
 fn sandboxes_cold_post_validation(
+    header_params: models::SandboxesColdPostHeaderParams,
     body: models::NewColdSandbox,
-) -> std::result::Result<(models::NewColdSandbox,), ValidationErrors> {
+) -> std::result::Result<
+    (
+        models::SandboxesColdPostHeaderParams,
+        models::NewColdSandbox,
+    ),
+    ValidationErrors,
+> {
+    header_params.validate()?;
     let b = SandboxesColdPostBodyValidator { body: &body };
     b.validate()?;
 
-    Ok((body,))
+    Ok((header_params, body))
 }
 /// SandboxesColdPost - POST /sandboxes-cold
 #[tracing::instrument(skip_all)]
@@ -530,12 +538,41 @@ where
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
 
-    #[allow(clippy::redundant_closure)]
-    let validation = tokio::task::spawn_blocking(move || sandboxes_cold_post_validation(body))
-        .await
-        .unwrap();
+    // Header parameters
+    let header_params = {
+        let header_x_agentenv_sandbox_id =
+            headers.get(HeaderName::from_static("x-agentenv-sandbox-id"));
 
-    let Ok((body,)) = validation else {
+        let header_x_agentenv_sandbox_id = match header_x_agentenv_sandbox_id {
+            Some(v) => match header::IntoHeaderValue::<uuid::Uuid>::try_from((*v).clone()) {
+                Ok(result) => Some(result.0),
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::from(format!(
+                            "Invalid header x-agentenv-sandbox-id - {err}"
+                        )))
+                        .map_err(|e| {
+                            error!(error = ?e);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        });
+                }
+            },
+            None => None,
+        };
+
+        models::SandboxesColdPostHeaderParams {
+            x_agentenv_sandbox_id: header_x_agentenv_sandbox_id,
+        }
+    };
+
+    #[allow(clippy::redundant_closure)]
+    let validation =
+        tokio::task::spawn_blocking(move || sandboxes_cold_post_validation(header_params, body))
+            .await
+            .unwrap();
+
+    let Ok((header_params, body)) = validation else {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from(validation.unwrap_err().to_string()))
@@ -544,7 +581,7 @@ where
 
     let result = api_impl
         .as_ref()
-        .sandboxes_cold_post(&method, &host, &cookies, &claims, &body)
+        .sandboxes_cold_post(&method, &host, &cookies, &claims, &header_params, &body)
         .await;
 
     let mut response = Response::builder();
@@ -613,6 +650,42 @@ where
                                                     (body)
                                                 => {
                                                   let mut response = response.status(400);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesColdPostResponse::Status409_Conflict
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(409);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesColdPostResponse::Status503_ServiceUnavailable
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(503);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
                                                     response_headers.insert(
@@ -816,12 +889,15 @@ struct SandboxesPostBodyValidator<'a> {
 
 #[tracing::instrument(skip_all)]
 fn sandboxes_post_validation(
+    header_params: models::SandboxesPostHeaderParams,
     body: models::NewSandbox,
-) -> std::result::Result<(models::NewSandbox,), ValidationErrors> {
+) -> std::result::Result<(models::SandboxesPostHeaderParams, models::NewSandbox), ValidationErrors>
+{
+    header_params.validate()?;
     let b = SandboxesPostBodyValidator { body: &body };
     b.validate()?;
 
-    Ok((body,))
+    Ok((header_params, body))
 }
 /// SandboxesPost - POST /sandboxes
 #[tracing::instrument(skip_all)]
@@ -856,12 +932,41 @@ where
         return response_with_status_code_only(StatusCode::UNAUTHORIZED);
     };
 
-    #[allow(clippy::redundant_closure)]
-    let validation = tokio::task::spawn_blocking(move || sandboxes_post_validation(body))
-        .await
-        .unwrap();
+    // Header parameters
+    let header_params = {
+        let header_x_agentenv_sandbox_id =
+            headers.get(HeaderName::from_static("x-agentenv-sandbox-id"));
 
-    let Ok((body,)) = validation else {
+        let header_x_agentenv_sandbox_id = match header_x_agentenv_sandbox_id {
+            Some(v) => match header::IntoHeaderValue::<uuid::Uuid>::try_from((*v).clone()) {
+                Ok(result) => Some(result.0),
+                Err(err) => {
+                    return Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
+                        .body(Body::from(format!(
+                            "Invalid header x-agentenv-sandbox-id - {err}"
+                        )))
+                        .map_err(|e| {
+                            error!(error = ?e);
+                            StatusCode::INTERNAL_SERVER_ERROR
+                        });
+                }
+            },
+            None => None,
+        };
+
+        models::SandboxesPostHeaderParams {
+            x_agentenv_sandbox_id: header_x_agentenv_sandbox_id,
+        }
+    };
+
+    #[allow(clippy::redundant_closure)]
+    let validation =
+        tokio::task::spawn_blocking(move || sandboxes_post_validation(header_params, body))
+            .await
+            .unwrap();
+
+    let Ok((header_params, body)) = validation else {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .body(Body::from(validation.unwrap_err().to_string()))
@@ -870,7 +975,7 @@ where
 
     let result = api_impl
         .as_ref()
-        .sandboxes_post(&method, &host, &cookies, &claims, &body)
+        .sandboxes_post(&method, &host, &cookies, &claims, &header_params, &body)
         .await;
 
     let mut response = Response::builder();
@@ -939,6 +1044,42 @@ where
                                                     (body)
                                                 => {
                                                   let mut response = response.status(400);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesPostResponse::Status409_Conflict
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(409);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesPostResponse::Status503_ServiceUnavailable
+                                                    (body)
+                                                => {
+                                                  let mut response = response.status(503);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
                                                     response_headers.insert(

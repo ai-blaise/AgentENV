@@ -38,6 +38,10 @@ pub struct SandboxMetadata {
     pub timeout_action: SandboxTimeoutAction,
     pub expires_at: Option<SystemTime>,
     pub auto_resume: bool,
+    /// SHA-256 fingerprint of the canonical create request when the caller
+    /// supplied a stable sandbox ID. Used to make create retries idempotent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub create_request_fingerprint: Option<String>,
     /// Virtualization mode used by this sandbox for its entire lifecycle.
     #[serde(default)]
     pub virtualization_mode: VirtualizationMode,
@@ -76,6 +80,7 @@ impl Default for SandboxMetadata {
             timeout_action: SandboxTimeoutAction::Pause,
             expires_at: None,
             auto_resume: false,
+            create_request_fingerprint: None,
             virtualization_mode: VirtualizationMode::default(),
             runtime_versions: SnapshotRuntimeVersions::new(
                 "unknown".to_string(),

@@ -150,6 +150,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    "503":
+      description: Service unavailable
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     "500":
       description: Server error
       content:
@@ -1352,6 +1358,17 @@ paths:
           AuthProviderTeamAuth: []
         - AdminApiKeyAuth: []
           AdminTeamAuth: []
+      parameters:
+        - name: x-agentenv-sandbox-id
+          in: header
+          required: false
+          description: >
+            Stable UUID for an idempotent create attempt. Retries with the same
+            UUID and request body return the existing sandbox; reusing the UUID
+            with a different body returns 409 Conflict.
+          schema:
+            type: string
+            format: uuid
       requestBody:
         required: true
         content:
@@ -1374,6 +1391,10 @@ paths:
           $ref: "#/components/responses/401"
         "400":
           $ref: "#/components/responses/400"
+        "409":
+          $ref: "#/components/responses/409"
+        "503":
+          $ref: "#/components/responses/503"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1391,6 +1412,17 @@ paths:
           AuthProviderTeamAuth: []
         - AdminApiKeyAuth: []
           AdminTeamAuth: []
+      parameters:
+        - name: x-agentenv-sandbox-id
+          in: header
+          required: false
+          description: >
+            Stable UUID for an idempotent create attempt. Retries with the same
+            UUID and request body return the existing sandbox; reusing the UUID
+            with a different body returns 409 Conflict.
+          schema:
+            type: string
+            format: uuid
       requestBody:
         required: true
         content:
@@ -1413,6 +1445,10 @@ paths:
           $ref: "#/components/responses/401"
         "400":
           $ref: "#/components/responses/400"
+        "409":
+          $ref: "#/components/responses/409"
+        "503":
+          $ref: "#/components/responses/503"
         "500":
           $ref: "#/components/responses/500"
 

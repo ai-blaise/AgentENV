@@ -207,6 +207,11 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		sandboxID = hostRoute.sandboxID
 		hasSandbox = true
 		routeSource = routeSourceHost
+	} else if isSandboxCreateRequest(r) {
+		// On create, x-agentenv-sandbox-id is a caller-assigned idempotency ID,
+		// not evidence that an existing sandbox binding already exists. Keep the
+		// header on the upstream request while scheduling it as a new sandbox.
+		routeSource = routeSourceSchedule
 	} else if isSandboxControlPlaneRequest(r) {
 		sandboxID, hasSandbox = sandboxIDFromPath(r.URL.Path)
 		routeSource = routeSourcePath
@@ -284,6 +289,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			flushImmediately: longLived,
 		},
 	)
+}
+
+func isSandboxCreateRequest(r *http.Request) bool {
+	if r.Method != http.MethodPost {
+		return false
+	}
+	path := strings.TrimRight(r.URL.Path, "/")
+	return path == "/sandboxes" || path == "/sandboxes-cold"
 }
 
 func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {

@@ -72,6 +72,9 @@ pub enum OrchestratorError {
         requested: u64,
     },
 
+    #[error("sandbox {sandbox_id} create request conflicts with the original request")]
+    CreateRequestConflict { sandbox_id: SandboxId },
+
     #[error("sandbox {0} not found")]
     SandboxNotFound(SandboxId),
 

@@ -6,6 +6,8 @@ use async_trait::async_trait;
 use axum_extra::extract::CookieJar;
 use headers::Host;
 use http::Method;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use tracing::warn;
 
@@ -53,6 +55,7 @@ impl From<OrchestratorError> for models::Error {
                 Self::new(503, "orchestrator is shutting down".to_string())
             }
             OrchestratorError::AdmissionDenied { .. } => Self::new(503, err.to_string()),
+            OrchestratorError::CreateRequestConflict { .. } => Self::new(409, err.to_string()),
             OrchestratorError::SandboxNotFound(id) => sandbox_not_found(id),
             OrchestratorError::InvalidSandboxState { .. } => Self::new(400, err.to_string()),
             OrchestratorError::SandboxOperationFailed {
@@ -72,6 +75,19 @@ impl From<OrchestratorError> for models::Error {
             other => ApiImpl::internal_error(&other),
         }
     }
+}
+
+fn create_request_fingerprint(
+    request_kind: &'static str,
+    body: &impl Serialize,
+) -> Result<String, serde_json::Error> {
+    // Cargo feature unification can make serde_json preserve insertion order,
+    // so sort every object explicitly before hashing. Generated request models
+    // contain HashMaps whose serialization order is otherwise nondeterministic.
+    let mut value = serde_json::to_value(body)?;
+    value.sort_all_objects();
+    let canonical = serde_json::to_vec(&(request_kind, value))?;
+    Ok(hex::encode(Sha256::digest(canonical)))
 }
 
 impl From<SandboxState> for models::SandboxState {
@@ -440,6 +456,7 @@ impl Sandboxes<()> for ApiImpl {
         _host: &Host,
         _cookies: &CookieJar,
         _claims: &Self::Claims,
+        header_params: &models::SandboxesColdPostHeaderParams,
         body: &models::NewColdSandbox,
     ) -> Result<SandboxesColdPostResponse, ()> {
         let image_resolver = self.image_resolver();
@@ -549,10 +566,30 @@ impl Sandboxes<()> for ApiImpl {
             custom_extension_params: custom_params,
         };
 
-        match timer
-            .time("create_sandbox", self.orchestrator.create_sandbox(request))
-            .await
-        {
+        let request_fingerprint = match create_request_fingerprint("cold", body) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return Ok(SandboxesColdPostResponse::Status500_ServerError(
+                    Self::internal_error(&error),
+                ));
+            }
+        };
+        let create = async {
+            match header_params.x_agentenv_sandbox_id {
+                Some(sandbox_id) => {
+                    self.orchestrator
+                        .create_sandbox_with_id(
+                            SandboxId::from_uuid(sandbox_id),
+                            request_fingerprint,
+                            request,
+                        )
+                        .await
+                }
+                None => self.orchestrator.create_sandbox(request).await,
+            }
+        };
+
+        match timer.time("create_sandbox", create).await {
             Ok(metadata) => {
                 let sandbox_id = metadata.id.to_string();
                 Ok(
@@ -563,6 +600,14 @@ impl Sandboxes<()> for ApiImpl {
                 )
             }
             Err(err) => {
+                if matches!(&err, OrchestratorError::AdmissionDenied { .. }) {
+                    return Ok(SandboxesColdPostResponse::Status503_ServiceUnavailable(
+                        err.into(),
+                    ));
+                }
+                if matches!(&err, OrchestratorError::CreateRequestConflict { .. }) {
+                    return Ok(SandboxesColdPostResponse::Status409_Conflict(err.into()));
+                }
                 let invalid_request = match &err {
                     OrchestratorError::SandboxOperationFailed { source, .. } => {
                         source.chain().find_map(|cause| {
@@ -619,6 +664,7 @@ impl Sandboxes<()> for ApiImpl {
         _host: &Host,
         _cookies: &CookieJar,
         _claims: &Self::Claims,
+        header_params: &models::SandboxesPostHeaderParams,
         body: &models::NewSandbox,
     ) -> Result<SandboxesPostResponse, ()> {
         let timer = SandboxStageTimer::new("create_warm");
@@ -684,10 +730,30 @@ impl Sandboxes<()> for ApiImpl {
             custom_extension_params: custom_params,
         };
 
-        match timer
-            .time("create_sandbox", self.orchestrator.create_sandbox(request))
-            .await
-        {
+        let request_fingerprint = match create_request_fingerprint("warm", body) {
+            Ok(fingerprint) => fingerprint,
+            Err(error) => {
+                return Ok(SandboxesPostResponse::Status500_ServerError(
+                    Self::internal_error(&error),
+                ));
+            }
+        };
+        let create = async {
+            match header_params.x_agentenv_sandbox_id {
+                Some(sandbox_id) => {
+                    self.orchestrator
+                        .create_sandbox_with_id(
+                            SandboxId::from_uuid(sandbox_id),
+                            request_fingerprint,
+                            request,
+                        )
+                        .await
+                }
+                None => self.orchestrator.create_sandbox(request).await,
+            }
+        };
+
+        match timer.time("create_sandbox", create).await {
             Ok(metadata) => {
                 let sandbox_id = metadata.id.to_string();
                 Ok(
@@ -696,6 +762,12 @@ impl Sandboxes<()> for ApiImpl {
                         x_agentenv_sandbox_id: Some(sandbox_id),
                     },
                 )
+            }
+            Err(err @ OrchestratorError::AdmissionDenied { .. }) => Ok(
+                SandboxesPostResponse::Status503_ServiceUnavailable(err.into()),
+            ),
+            Err(err @ OrchestratorError::CreateRequestConflict { .. }) => {
+                Ok(SandboxesPostResponse::Status409_Conflict(err.into()))
             }
             Err(err) => Ok(SandboxesPostResponse::Status500_ServerError(
                 Self::internal_error(&err),
@@ -1461,6 +1533,26 @@ impl Sandboxes<()> for ApiImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_fingerprint_is_canonical_and_endpoint_scoped() {
+        let first = serde_json::json!({
+            "metadata": {"z": "last", "a": "first"},
+            "template": "base",
+        });
+        let second = serde_json::json!({
+            "template": "base",
+            "metadata": {"a": "first", "z": "last"},
+        });
+
+        let warm_first = create_request_fingerprint("warm", &first).unwrap();
+        let warm_second = create_request_fingerprint("warm", &second).unwrap();
+        let cold = create_request_fingerprint("cold", &second).unwrap();
+
+        assert_eq!(warm_first, warm_second);
+        assert_ne!(warm_first, cold);
+        assert_eq!(warm_first.len(), 64);
+    }
 
     #[test]
     fn parse_metadata_filter_with_none_returns_none() {

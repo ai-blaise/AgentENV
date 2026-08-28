@@ -21,6 +21,10 @@ pub enum SandboxesColdPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Service unavailable
+    Status503_ServiceUnavailable(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -52,6 +56,10 @@ pub enum SandboxesPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Conflict
+    Status409_Conflict(models::Error),
+    /// Service unavailable
+    Status503_ServiceUnavailable(models::Error),
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -288,6 +296,7 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         host: &Host,
         cookies: &CookieJar,
         claims: &Self::Claims,
+        header_params: &models::SandboxesColdPostHeaderParams,
         body: &models::NewColdSandbox,
     ) -> Result<SandboxesColdPostResponse, E>;
 
@@ -314,6 +323,7 @@ pub trait Sandboxes<E: std::fmt::Debug + Send + Sync + 'static = ()>:
         host: &Host,
         cookies: &CookieJar,
         claims: &Self::Claims,
+        header_params: &models::SandboxesPostHeaderParams,
         body: &models::NewSandbox,
     ) -> Result<SandboxesPostResponse, E>;
 

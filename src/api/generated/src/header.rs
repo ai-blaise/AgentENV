@@ -1,4 +1,4 @@
-use std::{convert::TryFrom, fmt, ops::Deref};
+use std::{convert::TryFrom, fmt, ops::Deref, str::FromStr};
 
 use chrono::{DateTime, Utc};
 use http::HeaderValue;
@@ -179,6 +179,37 @@ impl TryFrom<IntoHeaderValue<DateTime<Utc>>> for HeaderValue {
 
     fn try_from(hdr_value: IntoHeaderValue<DateTime<Utc>>) -> Result<Self, Self::Error> {
         match HeaderValue::from_str(hdr_value.0.to_rfc3339().as_str()) {
+            Ok(hdr_value) => Ok(hdr_value),
+            Err(e) => Err(format!(
+                r#"Unable to convert {hdr_value:?} to a header: {e}"#
+            )),
+        }
+    }
+}
+
+// uuid::Uuid
+
+impl TryFrom<HeaderValue> for IntoHeaderValue<uuid::Uuid> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            Ok(hdr_value) => match uuid::Uuid::from_str(hdr_value) {
+                Ok(uuid) => Ok(IntoHeaderValue(uuid)),
+                Err(e) => Err(format!(r#"Unable to parse: {hdr_value} as uuid - {e}"#)),
+            },
+            Err(e) => Err(format!(
+                r#"Unable to convert header {hdr_value:?} to string {e}"#
+            )),
+        }
+    }
+}
+
+impl TryFrom<IntoHeaderValue<uuid::Uuid>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(hdr_value: IntoHeaderValue<uuid::Uuid>) -> Result<Self, Self::Error> {
+        match HeaderValue::from_bytes(hdr_value.0.as_bytes()) {
             Ok(hdr_value) => Ok(hdr_value),
             Err(e) => Err(format!(
                 r#"Unable to convert {hdr_value:?} to a header: {e}"#

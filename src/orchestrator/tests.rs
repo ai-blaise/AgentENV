@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use async_trait::async_trait;
@@ -138,6 +139,7 @@ fn make_orchestrator_without_background_with_admission<
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
         admission: AdmissionController::new(admission_limits, []),
+        create_locks: DashMap::new(),
     })
 }
 
@@ -1191,6 +1193,64 @@ fn create_request(
         auto_resume: false,
         secure: false,
     }
+}
+
+#[tokio::test]
+async fn stable_create_id_serializes_retries_and_rejects_body_mismatch() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::WaitForReady,
+        MockAction::SucceedAfter(Duration::from_millis(25)),
+    );
+    let launch_count = Arc::new(AtomicUsize::new(0));
+    let launch_count_for_hook = Arc::clone(&launch_count);
+    behavior.set_on_operation(
+        MockOperation::WaitForReady,
+        Arc::new(move || {
+            launch_count_for_hook.fetch_add(1, Ordering::Relaxed);
+        }),
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let sandbox_id = SandboxId::new();
+    let request = create_request(Some(60), &[("case", "idempotent-create")]);
+
+    let (first, replay) = tokio::join!(
+        orchestrator.create_sandbox_with_id(
+            sandbox_id,
+            "same-request".to_string(),
+            request.clone(),
+        ),
+        orchestrator.create_sandbox_with_id(
+            sandbox_id,
+            "same-request".to_string(),
+            request.clone(),
+        ),
+    );
+    let first = first?;
+    let replay = replay?;
+
+    assert_eq!(first.id, sandbox_id);
+    assert_eq!(replay.id, sandbox_id);
+    assert_eq!(launch_count.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        first.create_request_fingerprint.as_deref(),
+        Some("same-request")
+    );
+    assert!(orchestrator.create_locks.is_empty());
+
+    let conflict = orchestrator
+        .create_sandbox_with_id(sandbox_id, "different-request".to_string(), request)
+        .await
+        .expect_err("the same stable ID must not accept a different request");
+    assert!(matches!(
+        conflict,
+        OrchestratorError::CreateRequestConflict {
+            sandbox_id: conflicting_id,
+        } if conflicting_id == sandbox_id
+    ));
+    Ok(())
 }
 
 #[tokio::test]

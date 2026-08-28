@@ -2081,6 +2081,66 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 	}
 }
 
+func TestCreateWithStableSandboxIDStillSchedulesAndForwardsID(t *testing.T) {
+	const sandboxID = "019c4f58-8a74-7e11-82de-2b87f6ada375"
+
+	upstreamID := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamID <- r.Header.Get(headerSandboxID)
+		w.Header().Set(headerSandboxID, sandboxID)
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"sandboxID":"` + sandboxID + `"}`))
+	}))
+	defer upstream.Close()
+
+	scheduleCalls := 0
+	lookupCalls := 0
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			scheduleCalls++
+			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{
+				NodeId: "node-1", Endpoint: upstream.URL,
+			}}, nil
+		},
+		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			lookupCalls++
+			return nil, fmt.Errorf("create must not look up the requested sandbox ID")
+		},
+		recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			return &schedulerv1.RecordAssignmentResponse{}, nil
+		},
+	}, time.Second, 1024)
+
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
+	defer gatewayServer.Close()
+	req, err := http.NewRequest(
+		http.MethodPost,
+		gatewayServer.URL+"/sandboxes",
+		strings.NewReader(`{"templateID":"base"}`),
+	)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(headerSandboxID, sandboxID)
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("create request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", resp.StatusCode)
+	}
+	if got := <-upstreamID; got != sandboxID {
+		t.Fatalf("upstream sandbox ID = %q, want %q", got, sandboxID)
+	}
+	if scheduleCalls != 1 || lookupCalls != 0 {
+		t.Fatalf("schedule calls = %d, lookup calls = %d", scheduleCalls, lookupCalls)
+	}
+}
+
 func TestHandleProxyColdSandboxCreateRecordsAssignment(t *testing.T) {
 	type upstreamRequestSnapshot struct {
 		method string

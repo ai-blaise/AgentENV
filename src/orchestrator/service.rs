@@ -6,6 +6,7 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
+use dashmap::DashMap;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
@@ -109,6 +110,7 @@ pub struct Orchestrator<
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
     admission: AdmissionController,
+    create_locks: DashMap<SandboxId, Arc<Mutex<()>>>,
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
@@ -219,6 +221,7 @@ where
             image_refs,
             access_tokens,
             admission,
+            create_locks: DashMap::new(),
         });
 
         // Start the auto-evict task.
@@ -354,11 +357,74 @@ where
         request: CreateSandboxRequest,
     ) -> Result<SandboxMetadata> {
         let sandbox_id = SandboxId::new();
+        self.create_sandbox_for_attempt(sandbox_id, None, request)
+            .await
+    }
+
+    /// Creates a sandbox under a caller-assigned stable ID.
+    ///
+    /// Repeating the same ID and request fingerprint returns the existing
+    /// sandbox. Reusing an ID with a different fingerprint fails closed.
+    pub async fn create_sandbox_with_id(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        request_fingerprint: String,
+        request: CreateSandboxRequest,
+    ) -> Result<SandboxMetadata> {
+        self.create_sandbox_for_attempt(sandbox_id, Some(request_fingerprint), request)
+            .await
+    }
+
+    async fn create_sandbox_for_attempt(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        request_fingerprint: Option<String>,
+        request: CreateSandboxRequest,
+    ) -> Result<SandboxMetadata> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("create", sandbox_id, async move {
-            this.create_sandbox_inner(sandbox_id, request).await
+            this.create_sandbox_idempotent_inner(sandbox_id, request_fingerprint, request)
+                .await
         })
         .await
+    }
+
+    async fn create_sandbox_idempotent_inner(
+        self: Arc<Self>,
+        sandbox_id: SandboxId,
+        request_fingerprint: Option<String>,
+        request: CreateSandboxRequest,
+    ) -> Result<SandboxMetadata> {
+        let create_lock = self
+            .create_locks
+            .entry(sandbox_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let guard = create_lock.lock().await;
+
+        let result = match self.store.get(&sandbox_id).await {
+            Err(error) => Err(OrchestratorError::from(error)),
+            Ok(Some(existing))
+                if request_fingerprint.is_some()
+                    && existing.create_request_fingerprint == request_fingerprint
+                    && existing.state != SandboxState::Killing =>
+            {
+                metrics::counter!("agentenv_orchestrator_create_replay_total").increment(1);
+                Ok(existing)
+            }
+            Ok(Some(_)) => Err(OrchestratorError::CreateRequestConflict { sandbox_id }),
+            Ok(None) => {
+                Arc::clone(&self)
+                    .create_sandbox_inner(sandbox_id, request_fingerprint, request)
+                    .await
+            }
+        };
+
+        drop(guard);
+        self.create_locks.remove_if(&sandbox_id, |_, current| {
+            Arc::ptr_eq(current, &create_lock) && Arc::strong_count(current) == 2
+        });
+        result
     }
 
     #[tracing::instrument(
@@ -369,6 +435,7 @@ where
     async fn create_sandbox_inner(
         self: Arc<Self>,
         sandbox_id: SandboxId,
+        request_fingerprint: Option<String>,
         request: CreateSandboxRequest,
     ) -> Result<SandboxMetadata> {
         if let Err(err) = self.ensure_accepting_lifecycle_operations() {
@@ -437,6 +504,7 @@ where
                     image_configs: launch_image_configs,
                     timeout_action,
                     auto_resume,
+                    create_request_fingerprint: request_fingerprint,
                     user_metadata,
                     network_policy,
                     custom_extension_params: effective_custom_extension_params,
@@ -497,6 +565,7 @@ where
                     image_configs: launch_image_configs,
                     timeout_action,
                     auto_resume,
+                    create_request_fingerprint: request_fingerprint,
                     user_metadata,
                     network_policy,
                     custom_extension_params,
@@ -690,6 +759,7 @@ where
             metadata.state = SandboxState::Running;
             metadata.created_at = now;
             metadata.paused_state = None;
+            metadata.create_request_fingerprint = None;
             metadata.update_timeout(new_timeout);
 
             let proxy_target = match Self::proxy_target_from_sandbox(backend.as_ref()) {
