@@ -57,6 +57,9 @@ type ServerOptions struct {
 	// BindingCacheTTL bounds how long a sandbox-to-node lookup is reused. Zero
 	// uses defaultBindingCacheTTL.
 	BindingCacheTTL time.Duration
+	// MaxInFlightCreates bounds concurrent create placements. Zero uses
+	// defaultMaxInFlightCreates.
+	MaxInFlightCreates int
 }
 
 // defaultMaxIdleConnsPerHost is sized for a gateway fronting a handful of nodes
@@ -87,7 +90,10 @@ type Server struct {
 	upstreamTransport *http.Transport
 	// bindingCache is the same object as queryOnlyScheduler, kept typed so the
 	// proxy can invalidate an entry the upstream has just contradicted.
-	bindingCache   *CachingSchedulerClient
+	bindingCache *CachingSchedulerClient
+	// createLimiter bounds concurrent create placements so a burst cannot
+	// multiply into scheduler load through the reschedule loop.
+	createLimiter  *createLimiter
 	apiKey         []byte
 	requestTimeout time.Duration
 	maxRespSize    int64
@@ -338,6 +344,20 @@ func (s *Server) proxyScheduledCreate(
 	hostRoute *hostRoute,
 	longLived bool,
 ) {
+	// Shed before placing anything. A create is the only request that can fan
+	// out across several nodes, so admitting more than the gateway will carry
+	// turns one burst into a multiple of it against the scheduler.
+	release, ok := s.createLimiter.acquire()
+	if !ok {
+		recordGatewayRefusal(refusalGatewayShed)
+		s.logger.Warn("gateway shedding create; too many placements in flight",
+			zap.Int64("in_flight", s.createLimiter.currentInFlight()),
+		)
+		writeRefusal(w, refusalGatewayShed, 1)
+		return
+	}
+	defer release()
+
 	// captureRequestBody leaves a replayable body only when it fitted the hint
 	// budget. A larger body is a one-shot stream, so it gets a single attempt
 	// rather than a silently truncated retry.
@@ -352,6 +372,14 @@ func (s *Server) proxyScheduledCreate(
 		})
 		recordGatewaySchedulerRPC("Schedule", rpcStart, err)
 		if err != nil {
+			// Exhausting the candidate set after some nodes refused is a
+			// different answer from "the fleet has no capacity at all", but
+			// both mean this create cannot be placed right now.
+			if status.Code(err) == codes.Unavailable {
+				recordGatewayRefusal(refusalFleetExhausted)
+				writeRefusal(w, refusalFleetExhausted, 2)
+				return
+			}
 			s.writeSchedulerError(w, err)
 			return
 		}

@@ -16,6 +16,13 @@ import (
 )
 
 var (
+	gatewayCreateRefusalsTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_gateway_create_refusals_total",
+			Help: "Creates refused by the gateway, by reason.",
+		},
+		[]string{"reason"},
+	)
 	gatewayScheduleRetriesTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "agentenv_gateway_schedule_retries_total",
@@ -249,4 +256,11 @@ func gatewayRouteLabel(path string) string {
 // the create rate means the fleet is saturated rather than merely unbalanced.
 func recordGatewayScheduleRetry(nodeID string) {
 	gatewayScheduleRetriesTotal.WithLabelValues(nodeID).Inc()
+}
+
+// recordGatewayRefusal counts creates the gateway refused, by reason. The
+// reasons are a closed set, and separating them matters: shedding means the
+// gateway is the constraint, exhaustion means the fleet is.
+func recordGatewayRefusal(reason string) {
+	gatewayCreateRefusalsTotal.WithLabelValues(reason).Inc()
 }
