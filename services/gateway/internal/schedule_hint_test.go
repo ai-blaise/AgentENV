@@ -35,6 +35,9 @@ func TestBuildScheduleHintNewSandbox(t *testing.T) {
 	if hint.GetNewColdSandbox() != nil {
 		t.Fatalf("did not expect cold sandbox hint")
 	}
+	if got := hint.GetNewSandbox().GetTemplateId(); got != "tmpl" {
+		t.Fatalf("template_id = %q, want tmpl", got)
+	}
 
 	// Body must remain available for the upstream request.
 	body, err := io.ReadAll(r.Body)
@@ -47,7 +50,7 @@ func TestBuildScheduleHintNewSandbox(t *testing.T) {
 }
 
 func TestBuildScheduleHintNewColdSandbox(t *testing.T) {
-	const reqBody = `{"image":"ubuntu:24.04","cpuCount":4,"memoryMB":2048,"attachedDrives":[{"source":{"image":"data:v1"}},{"source":{"image":"cache:v2"}}]}`
+	const reqBody = `{"image":"ubuntu:24.04","cpuCount":4,"memoryMB":2048,"diskSizeMB":8192,"attachedDrives":[{"source":{"image":"data:v1"}},{"source":{"image":"cache:v2"}}]}`
 	r := newHintRequest(t, http.MethodPost, "/sandboxes-cold", reqBody)
 
 	hint, err := buildScheduleHint(r)
@@ -63,6 +66,9 @@ func TestBuildScheduleHintNewColdSandbox(t *testing.T) {
 	}
 	if cold.GetMemoryMb() != 2048 {
 		t.Fatalf("memory_mb = %d, want 2048", cold.GetMemoryMb())
+	}
+	if cold.GetDiskSizeMb() != 8192 {
+		t.Fatalf("disk_size_mb = %d, want 8192", cold.GetDiskSizeMb())
 	}
 	wantImages := []string{"ubuntu:24.04", "data:v1", "cache:v2"}
 	if got := cold.GetImages(); !equalStrings(got, wantImages) {

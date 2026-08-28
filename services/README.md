@@ -1,6 +1,9 @@
 # services
 
-Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
+Go gateway and legacy scheduler services for AgentENV. The production Rust
+control-plane replacement lives in `crates/control-plane`; the shared protobuf
+contract keeps the gateway and both scheduler implementations wire-compatible
+during rolling upgrades.
 
 ## Features
 
@@ -25,6 +28,13 @@ Gateway treats these headers as sandbox-routing markers:
 - e2b-sandbox-id
 
 If one of them exists, gateway resolves node from scheduler binding and forwards request there.
+
+For `POST /sandboxes` and `POST /sandboxes-cold`, the first header has a separate
+create-time meaning: it is the stable UUID for the create attempt. The gateway
+validates a caller-provided UUID or generates a UUIDv7 before scheduling, sends
+it to the scheduler for an atomic assignment claim, and forwards it to envd.
+Retries with the same UUID therefore reach the same node and launch at most one
+sandbox. Reusing the UUID with a different request body returns `409 Conflict`.
 
 When `gateway.sandbox_proxy_domains` is configured, gateway also accepts host-based sandbox
 data-plane URLs in the form `{port}-{sandboxID}.{proxy_domain}`. The host-derived

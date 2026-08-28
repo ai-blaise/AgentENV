@@ -23,6 +23,8 @@ service Scheduler {
 message Node {
   string node_id = 1;
   string endpoint = 2;
+  // Monotonic route generation. Generation 0 denotes a legacy binding.
+  uint64 generation = 3;
 }
 
 // ScheduleRequestHint carries structured information parsed from the incoming
@@ -45,17 +47,23 @@ message NewColdSandboxHint {
   repeated string images = 3;
   // Sandbox metadata key/value pairs parsed from the request body.
   map<string, string> metadata = 4;
+  uint64 disk_size_mb = 5;
 }
 
 // NewSandboxHint describes a POST /sandboxes request.
 message NewSandboxHint {
   // Sandbox metadata key/value pairs parsed from the request body.
   map<string, string> metadata = 1;
+  // Snapshot/template identifier used for cache affinity and policy lookups.
+  string template_id = 2;
 }
 
 message ScheduleRequest {
   reserved 1;  // formerly: string hint = 1
   ScheduleRequestHint hint = 2;
+  // Stable sandbox identifier for create requests. When present, Schedule is
+  // an atomic assignment claim: concurrent retries return the same node.
+  string sandbox_id = 3;
 }
 
 message ScheduleResponse {

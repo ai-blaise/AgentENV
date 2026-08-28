@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -17,6 +18,7 @@ import (
 
 	schedulerv1 "agentenv/services/api/proto"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -211,6 +213,12 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// On create, x-agentenv-sandbox-id is a caller-assigned idempotency ID,
 		// not evidence that an existing sandbox binding already exists. Keep the
 		// header on the upstream request while scheduling it as a new sandbox.
+		var err error
+		sandboxID, err = ensureCreateSandboxID(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		routeSource = routeSourceSchedule
 	} else if isSandboxControlPlaneRequest(r) {
 		sandboxID, hasSandbox = sandboxIDFromPath(r.URL.Path)
@@ -247,7 +255,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		rpcStart := time.Now()
 		resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{
-			Hint: hint,
+			Hint:      hint,
+			SandboxId: sandboxID,
 		})
 		recordGatewaySchedulerRPC("Schedule", rpcStart, err)
 		if err != nil {
@@ -297,6 +306,27 @@ func isSandboxCreateRequest(r *http.Request) bool {
 	}
 	path := strings.TrimRight(r.URL.Path, "/")
 	return path == "/sandboxes" || path == "/sandboxes-cold"
+}
+
+func ensureCreateSandboxID(r *http.Request) (string, error) {
+	requested := strings.TrimSpace(r.Header.Get(headerSandboxID))
+	if requested != "" {
+		parsed, err := uuid.Parse(requested)
+		if err != nil {
+			return "", fmt.Errorf("%s must be a valid UUID", headerSandboxID)
+		}
+		canonical := parsed.String()
+		r.Header.Set(headerSandboxID, canonical)
+		return canonical, nil
+	}
+
+	generated, err := uuid.NewV7()
+	if err != nil {
+		return "", fmt.Errorf("generate sandbox ID: %w", err)
+	}
+	canonical := generated.String()
+	r.Header.Set(headerSandboxID, canonical)
+	return canonical, nil
 }
 
 func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {

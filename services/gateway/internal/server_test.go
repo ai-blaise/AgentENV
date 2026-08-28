@@ -18,6 +18,7 @@ import (
 
 	schedulerv1 "agentenv/services/api/proto"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 )
@@ -2094,10 +2095,12 @@ func TestCreateWithStableSandboxIDStillSchedulesAndForwardsID(t *testing.T) {
 	defer upstream.Close()
 
 	scheduleCalls := 0
+	scheduledID := ""
 	lookupCalls := 0
 	server := newTestServer(t, stubSchedulerClient{
-		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+		scheduleFunc: func(_ context.Context, request *schedulerv1.ScheduleRequest, _ ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
 			scheduleCalls++
+			scheduledID = request.GetSandboxId()
 			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{
 				NodeId: "node-1", Endpoint: upstream.URL,
 			}}, nil
@@ -2138,6 +2141,92 @@ func TestCreateWithStableSandboxIDStillSchedulesAndForwardsID(t *testing.T) {
 	}
 	if scheduleCalls != 1 || lookupCalls != 0 {
 		t.Fatalf("schedule calls = %d, lookup calls = %d", scheduleCalls, lookupCalls)
+	}
+	if scheduledID != sandboxID {
+		t.Fatalf("scheduled sandbox ID = %q, want %q", scheduledID, sandboxID)
+	}
+}
+
+func TestCreateWithoutSandboxIDGeneratesStableIDBeforeScheduling(t *testing.T) {
+	scheduledID := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id := r.Header.Get(headerSandboxID)
+		w.Header().Set(headerSandboxID, id)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(_ context.Context, request *schedulerv1.ScheduleRequest, _ ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			scheduledID <- request.GetSandboxId()
+			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{
+				NodeId: "node-1", Endpoint: upstream.URL,
+			}}, nil
+		},
+		recordAssignmentFunc: func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			return &schedulerv1.RecordAssignmentResponse{}, nil
+		},
+	}, time.Second, 1024)
+
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
+	defer gatewayServer.Close()
+	request, err := http.NewRequest(
+		http.MethodPost,
+		gatewayServer.URL+"/sandboxes",
+		strings.NewReader(`{"templateID":"base"}`),
+	)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("create request failed: %v", err)
+	}
+	defer response.Body.Close()
+
+	id := <-scheduledID
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		t.Fatalf("generated sandbox ID %q is not a UUID: %v", id, err)
+	}
+	if parsed.Version() != 7 {
+		t.Fatalf("generated UUID version = %d, want 7", parsed.Version())
+	}
+}
+
+func TestCreateRejectsInvalidStableSandboxIDBeforeScheduling(t *testing.T) {
+	scheduleCalls := 0
+	server := newTestServer(t, stubSchedulerClient{
+		scheduleFunc: func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error) {
+			scheduleCalls++
+			return nil, fmt.Errorf("must not schedule")
+		},
+	}, time.Second, 1024)
+
+	gatewayServer := httptest.NewServer(authenticatedTestHandler(server))
+	defer gatewayServer.Close()
+	request, err := http.NewRequest(
+		http.MethodPost,
+		gatewayServer.URL+"/sandboxes",
+		strings.NewReader(`{"templateID":"base"}`),
+	)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	request.Header.Set(headerSandboxID, "not-a-uuid")
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("create request failed: %v", err)
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", response.StatusCode)
+	}
+	if scheduleCalls != 0 {
+		t.Fatalf("schedule calls = %d, want 0", scheduleCalls)
 	}
 }
 

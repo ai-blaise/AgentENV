@@ -146,9 +146,11 @@ func (SandboxEventType) EnumDescriptor() ([]byte, []int) {
 }
 
 type Node struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	Endpoint      string                 `protobuf:"bytes,2,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
+	state    protoimpl.MessageState `protogen:"open.v1"`
+	NodeId   string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	Endpoint string                 `protobuf:"bytes,2,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
+	// Monotonic route generation. Generation 0 denotes a legacy binding.
+	Generation    uint64 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -195,6 +197,13 @@ func (x *Node) GetEndpoint() string {
 		return x.Endpoint
 	}
 	return ""
+}
+
+func (x *Node) GetGeneration() uint64 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
 }
 
 // ScheduleRequestHint carries structured information parsed from the incoming
@@ -293,6 +302,7 @@ type NewColdSandboxHint struct {
 	Images []string `protobuf:"bytes,3,rep,name=images,proto3" json:"images,omitempty"`
 	// Sandbox metadata key/value pairs parsed from the request body.
 	Metadata      map[string]string `protobuf:"bytes,4,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	DiskSizeMb    uint64            `protobuf:"varint,5,opt,name=disk_size_mb,json=diskSizeMb,proto3" json:"disk_size_mb,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -355,11 +365,20 @@ func (x *NewColdSandboxHint) GetMetadata() map[string]string {
 	return nil
 }
 
+func (x *NewColdSandboxHint) GetDiskSizeMb() uint64 {
+	if x != nil {
+		return x.DiskSizeMb
+	}
+	return 0
+}
+
 // NewSandboxHint describes a POST /sandboxes request.
 type NewSandboxHint struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// Sandbox metadata key/value pairs parsed from the request body.
-	Metadata      map[string]string `protobuf:"bytes,1,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	Metadata map[string]string `protobuf:"bytes,1,rep,name=metadata,proto3" json:"metadata,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// Snapshot/template identifier used for cache affinity and policy lookups.
+	TemplateId    string `protobuf:"bytes,2,opt,name=template_id,json=templateId,proto3" json:"template_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -401,9 +420,19 @@ func (x *NewSandboxHint) GetMetadata() map[string]string {
 	return nil
 }
 
+func (x *NewSandboxHint) GetTemplateId() string {
+	if x != nil {
+		return x.TemplateId
+	}
+	return ""
+}
+
 type ScheduleRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Hint          *ScheduleRequestHint   `protobuf:"bytes,2,opt,name=hint,proto3" json:"hint,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Hint  *ScheduleRequestHint   `protobuf:"bytes,2,opt,name=hint,proto3" json:"hint,omitempty"`
+	// Stable sandbox identifier for create requests. When present, Schedule is
+	// an atomic assignment claim: concurrent retries return the same node.
+	SandboxId     string `protobuf:"bytes,3,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -443,6 +472,13 @@ func (x *ScheduleRequest) GetHint() *ScheduleRequestHint {
 		return x.Hint
 	}
 	return nil
+}
+
+func (x *ScheduleRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
 }
 
 type ScheduleResponse struct {
@@ -2311,30 +2347,39 @@ var File_api_proto_scheduler_proto protoreflect.FileDescriptor
 
 const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\n" +
-	"\x19api/proto/scheduler.proto\x12\fscheduler.v1\";\n" +
+	"\x19api/proto/scheduler.proto\x12\fscheduler.v1\"[\n" +
 	"\x04Node\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1a\n" +
-	"\bendpoint\x18\x02 \x01(\tR\bendpoint\"\xac\x01\n" +
+	"\bendpoint\x18\x02 \x01(\tR\bendpoint\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x03 \x01(\x04R\n" +
+	"generation\"\xac\x01\n" +
 	"\x13ScheduleRequestHint\x12L\n" +
 	"\x10new_cold_sandbox\x18\x01 \x01(\v2 .scheduler.v1.NewColdSandboxHintH\x00R\x0enewColdSandbox\x12?\n" +
 	"\vnew_sandbox\x18\x02 \x01(\v2\x1c.scheduler.v1.NewSandboxHintH\x00R\n" +
 	"newSandboxB\x06\n" +
-	"\x04kind\"\xef\x01\n" +
+	"\x04kind\"\x91\x02\n" +
 	"\x12NewColdSandboxHint\x12\x1b\n" +
 	"\tcpu_count\x18\x01 \x01(\rR\bcpuCount\x12\x1b\n" +
 	"\tmemory_mb\x18\x02 \x01(\x04R\bmemoryMb\x12\x16\n" +
 	"\x06images\x18\x03 \x03(\tR\x06images\x12J\n" +
-	"\bmetadata\x18\x04 \x03(\v2..scheduler.v1.NewColdSandboxHint.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\x04 \x03(\v2..scheduler.v1.NewColdSandboxHint.MetadataEntryR\bmetadata\x12 \n" +
+	"\fdisk_size_mb\x18\x05 \x01(\x04R\n" +
+	"diskSizeMb\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\x95\x01\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"\xb6\x01\n" +
 	"\x0eNewSandboxHint\x12F\n" +
-	"\bmetadata\x18\x01 \x03(\v2*.scheduler.v1.NewSandboxHint.MetadataEntryR\bmetadata\x1a;\n" +
+	"\bmetadata\x18\x01 \x03(\v2*.scheduler.v1.NewSandboxHint.MetadataEntryR\bmetadata\x12\x1f\n" +
+	"\vtemplate_id\x18\x02 \x01(\tR\n" +
+	"templateId\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"N\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"m\n" +
 	"\x0fScheduleRequest\x125\n" +
-	"\x04hint\x18\x02 \x01(\v2!.scheduler.v1.ScheduleRequestHintR\x04hintJ\x04\b\x01\x10\x02\":\n" +
+	"\x04hint\x18\x02 \x01(\v2!.scheduler.v1.ScheduleRequestHintR\x04hint\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x03 \x01(\tR\tsandboxIdJ\x04\b\x01\x10\x02\":\n" +
 	"\x10ScheduleResponse\x12&\n" +
 	"\x04node\x18\x01 \x01(\v2\x12.scheduler.v1.NodeR\x04node\"\x12\n" +
 	"\x10ListNodesRequest\"=\n" +

@@ -97,6 +97,7 @@ type newColdSandboxBody struct {
 	Image          string            `json:"image"`
 	CPUCount       uint32            `json:"cpuCount"`
 	MemoryMB       uint64            `json:"memoryMB"`
+	DiskSizeMB     uint64            `json:"diskSizeMB"`
 	Metadata       map[string]string `json:"metadata"`
 	AttachedDrives []struct {
 		Source struct {
@@ -119,6 +120,7 @@ func parseNewColdSandboxHint(body []byte) *schedulerv1.NewColdSandboxHint {
 	}
 	hint.CpuCount = parsed.CPUCount
 	hint.MemoryMb = parsed.MemoryMB
+	hint.DiskSizeMb = parsed.DiskSizeMB
 	hint.Metadata = parsed.Metadata
 	if parsed.Image != "" {
 		hint.Images = append(hint.Images, parsed.Image)
@@ -134,7 +136,8 @@ func parseNewColdSandboxHint(body []byte) *schedulerv1.NewColdSandboxHint {
 // newSandboxBody mirrors the subset of NewSandbox (src/api/openapi.yml) that is
 // relevant for scheduling.
 type newSandboxBody struct {
-	Metadata map[string]string `json:"metadata"`
+	TemplateID string            `json:"templateID"`
+	Metadata   map[string]string `json:"metadata"`
 }
 
 // parseNewSandboxHint extracts the structured sandbox hint from the request
@@ -150,5 +153,6 @@ func parseNewSandboxHint(body []byte) *schedulerv1.NewSandboxHint {
 		return hint
 	}
 	hint.Metadata = parsed.Metadata
+	hint.TemplateId = parsed.TemplateID
 	return hint
 }

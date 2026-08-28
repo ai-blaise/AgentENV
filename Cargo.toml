@@ -10,6 +10,7 @@ members = [
     "adev",
     "crates/aenv",
     "crates/benchmarks",
+    "crates/control-plane",
     "crates/e2e-tests",
     "crates/linux-cap",
     "crates/observability",
