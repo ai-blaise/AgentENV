@@ -102,8 +102,14 @@ impl IrohBlobsP2pTransport {
             .await
             .with_context(|| format!("create P2P blob store dir {}", store_dir.display()))?;
 
-        // Run one startup GC pass to clean up blobs whose retention tags were
-        // removed before a previous process exited.
+        // The collector is gated so it only sweeps when something has actually
+        // been unpublished, rather than walking the whole store every interval.
+        //
+        // That gate was previously armed only here, at startup. Since nothing
+        // in production ever called unpublish, it was never armed again, so the
+        // collector never swept during a process lifetime and the store grew
+        // without bound. Arming it on a timer as well means a sweep happens on
+        // a predictable cadence whether or not an unpublish raced it.
         let pending_gc = Arc::new(AtomicBool::new(true));
         let mut store_options = FsStoreOptions::new(&store_dir);
         store_options.gc = Some(gated_gc_config(gc_interval, pending_gc.clone()));
@@ -146,6 +152,8 @@ impl IrohBlobsP2pTransport {
             )
             .spawn();
         let downloader = Downloader::new(&store, router.endpoint());
+
+        Self::spawn_gc_arming_task(Arc::clone(&pending_gc), gc_interval);
 
         info!(
             node_id,
@@ -763,6 +771,33 @@ fn resolve_remote_local_providers(
 
 fn publish_tag_name(key: &P2pArtifactKey) -> String {
     format!("{PUBLISH_TAG_PREFIX}{}", digest::sha256_hex(key.as_bytes()))
+}
+
+impl IrohBlobsP2pTransport {
+    /// Arms the collector gate periodically.
+    ///
+    /// Arming slightly ahead of the collector's own interval means each sweep
+    /// finds the gate open, so retention actually converges instead of
+    /// depending on an unpublish having happened to race the last tick.
+    fn spawn_gc_arming_task(pending_gc: Arc<AtomicBool>, gc_interval: Duration) {
+        if gc_interval.is_zero() {
+            return;
+        }
+        let arm_interval = gc_interval / 2;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(arm_interval.max(Duration::from_secs(1)));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                // Only one owner of the flag remains once the transport is
+                // dropped, which is the signal to stop arming.
+                if Arc::strong_count(&pending_gc) == 1 {
+                    return;
+                }
+                pending_gc.store(true, Ordering::Release);
+            }
+        });
+    }
 }
 
 fn gated_gc_config(interval: Duration, pending_gc: Arc<AtomicBool>) -> GcConfig {

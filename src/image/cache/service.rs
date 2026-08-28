@@ -298,6 +298,12 @@ impl ImageCacheService {
         .context("join hard commit seed task")??;
         self.record_hard_commit_object(digest, Some(cached_path.clone()), Some(size))
             .await?;
+        // Advertise the layer to peers now that it is durably in the commit
+        // store. Best-effort by contract: the layer is usable locally whether
+        // or not peers ever learn about it.
+        crate::overlaybd::p2p::global_layer_publish_sink()
+            .publish_layer(digest, size, &cached_path)
+            .await;
         Ok(cached_path)
     }
 

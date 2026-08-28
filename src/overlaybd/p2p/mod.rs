@@ -1,6 +1,7 @@
 mod artifact;
 mod cache;
 mod facade;
+mod publish_sink;
 
 use std::{sync::Arc, time::Duration};
 use tracing::{info, warn};
@@ -10,6 +11,8 @@ use crate::{
 };
 pub(crate) use artifact::{layer_key_from_digest, layer_key_from_uuid, LayerMetadata};
 use facade::{start_http_facade_with_config, P2pHttpFacadeConfig, P2pHttpFacadeHandle};
+pub(crate) use publish_sink::global_layer_publish_sink;
+use publish_sink::{set_global_layer_publish_sink, TransportLayerPublishSink};
 
 #[derive(Debug)]
 pub struct OverlaybdP2pRuntime {
@@ -43,6 +46,16 @@ impl OverlaybdP2pRuntime {
             Duration::from_millis(overlaybd_config.p2p_lookup_timeout_ms);
         facade_config.fetch_range_timeout =
             Duration::from_millis(overlaybd_config.p2p_fetch_range_timeout_ms);
+
+        // Install the in-process publish sink so layers downloaded from a
+        // registry actually enter the P2P store. Without it only snapshot
+        // commits were ever advertised.
+        set_global_layer_publish_sink(Arc::new(TransportLayerPublishSink::new(
+            Arc::clone(&transport),
+            local_image_services_from_app_config(config)
+                .overlaybd_layers
+                .publishable_roots(),
+        )));
 
         match start_http_facade_with_config(transport, facade_config).await {
             Ok(facade) => {

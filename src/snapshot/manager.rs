@@ -221,6 +221,12 @@ impl SnapshotManager {
     /// Returns `Ok(())` on success. The operation is idempotent:
     /// if the snapshot does not exist, it is still considered success.
     pub async fn delete(&self, id_or_alias: impl AsRef<str>) -> anyhow::Result<()> {
+        // Resolve before deleting: after the repository drops the record there
+        // is no way to learn which fixed artifacts were advertised for it.
+        let advertised = self
+            .resolve_snapshot_id_for_unpublish(id_or_alias.as_ref())
+            .await;
+
         self.repository
             .delete(id_or_alias.as_ref())
             .await
@@ -229,7 +235,58 @@ impl SnapshotManager {
                     "delete snapshot '{}' through repository",
                     id_or_alias.as_ref()
                 )
-            })
+            })?;
+
+        if let Some(snapshot_id) = advertised {
+            self.unpublish_p2p_artifacts(&snapshot_id).await;
+        }
+        Ok(())
+    }
+
+    /// Resolves the snapshot id whose P2P advertisements should be withdrawn.
+    async fn resolve_snapshot_id_for_unpublish(&self, id_or_alias: &str) -> Option<SnapshotId> {
+        self.p2p_transport.as_ref()?;
+        if let Ok(id) = SnapshotId::parse(id_or_alias) {
+            return Some(id);
+        }
+        self.repository
+            .resolve_alias(id_or_alias)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Withdraws a deleted snapshot's fixed P2P advertisements.
+    ///
+    /// Without this nothing ever called unpublish, so the transport's retention
+    /// tags were never removed and its gated collector had nothing to collect —
+    /// the store grew for the lifetime of the process.
+    ///
+    /// Only the fixed per-snapshot artifacts are withdrawn. Overlaybd layers are
+    /// content-addressed and shared between snapshots, so withdrawing one
+    /// snapshot's layer would pull it out from under every other snapshot that
+    /// references the same digest; those are owned by the image cache's
+    /// retention instead.
+    #[tracing::instrument(skip(self), fields(snapshot_id = %snapshot_id))]
+    async fn unpublish_p2p_artifacts(&self, snapshot_id: &SnapshotId) {
+        let Some(transport) = self.p2p_transport.as_ref() else {
+            return;
+        };
+        for name in [
+            SNAPSHOT_ARTIFACT_LAYOUT.vm_state,
+            SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
+        ] {
+            let key = crate::snapshot::p2p::fixed_artifact_key(snapshot_id, name);
+            match transport.unpublish(&key).await {
+                Ok(true) => tracing::debug!(%key, "withdrew snapshot artifact from P2P"),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    %key,
+                    error = %error,
+                    "failed to withdraw snapshot artifact from P2P"
+                ),
+            }
+        }
     }
 
     /// Resolves an alias to its committed snapshot id.
