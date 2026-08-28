@@ -896,3 +896,131 @@ mod file_and_config_tests {
             .expect_err("a too-short secret must fail startup");
     }
 }
+
+#[cfg(test)]
+mod construction_tests {
+    use super::*;
+
+    fn key() -> ArtifactSealingKey {
+        ArtifactSealingKey::from_bytes(vec![7_u8; KEY_LEN]).expect("key")
+    }
+
+    fn scope() -> SealScope<'static> {
+        SealScope::new("snap-1", "vm_state.bin")
+    }
+
+    fn seal(plaintext: &[u8]) -> Vec<u8> {
+        seal_slice(&key(), &scope(), plaintext).expect("seal")
+    }
+
+    /// Nonce reuse under one AES-GCM key is catastrophic — it leaks the XOR of
+    /// the plaintexts and, worse, the authentication key itself. Every other
+    /// sealing test passes with a constant nonce, because a consistent seal and
+    /// open still round trip. This is the one that does not.
+    ///
+    /// Two identical plaintext chunks under identical keys produce identical
+    /// ciphertext if and only if they share a nonce, so comparing the chunks
+    /// of one artifact detects it directly.
+    #[test]
+    fn every_chunk_of_one_artifact_uses_a_distinct_nonce() {
+        let chunk = DEFAULT_CHUNK_SIZE as usize;
+        // Three identical chunks. Anything that makes the nonce a constant
+        // makes these encrypt to the same bytes.
+        let plaintext = vec![0xAB_u8; chunk * 3];
+        let sealed = seal(&plaintext);
+
+        // Compare the ciphertext only, NOT the trailing tag. The tag covers
+        // the associated data, which already includes the chunk index, so
+        // tags differ per chunk even under a reused nonce — comparing them
+        // would make this test pass while proving nothing.
+        let body = &sealed[HEADER_LEN..];
+        let sealed_chunk = chunk + TAG_LEN;
+        let ciphertext = |index: usize| &body[index * sealed_chunk..index * sealed_chunk + chunk];
+        let first = ciphertext(0);
+        let second = ciphertext(1);
+        let third = ciphertext(2);
+
+        assert_ne!(
+            first, second,
+            "identical plaintext chunks encrypted alike: the nonce is not varying"
+        );
+        assert_ne!(first, third, "chunks 0 and 2 share a nonce");
+        assert_ne!(second, third, "chunks 1 and 2 share a nonce");
+    }
+
+    /// The header is plaintext and is only protected by being bound into every
+    /// chunk's associated data. Without that binding, rewriting the declared
+    /// length and truncating the file to match yields a *shorter artifact that
+    /// still authenticates* — a forgery that hands a guest a truncated memory
+    /// image with every tag valid.
+    ///
+    /// The other tampering tests do not cover this: editing the salt changes
+    /// the derived key, and reordering changes the nonce, so both fail for
+    /// reasons that have nothing to do with the associated data.
+    #[test]
+    fn a_truncation_forgery_that_rewrites_the_declared_length_is_rejected() {
+        let chunk = DEFAULT_CHUNK_SIZE as usize;
+        let plaintext = vec![5_u8; chunk * 3];
+        let sealed = seal(&plaintext);
+
+        // Claim one chunk, and cut the file to exactly that. Every remaining
+        // tag is genuine; only the header disagrees with what was sealed.
+        let mut forged = sealed[..HEADER_LEN + chunk + TAG_LEN].to_vec();
+        forged[32..40].copy_from_slice(&(chunk as u64).to_be_bytes());
+
+        let error = open_slice(&key(), &scope(), &forged)
+            .expect_err("a rewritten length with matching truncation must not authenticate");
+        assert!(
+            error.to_string().contains("failed authentication"),
+            "the header must be authenticated by the chunk tags, got: {error}"
+        );
+    }
+
+    /// The same forgery in the other direction: a header that declares more
+    /// than was sealed must not be accepted as a longer artifact.
+    #[test]
+    fn a_lengthened_declared_length_is_rejected() {
+        let plaintext = vec![9_u8; 64];
+        let mut forged = seal(&plaintext);
+        forged[32..40].copy_from_slice(&1024_u64.to_be_bytes());
+
+        open_slice(&key(), &scope(), &forged)
+            .expect_err("a header claiming more than was sealed must not authenticate");
+    }
+
+    /// The chunk-size field decides how much the reader allocates before any
+    /// tag has verified, so it too must be covered by the tags rather than
+    /// merely bounded.
+    #[test]
+    fn a_rewritten_chunk_size_is_rejected() {
+        let plaintext = vec![3_u8; 128];
+        let mut forged = seal(&plaintext);
+        forged[12..16].copy_from_slice(&(DEFAULT_CHUNK_SIZE / 2).to_be_bytes());
+
+        open_slice(&key(), &scope(), &forged)
+            .expect_err("a rewritten chunk size must not authenticate");
+    }
+
+    /// The guard exists to bound an allocation made from an attacker-supplied
+    /// header before anything has been verified, so its boundary is worth
+    /// pinning rather than only its far side.
+    #[test]
+    fn the_chunk_size_guard_is_exclusive_at_its_limit() {
+        let mut at_limit = seal(b"guest memory");
+        at_limit[12..16].copy_from_slice(&MAX_CHUNK_SIZE.to_be_bytes());
+        let error = open_slice(&key(), &scope(), &at_limit)
+            .expect_err("the maximum is rejected by the tag, not by the bound");
+        assert!(
+            !error.to_string().contains("limit"),
+            "exactly MAX_CHUNK_SIZE must pass the bound and fail authentication instead: {error}"
+        );
+
+        let mut past_limit = seal(b"guest memory");
+        past_limit[12..16].copy_from_slice(&(MAX_CHUNK_SIZE + 1).to_be_bytes());
+        let error = open_slice(&key(), &scope(), &past_limit).expect_err("past the limit");
+        assert!(
+            error.to_string().contains("limit"),
+            "one byte past the maximum must be refused by the bound: {error}"
+        );
+    }
+}
