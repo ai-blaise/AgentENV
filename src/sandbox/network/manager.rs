@@ -10,8 +10,13 @@ use index_set::BitSet;
 use index_set::{slot_count, AtomicBitSet, SharedBitSet};
 use ipnetwork::Ipv4Network;
 use nix::libc;
-use tracing::{debug, trace, warn};
+use std::time::Duration;
+
+use tracing::{debug, info, trace, warn};
 use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
+
+/// How often [`NetworkManager::prime`] rechecks the pool while filling.
+const POOL_PRIME_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 use super::egress_proxy::EgressProxy;
 use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
@@ -172,6 +177,70 @@ impl NetworkManager {
         }
 
         manager
+    }
+
+    /// Fills the warm slot pool toward its low watermark before serving traffic.
+    ///
+    /// Slot creation measures ~43ms and does not speed up past four in
+    /// parallel, so a node that starts and is immediately handed a burst of
+    /// creates spends most of a second building slots inside the critical path.
+    /// The maintenance worker refills asynchronously, which fixes the steady
+    /// state but not the first burst — that is what this is for.
+    ///
+    /// Never an error: a partially warm pool is slower, not broken, and the
+    /// cold path stays available. Blocking startup on it would trade a latency
+    /// problem for an availability one.
+    pub async fn prime(timeout: Duration) -> Result<()> {
+        let Some(manager) = Self::global_if_initialized() else {
+            debug!("network manager not initialized; skipping slot prime");
+            return Ok(());
+        };
+        manager.prime_pool(timeout).await
+    }
+
+    async fn prime_pool(&self, timeout: Duration) -> Result<()> {
+        let config = self.pool.config();
+        if !config.maintenance_enabled {
+            debug!("network pool maintenance disabled; skipping slot prime");
+            return Ok(());
+        }
+        if !config.startup_prewarm {
+            debug!("network pool startup prewarm disabled; skipping slot prime");
+            return Ok(());
+        }
+
+        let target = config.low_watermark;
+        if target == 0 || self.pool.len() >= target {
+            return Ok(());
+        }
+
+        info!(
+            low_watermark = target,
+            current = self.pool.len(),
+            timeout_ms = timeout.as_millis(),
+            "priming network slot pool"
+        );
+
+        let started = std::time::Instant::now();
+        self.pool.request_maintenance();
+        loop {
+            if self.pool.len() >= target {
+                info!(
+                    warm = self.pool.len(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "network slot pool primed"
+                );
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                warn!(
+                    warm = self.pool.len(),
+                    target, "network slot pool prime timed out; continuing with partial warm-up"
+                );
+                return Ok(());
+            }
+            tokio::time::sleep(POOL_PRIME_POLL_INTERVAL).await;
+        }
     }
 
     fn shutting_down(&self) -> bool {

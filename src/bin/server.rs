@@ -102,6 +102,14 @@ async fn main() -> anyhow::Result<()> {
         warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
     }
 
+    // Beside the Firecracker pool rather than after it: a warm VM process with
+    // no warm slot to attach still pays full slot cost on the first burst.
+    if let Err(err) =
+        agentenv::sandbox::prime_network_slots(std::time::Duration::from_secs(10)).await
+    {
+        warn!(target: "agentenv", error = %err, "network slot prime failed; continuing startup");
+    }
+
     // Installed before the snapshot manager, which decides at publish time
     // whether fixed artifacts may be advertised at all.
     let snapshot_sealing = Arc::new(agentenv::snapshot::sealing::SnapshotSealing::from_config(

@@ -47,8 +47,12 @@ pub struct PoolConfig {
     pub high_watermark: usize,
     /// Enable background maintenance worker.
     pub maintenance_enabled: bool,
-    /// Advisory flag for callers that can prewarm once a reusable resource
-    /// shape is known. `WarmPool` itself only owns generic pool mechanics.
+    /// Whether the pool fills itself toward `low_watermark` at startup rather
+    /// than waiting for the first acquisition to drain it.
+    ///
+    /// Turning it off means the first callers pay full construction cost. That
+    /// is the right trade only where boot time matters more than first-request
+    /// latency, so it defaults on.
     pub startup_prewarm: bool,
 }
 
@@ -308,6 +312,8 @@ impl<T: Send> WarmPool<T> {
     /// The worker runs the provided `run_cycle` closure in a loop, which
     /// should call `compute_maintenance_action` and perform the necessary
     /// create/delete operations.
+    ///
+    /// One cycle is requested immediately unless `startup_prewarm` is off.
     pub fn start_maintenance_worker<F>(&'static self, run_cycle: F)
     where
         F: Fn() + Send + 'static,
@@ -325,7 +331,13 @@ impl<T: Send> WarmPool<T> {
         {
             Ok(handle) => {
                 *self.maintenance_worker.lock().unwrap() = Some(handle);
-                self.request_maintenance();
+                // Without this the pool stays empty until the first acquisition
+                // drops it below the low watermark, so the first callers pay
+                // full construction cost — which is exactly what the pool
+                // exists to avoid.
+                if self.config.startup_prewarm {
+                    self.request_maintenance();
+                }
             }
             Err(err) => {
                 self.maintenance_started.store(false, Ordering::Release);
@@ -340,16 +352,23 @@ impl<T: Send> WarmPool<T> {
     {
         let mut has_immediate_work = false;
         loop {
+            let mut signal = self.maintenance_signal.lock().unwrap();
             if !has_immediate_work {
-                let mut signal = self.maintenance_signal.lock().unwrap();
                 while !signal.stop && !signal.pending {
                     signal = self.maintenance_cv.wait(signal).unwrap();
                 }
-                if signal.stop {
-                    break;
-                }
-                signal.pending = false;
             }
+            // Checked on both paths. A cycle that leaves work outstanding —
+            // a fill that keeps failing, a watermark that cannot be reached —
+            // sets `has_immediate_work` every time round, and a stop flag read
+            // only in the waiting branch would then never be seen: the worker
+            // spins, `stop_maintenance_worker` blocks on the join, and process
+            // shutdown blocks behind it.
+            if signal.stop {
+                break;
+            }
+            signal.pending = false;
+            drop(signal);
 
             if self.is_shutting_down() {
                 break;
@@ -604,5 +623,101 @@ mod tests {
         });
         pool.drain_all();
         assert_eq!(pool.release(42), Err(42));
+    }
+}
+
+#[cfg(test)]
+mod maintenance_worker_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    fn config(startup_prewarm: bool) -> PoolConfig {
+        PoolConfig {
+            low_watermark: 2,
+            high_watermark: 4,
+            maintenance_enabled: true,
+            startup_prewarm,
+        }
+    }
+
+    /// The pool is leaked because `start_maintenance_worker` takes
+    /// `&'static self`; a test process exits long before that matters.
+    fn leaked(startup_prewarm: bool) -> &'static WarmPool<u32> {
+        Box::leak(Box::new(WarmPool::new(config(startup_prewarm))))
+    }
+
+    /// Counts maintenance cycles in the moments after the worker starts, with
+    /// a cycle that actually satisfies the watermark so the loop settles.
+    fn cycles_after_start(startup_prewarm: bool) -> usize {
+        let pool = leaked(startup_prewarm);
+        let cycles = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&cycles);
+        pool.start_maintenance_worker(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            if let PoolMaintenanceAction::Fill(to_fill) =
+                pool.compute_maintenance_action(pool.len())
+            {
+                for _ in 0..to_fill {
+                    let _ = pool.release(0);
+                }
+            }
+        });
+        // Long enough for a requested cycle to have run. The worker is
+        // otherwise idle, so no cycle appears on its own.
+        std::thread::sleep(Duration::from_millis(200));
+        let observed = cycles.load(Ordering::SeqCst);
+        pool.stop_maintenance_worker();
+        observed
+    }
+
+    /// Without a startup cycle the pool stays empty until the first
+    /// acquisition drains it, so the first callers pay full construction cost
+    /// — which is what the pool exists to avoid.
+    #[test]
+    fn prewarm_requests_a_cycle_as_soon_as_the_worker_starts() {
+        assert!(
+            cycles_after_start(true) >= 1,
+            "startup prewarm should have run a maintenance cycle"
+        );
+        assert!(
+            cycles_after_start(true) < 1000,
+            "a cycle that meets the watermark should settle, not spin"
+        );
+    }
+
+    /// The flag used to be advisory while the worker always requested a cycle,
+    /// so turning prewarm off did nothing at all.
+    #[test]
+    fn disabling_prewarm_leaves_the_pool_alone_until_demand_arrives() {
+        assert_eq!(
+            cycles_after_start(false),
+            0,
+            "no cycle should run before something asks for a resource"
+        );
+    }
+
+    /// A cycle that never satisfies the watermark — a fill that keeps failing,
+    /// a resource the host cannot currently build — leaves work outstanding
+    /// every time round. The worker must still stop: otherwise the join blocks
+    /// forever and process shutdown blocks behind it.
+    #[test]
+    fn a_worker_whose_cycles_never_finish_the_work_can_still_be_stopped() {
+        let pool = leaked(true);
+        pool.start_maintenance_worker(|| {
+            // Never adds anything, so the pool stays below the watermark and
+            // the loop always believes it has immediate work.
+            std::thread::sleep(Duration::from_millis(1));
+        });
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        pool.stop_maintenance_worker();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stopping took {:?}; the worker never observed the stop flag",
+            started.elapsed()
+        );
     }
 }

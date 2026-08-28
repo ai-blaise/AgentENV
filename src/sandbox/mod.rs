@@ -61,6 +61,14 @@ pub(crate) fn network_slot_capacity() -> network::NetworkSlotCapacity {
             pooled: 0,
         })
 }
+/// Fills the warm network slot pool before the node starts serving.
+///
+/// Exposed here rather than on the manager because the manager is crate
+/// private; startup is the only caller.
+pub async fn prime_network_slots(timeout: std::time::Duration) -> anyhow::Result<()> {
+    network::NetworkManager::prime(timeout).await
+}
+
 pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
 
 #[derive(Clone, Debug)]
