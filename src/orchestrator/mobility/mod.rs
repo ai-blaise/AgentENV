@@ -5,10 +5,15 @@
 //! the handover is in flight.
 
 mod claim;
+mod evacuation;
 mod record;
 mod saga;
 
 pub use claim::{ClaimOutcome, MobilityCoordinator, ResumeFence, DEFAULT_CLAIM_TTL};
+pub use evacuation::{
+    drain, plan_evacuation, DestinationCandidate, DrainBudget, DrainReport, EvacuationPlan,
+    MoveExecutor, PlannedMove, SandboxLayers, UnplaceableReason, UnplaceableSandbox,
+};
 pub use record::{
     LocalMobilityStore, MobilityGeneration, MobilityRecord, MobilityState, MobilityStore,
     MobilityWrite,

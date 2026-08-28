@@ -17,9 +17,11 @@ pub use admission::{
 };
 pub use metrics::OrchestratorMetrics;
 pub use mobility::{
-    ClaimOutcome, LocalMobilityStore, MigrationOutcome, MigrationSaga, MigrationSteps,
+    drain, plan_evacuation, ClaimOutcome, DestinationCandidate, DrainBudget, DrainReport,
+    EvacuationPlan, LocalMobilityStore, MigrationOutcome, MigrationSaga, MigrationSteps,
     MobilityCoordinator, MobilityGeneration, MobilityRecord, MobilityState, MobilityStore,
-    MobilityWrite, ResumeFence, DEFAULT_CLAIM_TTL,
+    MobilityWrite, MoveExecutor, PlannedMove, ResumeFence, SandboxLayers, UnplaceableReason,
+    UnplaceableSandbox, DEFAULT_CLAIM_TTL,
 };
 pub use persistence::{
     DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
