@@ -5203,6 +5203,13 @@ impl crate::orchestrator::MobilityHooks for RecordingMobility {
             .push("publish_metrics".to_string());
     }
 
+    async fn release_local_claim(&self, sandbox_id: &SandboxId) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("release_local_claim:{sandbox_id}"));
+    }
+
     async fn record_committed(
         &self,
         sandbox_id: &SandboxId,
@@ -5318,5 +5325,42 @@ async fn mobility_forgets_a_deleted_sandbox() -> Result<()> {
         mobility.calls()
     );
 
+    Ok(())
+}
+
+/// A resume that fails for its own reasons must give the claim back. It was
+/// taken to fence the resume; holding it after the resume did not happen
+/// fences the sandbox against every other node — and against a retry here —
+/// for a whole lease period, over a failure that had nothing to do with
+/// ownership.
+#[tokio::test(flavor = "multi_thread")]
+async fn mobility_returns_the_claim_when_a_resume_fails() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let mobility = Arc::new(RecordingMobility::default());
+    orchestrator.install_mobility(mobility.clone());
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+    orchestrator.pause_sandbox(sandbox_id).await?;
+
+    // Resuming a sandbox that has been removed from under the orchestrator
+    // fails after the claim has already been taken.
+    orchestrator.store.remove(&sandbox_id).await?;
+    orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .await
+        .expect_err("resuming a removed sandbox must fail");
+
+    assert!(
+        mobility
+            .calls()
+            .contains(&format!("release_local_claim:{sandbox_id}")),
+        "a failed resume must give the claim back, got {:?}",
+        mobility.calls()
+    );
     Ok(())
 }

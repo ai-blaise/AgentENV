@@ -160,11 +160,22 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
         // origin resume while this guest is already running.
         let committed = self.coordinator.complete(sandbox_id).await;
         guardian.release();
-        if !committed? {
-            // The claim was lost while restoring — expired and taken, or the
-            // record was superseded. The guest running here is now the second
-            // copy, so it is the one that has to go.
-            let reason = "the claim was lost during the restore".to_string();
+
+        // A store error here is not a reason to return: the guest is already
+        // live on this node, and propagating with `?` would leave it running
+        // with the record still saying the origin owns it — two nodes, one
+        // sandbox, and nobody's fence able to see it. An unreachable store
+        // cannot be distinguished from a lost claim, so it is treated as one.
+        let reason = match committed {
+            Ok(true) => None,
+            Ok(false) => Some("the claim was lost during the restore".to_string()),
+            Err(error) => Some(format!(
+                "the handover could not be recorded: {error:#}"
+            )),
+        };
+        if let Some(reason) = reason {
+            // The guest running here is now the second copy, so it is the one
+            // that has to go.
             warn!(%sandbox_id, "{reason}; discarding the restore rather than keeping two copies");
             self.roll_back(&claimed, &reason).await;
             return Ok(MigrationOutcome::RolledBack { reason });

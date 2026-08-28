@@ -176,7 +176,24 @@ impl LeaseGuardian {
                     return;
                 }
 
-                match renew().await {
+                // Bounded, because the deadline below is only evaluated once
+                // `renew()` returns. A renewal that hangs — a wedged store, a
+                // TCP connection that never resets — would otherwise mean the
+                // holder is never told it lost the lease, and keeps working
+                // long past the point another node may have taken over. The
+                // timeout is the renewal interval: a renewal still outstanding
+                // when the next one is due has already failed in every sense
+                // that matters.
+                let attempt = tokio::time::timeout(pacing.renew_interval(), renew()).await;
+                let outcome = match attempt {
+                    Ok(outcome) => outcome,
+                    Err(_) => RenewOutcome::Failed(anyhow::anyhow!(
+                        "lease renewal did not answer within {:?}",
+                        pacing.renew_interval()
+                    )),
+                };
+
+                match outcome {
                     RenewOutcome::Held => {
                         last_success = Instant::now();
                         last_error.clear();

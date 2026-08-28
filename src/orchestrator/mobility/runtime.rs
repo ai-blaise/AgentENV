@@ -64,6 +64,8 @@ pub trait MobilityHooks: Send + Sync {
     async fn claim_for_local_resume(&self, sandbox_id: &SandboxId) -> ResumeFence;
     /// Drops a record because the sandbox is running here again, or is gone.
     async fn forget(&self, sandbox_id: &SandboxId);
+    /// Gives back a claim this node took but did not use.
+    async fn release_local_claim(&self, sandbox_id: &SandboxId);
     /// Records that a paused sandbox's state now lives in the repository.
     async fn record_committed(
         &self,
@@ -88,6 +90,10 @@ impl<S: MobilityStore + 'static> MobilityHooks for MobilityRuntime<S> {
 
     async fn forget(&self, sandbox_id: &SandboxId) {
         MobilityRuntime::forget(self, sandbox_id).await
+    }
+
+    async fn release_local_claim(&self, sandbox_id: &SandboxId) {
+        MobilityRuntime::release_local_claim(self, sandbox_id).await
     }
 
     async fn record_committed(
@@ -212,8 +218,76 @@ impl<S: MobilityStore> MobilityRuntime<S> {
         }
     }
 
+    /// Gives back a claim this node took for a resume that then failed.
+    ///
+    /// Without this the sandbox stays fenced until the lease expires, so a
+    /// resume that fails for its own reasons — no capacity, a bad snapshot —
+    /// also blocks every other node from taking the sandbox for the length of
+    /// a TTL, and blocks this node from retrying.
+    pub async fn release_local_claim(&self, sandbox_id: &SandboxId) {
+        match self.coordinator.release(sandbox_id).await {
+            Ok(true) => debug!(%sandbox_id, "released a claim taken for a resume that failed"),
+            // Not ours any more, or never recorded. Either way there is
+            // nothing to give back.
+            Ok(false) => {}
+            Err(error) => warn!(
+                %sandbox_id,
+                error = %error,
+                "failed to release a claim after a failed resume; it will lapse"
+            ),
+        }
+    }
+
     /// Drops a sandbox's record because it is running here again, or is gone.
+    ///
+    /// Only this node's own records, and only ones nobody else holds. An
+    /// unconditional delete would erase an `Evacuated` tombstone — turning
+    /// "already gone, and to whom" into "unknown sandbox", which a late
+    /// claimant cannot tell from a lost record — and would drop a claim
+    /// another node had just been granted, freeing a sandbox that node is in
+    /// the middle of restoring.
     pub async fn forget(&self, sandbox_id: &SandboxId) {
+        let record = match self.coordinator.store().get(sandbox_id).await {
+            Ok(Some(record)) => record,
+            // Nothing to drop, or the store cannot be read. Leaving a record
+            // in place costs a drain one refused placement; removing one we
+            // could not read could remove someone else's claim.
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    %sandbox_id,
+                    error = %error,
+                    "could not read a mobility record to drop it; leaving it in place"
+                );
+                return;
+            }
+        };
+
+        match &record.state {
+            // Ours and unclaimed: the ordinary case, a sandbox that resumed
+            // here or was deleted.
+            MobilityState::Parked => {}
+            // Held by this node, which is what a local resume looks like after
+            // it took its own claim.
+            MobilityState::Claimed { by_node_id, .. } if by_node_id == self.node_id() => {}
+            MobilityState::Claimed { by_node_id, .. } => {
+                warn!(
+                    %sandbox_id,
+                    holder = %by_node_id,
+                    "not dropping a mobility record another node has claimed"
+                );
+                return;
+            }
+            MobilityState::Evacuated { to_node_id, .. } => {
+                debug!(
+                    %sandbox_id,
+                    destination = %to_node_id,
+                    "keeping the tombstone for a sandbox that moved"
+                );
+                return;
+            }
+        }
+
         if let Err(error) = self.coordinator.store().remove(sandbox_id).await {
             warn!(
                 %sandbox_id,
@@ -641,5 +715,114 @@ mod committed_and_failure_tests {
         async fn remove(&self, _sandbox_id: &SandboxId) -> anyhow::Result<()> {
             anyhow::bail!("mobility store is unavailable")
         }
+    }
+}
+
+#[cfg(test)]
+mod forget_tests {
+    use super::*;
+    use crate::orchestrator::mobility::record::LocalMobilityStore;
+    use crate::orchestrator::store::SandboxMetadata;
+    use crate::snapshot::SnapshotRuntimeVersions;
+    use crate::virtualization::VirtualizationMode;
+
+    async fn fixture() -> (
+        MobilityRuntime<LocalMobilityStore>,
+        LocalMobilityStore,
+        SandboxId,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalMobilityStore::open(dir.path().join("mobility"))
+            .await
+            .expect("store");
+        let metadata = SandboxMetadata {
+            runtime_versions: SnapshotRuntimeVersions {
+                kernel_version: "vmlinux-6.1.175".to_string(),
+                firecracker_version: "1.15.1".to_string(),
+                envd_version: "0.5.15".to_string(),
+                tools_drive_version: "0.1.0".to_string(),
+            },
+            virtualization_mode: VirtualizationMode::Kvm,
+            ..SandboxMetadata::default()
+        };
+        let facts = NodeMobilityFacts {
+            cpu_architecture: "x86_64".to_string(),
+            cluster_cpu_config: Arc::new(std::sync::RwLock::new(Some("{}".to_string()))),
+            memory_page_size: 4096,
+            artifact_reach: ArtifactReach::ClusterShared,
+        };
+        let runtime = MobilityRuntime::new(
+            Arc::new(MobilityCoordinator::new(store.clone(), "node-a")),
+            facts,
+        );
+        runtime.record_paused(&metadata).await;
+        (runtime, store, metadata.id, dir)
+    }
+
+    /// Deleting a sandbox locally must not free one another node is in the
+    /// middle of restoring. `forget` runs unconditionally from the delete
+    /// path, so a claim in flight would otherwise be erased and the sandbox
+    /// offered to a second destination.
+    #[tokio::test]
+    async fn a_record_another_node_has_claimed_is_not_dropped() {
+        let (runtime, store, sandbox_id, _dir) = fixture().await;
+        MobilityCoordinator::new(store.clone(), "node-b")
+            .claim(&sandbox_id)
+            .await
+            .expect("claim");
+
+        runtime.forget(&sandbox_id).await;
+
+        let record = store
+            .get(&sandbox_id)
+            .await
+            .expect("get")
+            .expect("the claim must survive a local forget");
+        assert!(
+            matches!(record.state, MobilityState::Claimed { ref by_node_id, .. } if by_node_id == "node-b"),
+            "expected node-b's claim, got {:?}",
+            record.state
+        );
+    }
+
+    /// The tombstone answers a late claimant with "already gone, and to whom".
+    /// Erasing it turns that into "unknown sandbox", which is what a lost
+    /// record also looks like — and the two call for opposite responses.
+    #[tokio::test]
+    async fn an_evacuated_tombstone_survives() {
+        let (runtime, store, sandbox_id, _dir) = fixture().await;
+        let destination = MobilityCoordinator::new(store.clone(), "node-b");
+        destination.claim(&sandbox_id).await.expect("claim");
+        destination.complete(&sandbox_id).await.expect("complete");
+
+        runtime.forget(&sandbox_id).await;
+
+        let record = store
+            .get(&sandbox_id)
+            .await
+            .expect("get")
+            .expect("the tombstone must survive");
+        assert!(matches!(record.state, MobilityState::Evacuated { .. }));
+    }
+
+    /// The ordinary cases still drop: a sandbox that resumed here or was
+    /// deleted leaves no record behind.
+    #[tokio::test]
+    async fn a_parked_or_self_claimed_record_is_dropped() {
+        let (runtime, store, sandbox_id, _dir) = fixture().await;
+        runtime.forget(&sandbox_id).await;
+        assert!(store.get(&sandbox_id).await.expect("get").is_none());
+
+        let (runtime, store, sandbox_id, _dir) = fixture().await;
+        MobilityCoordinator::new(store.clone(), "node-a")
+            .claim(&sandbox_id)
+            .await
+            .expect("claim");
+        runtime.forget(&sandbox_id).await;
+        assert!(
+            store.get(&sandbox_id).await.expect("get").is_none(),
+            "this node's own claim must not block its own cleanup"
+        );
     }
 }

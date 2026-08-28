@@ -1484,30 +1484,14 @@ where
         sandbox_id: SandboxId,
         timeout: NewTimeout,
     ) -> Result<SandboxMetadata> {
-        let this = Arc::clone(self);
-        self.run_cancellation_safe("resume", sandbox_id, async move {
-            this.resume_sandbox_inner(sandbox_id, timeout).await
-        })
-        .await
-    }
-
-    #[tracing::instrument(
-        name = "resume_sandbox",
-        skip(self),
-        fields(sandbox_id = %sandbox_id, timeout = ?timeout)
-    )]
-    async fn resume_sandbox_inner(
-        self: Arc<Self>,
-        sandbox_id: SandboxId,
-        timeout: NewTimeout,
-    ) -> Result<SandboxMetadata> {
-        self.ensure_accepting_lifecycle_operations()?;
-
-        // Before any state transition: a destination may be restoring this
-        // sandbox right now, and resuming it here as well is the one failure
-        // the handover protocol exists to prevent. Taking the claim rather
-        // than reading it, because a destination that claims between a read
-        // and the resume would produce exactly that.
+        // The fence is taken here rather than inside, and given back here too.
+        // Every early return between taking a claim and launching would
+        // otherwise leave the sandbox fenced against every other node, and
+        // against a retry on this one, for a whole lease period — over a
+        // failure that had nothing to do with ownership.
+        //
+        // Taking rather than reading: a destination that claims between a
+        // check and the resume would leave two nodes running one sandbox.
         if let Some(mobility) = self.mobility() {
             match mobility.claim_for_local_resume(&sandbox_id).await {
                 ResumeFence::Allowed => {}
@@ -1525,6 +1509,33 @@ where
                 }
             }
         }
+
+        let this = Arc::clone(self);
+        let resumed = self
+            .run_cancellation_safe("resume", sandbox_id, async move {
+                this.resume_sandbox_inner(sandbox_id, timeout).await
+            })
+            .await;
+
+        if resumed.is_err() {
+            if let Some(mobility) = self.mobility() {
+                mobility.release_local_claim(&sandbox_id).await;
+            }
+        }
+        resumed
+    }
+
+    #[tracing::instrument(
+        name = "resume_sandbox",
+        skip(self),
+        fields(sandbox_id = %sandbox_id, timeout = ?timeout)
+    )]
+    async fn resume_sandbox_inner(
+        self: Arc<Self>,
+        sandbox_id: SandboxId,
+        timeout: NewTimeout,
+    ) -> Result<SandboxMetadata> {
+        self.ensure_accepting_lifecycle_operations()?;
 
         info!("resuming sandbox");
         let mut metadata = self
@@ -1624,6 +1635,9 @@ where
                     .then(|| self.access_tokens.generate(metadata.id)),
             ))
             .await;
+        // `resume_sandbox` owns the claim from before the first read to after
+        // the last, so a failure here needs nothing: every exit is covered
+        // there rather than only the ones that reach this point.
         if let Ok(metadata) = resumed.as_ref() {
             self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                 .await;

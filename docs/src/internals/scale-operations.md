@@ -160,23 +160,6 @@ parser sees it: `src/p2p/iroh/transport.rs` `download_blob` is bounded only by
 byte cap belongs there, checked against the blob's stored size before the
 read. Only reachable with P2P enabled, which is off by default.
 
-**A store error while committing a handover leaves the guest live with no
-rollback.** `MigrationSaga` handles `complete()` returning `Ok(false)` but
-propagates `Err` with `?`, after the destination's guest is already running.
-
-**A lease renewal that hangs never times out.** The guardian's abandon
-deadline is only evaluated after `renew()` returns, so a renewal that never
-completes means the holder is never told it lost the lease. It needs a
-`tokio::time::timeout` around the renewal, not only a deadline after it.
-
-**`forget` is an unconditional delete.** It erases an `Evacuated` tombstone and
-can drop a claim another node was just granted. It needs the same
-compare-and-set as the rest of the protocol.
-
-**The resume fence takes a claim that only the success path returns.** Every
-failure between taking it and launching leaves the record `Claimed` until the
-lease expires.
-
 **The drain's per-move timeout cancels the saga from outside**, bypassing the
 compensation paths it is careful to run itself.
 
