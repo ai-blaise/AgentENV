@@ -19,19 +19,28 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Scheduler_Schedule_FullMethodName           = "/scheduler.v1.Scheduler/Schedule"
-	Scheduler_ListNodes_FullMethodName          = "/scheduler.v1.Scheduler/ListNodes"
-	Scheduler_LookupNode_FullMethodName         = "/scheduler.v1.Scheduler/LookupNode"
-	Scheduler_RecordAssignment_FullMethodName   = "/scheduler.v1.Scheduler/RecordAssignment"
-	Scheduler_Heartbeat_FullMethodName          = "/scheduler.v1.Scheduler/Heartbeat"
-	Scheduler_ReportSandboxEvent_FullMethodName = "/scheduler.v1.Scheduler/ReportSandboxEvent"
-	Scheduler_ListObservedNodes_FullMethodName  = "/scheduler.v1.Scheduler/ListObservedNodes"
-	Scheduler_ListP2PPeers_FullMethodName       = "/scheduler.v1.Scheduler/ListP2pPeers"
-	Scheduler_RecordP2PArtifact_FullMethodName  = "/scheduler.v1.Scheduler/RecordP2pArtifact"
-	Scheduler_ForgetP2PArtifact_FullMethodName  = "/scheduler.v1.Scheduler/ForgetP2pArtifact"
-	Scheduler_LookupP2PArtifact_FullMethodName  = "/scheduler.v1.Scheduler/LookupP2pArtifact"
-	Scheduler_GetNode_FullMethodName            = "/scheduler.v1.Scheduler/GetNode"
-	Scheduler_UnregisterNode_FullMethodName     = "/scheduler.v1.Scheduler/UnregisterNode"
+	Scheduler_Schedule_FullMethodName                     = "/scheduler.v1.Scheduler/Schedule"
+	Scheduler_ListNodes_FullMethodName                    = "/scheduler.v1.Scheduler/ListNodes"
+	Scheduler_LookupNode_FullMethodName                   = "/scheduler.v1.Scheduler/LookupNode"
+	Scheduler_RecordAssignment_FullMethodName             = "/scheduler.v1.Scheduler/RecordAssignment"
+	Scheduler_Heartbeat_FullMethodName                    = "/scheduler.v1.Scheduler/Heartbeat"
+	Scheduler_ReportSandboxEvent_FullMethodName           = "/scheduler.v1.Scheduler/ReportSandboxEvent"
+	Scheduler_ListObservedNodes_FullMethodName            = "/scheduler.v1.Scheduler/ListObservedNodes"
+	Scheduler_ListP2PPeers_FullMethodName                 = "/scheduler.v1.Scheduler/ListP2pPeers"
+	Scheduler_RecordP2PArtifact_FullMethodName            = "/scheduler.v1.Scheduler/RecordP2pArtifact"
+	Scheduler_ForgetP2PArtifact_FullMethodName            = "/scheduler.v1.Scheduler/ForgetP2pArtifact"
+	Scheduler_LookupP2PArtifact_FullMethodName            = "/scheduler.v1.Scheduler/LookupP2pArtifact"
+	Scheduler_GetNode_FullMethodName                      = "/scheduler.v1.Scheduler/GetNode"
+	Scheduler_UnregisterNode_FullMethodName               = "/scheduler.v1.Scheduler/UnregisterNode"
+	Scheduler_BeginMigration_FullMethodName               = "/scheduler.v1.Scheduler/BeginMigration"
+	Scheduler_RecordMigrationCheckpoint_FullMethodName    = "/scheduler.v1.Scheduler/RecordMigrationCheckpoint"
+	Scheduler_PrepareMigrationDestination_FullMethodName  = "/scheduler.v1.Scheduler/PrepareMigrationDestination"
+	Scheduler_QuiesceMigrationSource_FullMethodName       = "/scheduler.v1.Scheduler/QuiesceMigrationSource"
+	Scheduler_CommitMigration_FullMethodName              = "/scheduler.v1.Scheduler/CommitMigration"
+	Scheduler_ActivateMigrationDestination_FullMethodName = "/scheduler.v1.Scheduler/ActivateMigrationDestination"
+	Scheduler_AbortMigration_FullMethodName               = "/scheduler.v1.Scheduler/AbortMigration"
+	Scheduler_ReleaseMigrationSource_FullMethodName       = "/scheduler.v1.Scheduler/ReleaseMigrationSource"
+	Scheduler_GetMigration_FullMethodName                 = "/scheduler.v1.Scheduler/GetMigration"
 )
 
 // SchedulerClient is the client API for Scheduler service.
@@ -51,6 +60,15 @@ type SchedulerClient interface {
 	LookupP2PArtifact(ctx context.Context, in *LookupP2PArtifactRequest, opts ...grpc.CallOption) (*LookupP2PArtifactResponse, error)
 	GetNode(ctx context.Context, in *GetNodeRequest, opts ...grpc.CallOption) (*GetNodeResponse, error)
 	UnregisterNode(ctx context.Context, in *UnregisterNodeRequest, opts ...grpc.CallOption) (*UnregisterNodeResponse, error)
+	BeginMigration(ctx context.Context, in *BeginMigrationRequest, opts ...grpc.CallOption) (*MigrationResponse, error)
+	RecordMigrationCheckpoint(ctx context.Context, in *RecordMigrationCheckpointRequest, opts ...grpc.CallOption) (*MigrationResponse, error)
+	PrepareMigrationDestination(ctx context.Context, in *MigrationStepRequest, opts ...grpc.CallOption) (*MigrationResponse, error)
+	QuiesceMigrationSource(ctx context.Context, in *MigrationStepRequest, opts ...grpc.CallOption) (*MigrationResponse, error)
+	CommitMigration(ctx context.Context, in *MigrationStepRequest, opts ...grpc.CallOption) (*MigrationResponse, error)
+	ActivateMigrationDestination(ctx context.Context, in *MigrationStepRequest, opts ...grpc.CallOption) (*MigrationResponse, error)
+	AbortMigration(ctx context.Context, in *AbortMigrationRequest, opts ...grpc.CallOption) (*MigrationResponse, error)
+	ReleaseMigrationSource(ctx context.Context, in *MigrationStepRequest, opts ...grpc.CallOption) (*MigrationResponse, error)
+	GetMigration(ctx context.Context, in *GetMigrationRequest, opts ...grpc.CallOption) (*MigrationResponse, error)
 }
 
 type schedulerClient struct {
@@ -191,6 +209,96 @@ func (c *schedulerClient) UnregisterNode(ctx context.Context, in *UnregisterNode
 	return out, nil
 }
 
+func (c *schedulerClient) BeginMigration(ctx context.Context, in *BeginMigrationRequest, opts ...grpc.CallOption) (*MigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MigrationResponse)
+	err := c.cc.Invoke(ctx, Scheduler_BeginMigration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerClient) RecordMigrationCheckpoint(ctx context.Context, in *RecordMigrationCheckpointRequest, opts ...grpc.CallOption) (*MigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MigrationResponse)
+	err := c.cc.Invoke(ctx, Scheduler_RecordMigrationCheckpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerClient) PrepareMigrationDestination(ctx context.Context, in *MigrationStepRequest, opts ...grpc.CallOption) (*MigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MigrationResponse)
+	err := c.cc.Invoke(ctx, Scheduler_PrepareMigrationDestination_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerClient) QuiesceMigrationSource(ctx context.Context, in *MigrationStepRequest, opts ...grpc.CallOption) (*MigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MigrationResponse)
+	err := c.cc.Invoke(ctx, Scheduler_QuiesceMigrationSource_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerClient) CommitMigration(ctx context.Context, in *MigrationStepRequest, opts ...grpc.CallOption) (*MigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MigrationResponse)
+	err := c.cc.Invoke(ctx, Scheduler_CommitMigration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerClient) ActivateMigrationDestination(ctx context.Context, in *MigrationStepRequest, opts ...grpc.CallOption) (*MigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MigrationResponse)
+	err := c.cc.Invoke(ctx, Scheduler_ActivateMigrationDestination_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerClient) AbortMigration(ctx context.Context, in *AbortMigrationRequest, opts ...grpc.CallOption) (*MigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MigrationResponse)
+	err := c.cc.Invoke(ctx, Scheduler_AbortMigration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerClient) ReleaseMigrationSource(ctx context.Context, in *MigrationStepRequest, opts ...grpc.CallOption) (*MigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MigrationResponse)
+	err := c.cc.Invoke(ctx, Scheduler_ReleaseMigrationSource_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerClient) GetMigration(ctx context.Context, in *GetMigrationRequest, opts ...grpc.CallOption) (*MigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(MigrationResponse)
+	err := c.cc.Invoke(ctx, Scheduler_GetMigration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SchedulerServer is the server API for Scheduler service.
 // All implementations must embed UnimplementedSchedulerServer
 // for forward compatibility.
@@ -208,6 +316,15 @@ type SchedulerServer interface {
 	LookupP2PArtifact(context.Context, *LookupP2PArtifactRequest) (*LookupP2PArtifactResponse, error)
 	GetNode(context.Context, *GetNodeRequest) (*GetNodeResponse, error)
 	UnregisterNode(context.Context, *UnregisterNodeRequest) (*UnregisterNodeResponse, error)
+	BeginMigration(context.Context, *BeginMigrationRequest) (*MigrationResponse, error)
+	RecordMigrationCheckpoint(context.Context, *RecordMigrationCheckpointRequest) (*MigrationResponse, error)
+	PrepareMigrationDestination(context.Context, *MigrationStepRequest) (*MigrationResponse, error)
+	QuiesceMigrationSource(context.Context, *MigrationStepRequest) (*MigrationResponse, error)
+	CommitMigration(context.Context, *MigrationStepRequest) (*MigrationResponse, error)
+	ActivateMigrationDestination(context.Context, *MigrationStepRequest) (*MigrationResponse, error)
+	AbortMigration(context.Context, *AbortMigrationRequest) (*MigrationResponse, error)
+	ReleaseMigrationSource(context.Context, *MigrationStepRequest) (*MigrationResponse, error)
+	GetMigration(context.Context, *GetMigrationRequest) (*MigrationResponse, error)
 	mustEmbedUnimplementedSchedulerServer()
 }
 
@@ -256,6 +373,33 @@ func (UnimplementedSchedulerServer) GetNode(context.Context, *GetNodeRequest) (*
 }
 func (UnimplementedSchedulerServer) UnregisterNode(context.Context, *UnregisterNodeRequest) (*UnregisterNodeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UnregisterNode not implemented")
+}
+func (UnimplementedSchedulerServer) BeginMigration(context.Context, *BeginMigrationRequest) (*MigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BeginMigration not implemented")
+}
+func (UnimplementedSchedulerServer) RecordMigrationCheckpoint(context.Context, *RecordMigrationCheckpointRequest) (*MigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RecordMigrationCheckpoint not implemented")
+}
+func (UnimplementedSchedulerServer) PrepareMigrationDestination(context.Context, *MigrationStepRequest) (*MigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method PrepareMigrationDestination not implemented")
+}
+func (UnimplementedSchedulerServer) QuiesceMigrationSource(context.Context, *MigrationStepRequest) (*MigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method QuiesceMigrationSource not implemented")
+}
+func (UnimplementedSchedulerServer) CommitMigration(context.Context, *MigrationStepRequest) (*MigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method CommitMigration not implemented")
+}
+func (UnimplementedSchedulerServer) ActivateMigrationDestination(context.Context, *MigrationStepRequest) (*MigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ActivateMigrationDestination not implemented")
+}
+func (UnimplementedSchedulerServer) AbortMigration(context.Context, *AbortMigrationRequest) (*MigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AbortMigration not implemented")
+}
+func (UnimplementedSchedulerServer) ReleaseMigrationSource(context.Context, *MigrationStepRequest) (*MigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReleaseMigrationSource not implemented")
+}
+func (UnimplementedSchedulerServer) GetMigration(context.Context, *GetMigrationRequest) (*MigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetMigration not implemented")
 }
 func (UnimplementedSchedulerServer) mustEmbedUnimplementedSchedulerServer() {}
 func (UnimplementedSchedulerServer) testEmbeddedByValue()                   {}
@@ -512,6 +656,168 @@ func _Scheduler_UnregisterNode_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Scheduler_BeginMigration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BeginMigrationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).BeginMigration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_BeginMigration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).BeginMigration(ctx, req.(*BeginMigrationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Scheduler_RecordMigrationCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RecordMigrationCheckpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).RecordMigrationCheckpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_RecordMigrationCheckpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).RecordMigrationCheckpoint(ctx, req.(*RecordMigrationCheckpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Scheduler_PrepareMigrationDestination_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MigrationStepRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).PrepareMigrationDestination(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_PrepareMigrationDestination_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).PrepareMigrationDestination(ctx, req.(*MigrationStepRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Scheduler_QuiesceMigrationSource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MigrationStepRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).QuiesceMigrationSource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_QuiesceMigrationSource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).QuiesceMigrationSource(ctx, req.(*MigrationStepRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Scheduler_CommitMigration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MigrationStepRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).CommitMigration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_CommitMigration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).CommitMigration(ctx, req.(*MigrationStepRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Scheduler_ActivateMigrationDestination_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MigrationStepRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).ActivateMigrationDestination(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_ActivateMigrationDestination_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).ActivateMigrationDestination(ctx, req.(*MigrationStepRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Scheduler_AbortMigration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AbortMigrationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).AbortMigration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_AbortMigration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).AbortMigration(ctx, req.(*AbortMigrationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Scheduler_ReleaseMigrationSource_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(MigrationStepRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).ReleaseMigrationSource(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_ReleaseMigrationSource_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).ReleaseMigrationSource(ctx, req.(*MigrationStepRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Scheduler_GetMigration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetMigrationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).GetMigration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_GetMigration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).GetMigration(ctx, req.(*GetMigrationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Scheduler_ServiceDesc is the grpc.ServiceDesc for Scheduler service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -570,6 +876,42 @@ var Scheduler_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UnregisterNode",
 			Handler:    _Scheduler_UnregisterNode_Handler,
+		},
+		{
+			MethodName: "BeginMigration",
+			Handler:    _Scheduler_BeginMigration_Handler,
+		},
+		{
+			MethodName: "RecordMigrationCheckpoint",
+			Handler:    _Scheduler_RecordMigrationCheckpoint_Handler,
+		},
+		{
+			MethodName: "PrepareMigrationDestination",
+			Handler:    _Scheduler_PrepareMigrationDestination_Handler,
+		},
+		{
+			MethodName: "QuiesceMigrationSource",
+			Handler:    _Scheduler_QuiesceMigrationSource_Handler,
+		},
+		{
+			MethodName: "CommitMigration",
+			Handler:    _Scheduler_CommitMigration_Handler,
+		},
+		{
+			MethodName: "ActivateMigrationDestination",
+			Handler:    _Scheduler_ActivateMigrationDestination_Handler,
+		},
+		{
+			MethodName: "AbortMigration",
+			Handler:    _Scheduler_AbortMigration_Handler,
+		},
+		{
+			MethodName: "ReleaseMigrationSource",
+			Handler:    _Scheduler_ReleaseMigrationSource_Handler,
+		},
+		{
+			MethodName: "GetMigration",
+			Handler:    _Scheduler_GetMigration_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

@@ -18,6 +18,15 @@ service Scheduler {
   rpc LookupP2pArtifact(LookupP2pArtifactRequest) returns (LookupP2pArtifactResponse);
   rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
   rpc UnregisterNode(UnregisterNodeRequest) returns (UnregisterNodeResponse);
+  rpc BeginMigration(BeginMigrationRequest) returns (MigrationResponse);
+  rpc RecordMigrationCheckpoint(RecordMigrationCheckpointRequest) returns (MigrationResponse);
+  rpc PrepareMigrationDestination(MigrationStepRequest) returns (MigrationResponse);
+  rpc QuiesceMigrationSource(MigrationStepRequest) returns (MigrationResponse);
+  rpc CommitMigration(MigrationStepRequest) returns (MigrationResponse);
+  rpc ActivateMigrationDestination(MigrationStepRequest) returns (MigrationResponse);
+  rpc AbortMigration(AbortMigrationRequest) returns (MigrationResponse);
+  rpc ReleaseMigrationSource(MigrationStepRequest) returns (MigrationResponse);
+  rpc GetMigration(GetMigrationRequest) returns (MigrationResponse);
 }
 
 message Node {
@@ -164,6 +173,25 @@ message ObservedNode {
   MachineInfo machine_info = 7;
   NodeSnapshot snapshot = 8;
   int64 last_seen_unix_ms = 9;
+  MigrationCapabilities migration_capabilities = 10;
+}
+
+// MigrationCapabilities is a strict snapshot/runtime compatibility domain.
+// Empty or unknown fields make a node ineligible for migration.
+message MigrationCapabilities {
+  string cpu_architecture = 1;
+  string virtualization_mode = 2;
+  string cpu_template = 3;
+  string firecracker_version = 4;
+  string snapshot_format = 5;
+  string kernel_version = 6;
+  string tools_drive_version = 7;
+  string device_model = 8;
+  uint64 memory_page_size = 9;
+  bool incremental_checkpoints = 10;
+  bool peer_restore = 11;
+  bool stable_connection_proxy = 12;
+  bool virtio_mem = 13;
 }
 
 message HeartbeatRequest {
@@ -180,6 +208,7 @@ message HeartbeatRequest {
   // outbox. A new stream ID denotes replacement of the node's local state.
   string lifecycle_stream_id = 10;
   uint64 lifecycle_last_sequence = 11;
+  MigrationCapabilities migration_capabilities = 12;
 }
 
 message HeartbeatResponse {
@@ -290,3 +319,77 @@ message UnregisterNodeRequest {
 }
 
 message UnregisterNodeResponse {}
+
+enum MigrationPhase {
+  MIGRATION_PHASE_UNSPECIFIED = 0;
+  MIGRATION_PHASE_PREPARING = 1;
+  MIGRATION_PHASE_READY_TO_CUTOVER = 2;
+  MIGRATION_PHASE_SOURCE_QUIESCED = 3;
+  MIGRATION_PHASE_COMMITTED = 4;
+  MIGRATION_PHASE_DESTINATION_ACTIVE = 5;
+  MIGRATION_PHASE_SOURCE_RELEASED = 6;
+  MIGRATION_PHASE_ABORTED = 7;
+}
+
+message Migration {
+  string migration_id = 1;
+  string sandbox_id = 2;
+  uint64 source_generation = 3;
+  Node source = 4;
+  Node destination = 5;
+  MigrationPhase phase = 6;
+  string checkpoint_id = 7;
+  string manifest_digest = 8;
+  bool durable_coverage = 9;
+  bool destination_prepared = 10;
+  int64 created_at_unix_ms = 11;
+  int64 updated_at_unix_ms = 12;
+  string abort_reason = 13;
+}
+
+message BeginMigrationRequest {
+  string migration_id = 1;
+  string sandbox_id = 2;
+  string source_node_id = 3;
+  string source_service_instance_id = 4;
+  uint64 expected_generation = 5;
+  string destination_node_id = 6;
+  string destination_service_instance_id = 7;
+  uint32 requested_cpu = 8;
+  uint64 requested_memory_bytes = 9;
+  uint64 requested_disk_bytes = 10;
+}
+
+message RecordMigrationCheckpointRequest {
+  string migration_id = 1;
+  string sandbox_id = 2;
+  string node_id = 3;
+  string service_instance_id = 4;
+  string checkpoint_id = 5;
+  string manifest_digest = 6;
+  bool durable_coverage = 7;
+}
+
+message MigrationStepRequest {
+  string migration_id = 1;
+  string sandbox_id = 2;
+  string node_id = 3;
+  string service_instance_id = 4;
+}
+
+message AbortMigrationRequest {
+  string migration_id = 1;
+  string sandbox_id = 2;
+  string node_id = 3;
+  string service_instance_id = 4;
+  string reason = 5;
+}
+
+message GetMigrationRequest {
+  string migration_id = 1;
+  string sandbox_id = 2;
+}
+
+message MigrationResponse {
+  Migration migration = 1;
+}

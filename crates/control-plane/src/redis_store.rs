@@ -8,6 +8,10 @@ use crate::assignment::{
     AssignmentStore, ClaimOutcome, ClaimRequest, LifecycleBatch, LifecycleEventKind,
     ReconcileRequest, ReconcileResult, StoreError,
 };
+use crate::migration::{
+    validate_begin, validate_update, BeginMigration, MigrationAction, MigrationPhase,
+    MigrationRecord, UpdateMigration,
+};
 use crate::model::{Assignment, AssignmentState, Node};
 
 const DEFAULT_KEY_PREFIX: &str = "agentenv:control-plane";
@@ -64,6 +68,13 @@ impl RedisAssignmentStore {
     fn fence_key(&self, sandbox_id: &str) -> String {
         format!(
             "{}:{{{}}}:fence:{}",
+            self.key_prefix, self.cluster_id, sandbox_id
+        )
+    }
+
+    fn migration_key(&self, sandbox_id: &str) -> String {
+        format!(
+            "{}:{{{}}}:migration:{}",
             self.key_prefix, self.cluster_id, sandbox_id
         )
     }
@@ -418,6 +429,180 @@ impl AssignmentStore for RedisAssignmentStore {
             ))),
         }
     }
+
+    async fn begin_migration(
+        &self,
+        request: BeginMigration,
+    ) -> Result<MigrationRecord, StoreError> {
+        validate_begin(&request).map_err(StoreError::Invalid)?;
+        for (value, name) in [
+            (&request.migration_id, "migration_id"),
+            (&request.sandbox_id, "sandbox_id"),
+            (&request.source.id, "source_node_id"),
+            (&request.destination.id, "destination_node_id"),
+        ] {
+            validate_key_component(value, name)?;
+        }
+        let destination = Node {
+            generation: request.expected_generation + 1,
+            ..request.destination.clone()
+        };
+        let record = MigrationRecord {
+            migration_id: request.migration_id.clone(),
+            sandbox_id: request.sandbox_id.clone(),
+            source_generation: request.expected_generation,
+            source: request.source.clone(),
+            destination: destination.clone(),
+            phase: MigrationPhase::Preparing,
+            checkpoint_id: None,
+            manifest_digest: None,
+            durable_coverage: false,
+            destination_prepared: false,
+            created_at_unix_ms: request.now_unix_ms,
+            updated_at_unix_ms: request.now_unix_ms,
+            abort_reason: None,
+        };
+        let [totals_key, expiry_key, resources_key] = self.node_keys(&destination.id);
+        let reservation_ttl_ms = self.lease_ttl_ms()?;
+        let keys_ttl_ms = reservation_ttl_ms.saturating_mul(2);
+        let mut connection = self.connection.clone();
+        let (code, raw): (i64, String) = Script::new(BEGIN_MIGRATION_SCRIPT)
+            .key(self.assignment_key(&request.sandbox_id))
+            .key(self.fence_key(&request.sandbox_id))
+            .key(self.migration_key(&request.sandbox_id))
+            .key(totals_key)
+            .key(expiry_key)
+            .key(resources_key)
+            .arg(encode_migration(&record)?)
+            .arg(&request.migration_id)
+            .arg(&request.sandbox_id)
+            .arg(&request.source.id)
+            .arg(request.expected_generation)
+            .arg(&destination.id)
+            .arg(request.resources.cpu)
+            .arg(request.resources.memory_bytes)
+            .arg(request.resources.disk_bytes)
+            .arg(request.destination_observed.sandboxes)
+            .arg(request.destination_observed.starting)
+            .arg(request.destination_observed.cpu)
+            .arg(request.destination_observed.memory_bytes)
+            .arg(request.destination_observed.disk_bytes)
+            .arg(request.destination_limits.max_sandboxes.unwrap_or(0))
+            .arg(request.destination_limits.max_starting.unwrap_or(0))
+            .arg(request.destination_limits.max_cpu.unwrap_or(0))
+            .arg(request.destination_limits.max_memory_bytes.unwrap_or(0))
+            .arg(request.destination_limits.max_disk_bytes.unwrap_or(0))
+            .arg(reservation_ttl_ms)
+            .arg(keys_ttl_ms)
+            .arg(CLEANUP_BATCH)
+            .arg(migration_reservation_id(&request.migration_id))
+            .invoke_async(&mut connection)
+            .await
+            .map_err(|error| StoreError::Backend(format!("begin migration: {error}")))?;
+        match code {
+            1 | 0 => decode_migration(&raw),
+            -1 => Err(StoreError::CapacityExhausted {
+                node_id: destination.id,
+            }),
+            -2 => Err(StoreError::Invariant(raw)),
+            -3 => Err(StoreError::MigrationNotFound),
+            -4 => Err(StoreError::MigrationConflict(raw)),
+            _ => Err(StoreError::Invariant(format!(
+                "Redis begin migration script returned code {code}: {raw}"
+            ))),
+        }
+    }
+
+    async fn update_migration(
+        &self,
+        request: UpdateMigration,
+    ) -> Result<MigrationRecord, StoreError> {
+        validate_update(&request).map_err(StoreError::Invalid)?;
+        for (value, name) in [
+            (&request.migration_id, "migration_id"),
+            (&request.sandbox_id, "sandbox_id"),
+            (&request.actor_node_id, "actor_node_id"),
+        ] {
+            validate_key_component(value, name)?;
+        }
+        let current = self
+            .lookup_migration(&request.sandbox_id, &request.migration_id)
+            .await?
+            .ok_or(StoreError::MigrationNotFound)?;
+        let [totals_key, expiry_key, resources_key] = self.node_keys(&current.destination.id);
+        let (checkpoint_id, manifest_digest, durable_coverage, reason) =
+            migration_action_arguments(&request.action);
+        let reservation_ttl_ms = self.lease_ttl_ms()?;
+        let mut connection = self.connection.clone();
+        let (code, raw): (i64, String) = Script::new(UPDATE_MIGRATION_SCRIPT)
+            .key(self.assignment_key(&request.sandbox_id))
+            .key(self.fence_key(&request.sandbox_id))
+            .key(self.migration_key(&request.sandbox_id))
+            .key(self.node_routes_key(&current.source.id))
+            .key(self.node_routes_key(&current.destination.id))
+            .key(totals_key)
+            .key(expiry_key)
+            .key(resources_key)
+            .arg(&request.migration_id)
+            .arg(&request.sandbox_id)
+            .arg(&request.actor_node_id)
+            .arg(request.action.name())
+            .arg(checkpoint_id)
+            .arg(manifest_digest)
+            .arg(durable_coverage)
+            .arg(reason)
+            .arg(request.now_unix_ms)
+            .arg(reservation_ttl_ms)
+            .arg(reservation_ttl_ms.saturating_mul(2))
+            .arg(self.lease_ttl_ms()?)
+            .arg(migration_reservation_id(&request.migration_id))
+            .invoke_async(&mut connection)
+            .await
+            .map_err(|error| StoreError::Backend(format!("update migration: {error}")))?;
+        match code {
+            1 | 0 => decode_migration(&raw),
+            -2 => Err(StoreError::Invariant(raw)),
+            -3 => Err(StoreError::MigrationNotFound),
+            -4 | -5 => Err(StoreError::MigrationConflict(raw)),
+            _ => Err(StoreError::Invariant(format!(
+                "Redis update migration script returned code {code}: {raw}"
+            ))),
+        }
+    }
+
+    async fn lookup_migration(
+        &self,
+        sandbox_id: &str,
+        migration_id: &str,
+    ) -> Result<Option<MigrationRecord>, StoreError> {
+        validate_key_component(sandbox_id, "sandbox_id")?;
+        validate_key_component(migration_id, "migration_id")?;
+        let mut connection = self.connection.clone();
+        let raw = redis::cmd("GET")
+            .arg(self.migration_key(sandbox_id))
+            .query_async::<Option<String>>(&mut connection)
+            .await
+            .map_err(|error| StoreError::Backend(format!("lookup migration: {error}")))?;
+        raw.map(|raw| decode_migration(&raw))
+            .transpose()
+            .map(|record| record.filter(|record| record.migration_id == migration_id))
+    }
+}
+
+fn migration_reservation_id(migration_id: &str) -> String {
+    format!("migration.{migration_id}")
+}
+
+fn migration_action_arguments(action: &MigrationAction) -> (&str, &str, bool, &str) {
+    match action {
+        MigrationAction::RecordCheckpoint {
+            checkpoint_id,
+            manifest_digest,
+            durable_coverage,
+        } => (checkpoint_id, manifest_digest, *durable_coverage, ""),
+        MigrationAction::Abort { reason } => ("", "", false, reason),
+        _ => ("", "", false, ""),
+    }
 }
 
 fn lifecycle_kind(kind: LifecycleEventKind) -> &'static str {
@@ -473,6 +658,16 @@ fn decode_assignment(raw: &str) -> Result<Assignment, StoreError> {
         .map_err(|error| StoreError::Invariant(format!("decode assignment: {error}")))
 }
 
+fn encode_migration(migration: &MigrationRecord) -> Result<String, StoreError> {
+    serde_json::to_string(migration)
+        .map_err(|error| StoreError::Invariant(format!("serialize migration: {error}")))
+}
+
+fn decode_migration(raw: &str) -> Result<MigrationRecord, StoreError> {
+    serde_json::from_str(raw)
+        .map_err(|error| StoreError::Invariant(format!("decode migration: {error}")))
+}
+
 fn ownership_node(raw: &str) -> Result<String, StoreError> {
     if let Ok(assignment) = serde_json::from_str::<Assignment>(raw) {
         return Ok(assignment.node.id);
@@ -484,6 +679,319 @@ fn ownership_node(raw: &str) -> Result<String, StoreError> {
         "assignment script returned invalid ownership detail".to_string(),
     ))
 }
+
+const BEGIN_MIGRATION_SCRIPT: &str = r#"
+local assignment_raw = redis.call('GET', KEYS[1])
+local fence_raw = redis.call('GET', KEYS[2])
+if not assignment_raw or not fence_raw then
+  return {-3, 'active assignment or fence is missing'}
+end
+local assignment_ok, assignment = pcall(cjson.decode, assignment_raw)
+local fence_ok, fence = pcall(cjson.decode, fence_raw)
+if not assignment_ok or not assignment or not assignment['node']
+    or not assignment['node']['id'] or not assignment['node']['generation']
+    or not assignment['state'] then
+  return {-2, 'corrupt active assignment'}
+end
+if not fence_ok or not fence or not fence['owner_node_id'] or not fence['generation'] then
+  return {-2, 'corrupt ownership fence'}
+end
+local source_node_id = ARGV[4]
+local source_generation = tonumber(ARGV[5])
+local destination_node_id = ARGV[6]
+if assignment['state'] ~= 'confirmed'
+    or assignment['node']['id'] ~= source_node_id
+    or tonumber(assignment['node']['generation']) ~= source_generation then
+  return {-4, 'source owner or generation does not match the active route'}
+end
+if fence['retired'] or fence['owner_node_id'] ~= source_node_id
+    or tonumber(fence['generation']) ~= source_generation then
+  return {-4, 'source owner or generation does not match the ownership fence'}
+end
+if source_node_id == destination_node_id then
+  return {-4, 'migration source and destination must differ'}
+end
+
+local requested_ok, requested = pcall(cjson.decode, ARGV[1])
+if not requested_ok or not requested or not requested['source'] or not requested['destination']
+    or requested['migration_id'] ~= ARGV[2] or requested['sandbox_id'] ~= ARGV[3]
+    or requested['source']['id'] ~= source_node_id
+    or requested['destination']['id'] ~= destination_node_id
+    or tonumber(requested['source_generation']) ~= source_generation
+    or tonumber(requested['destination']['generation']) ~= source_generation + 1 then
+  return {-2, 'corrupt requested migration'}
+end
+
+local existing_raw = redis.call('GET', KEYS[3])
+if existing_raw then
+  local existing_ok, existing = pcall(cjson.decode, existing_raw)
+  if not existing_ok or not existing or not existing['migration_id'] or not existing['phase'] then
+    return {-2, 'corrupt migration record'}
+  end
+  if existing['migration_id'] == ARGV[2] then
+    if existing['source']['id'] ~= source_node_id
+        or existing['destination']['id'] ~= destination_node_id
+        or tonumber(existing['source_generation']) ~= source_generation then
+      return {-4, 'migration ID was reused with different parameters'}
+    end
+    return {0, existing_raw}
+  end
+  if existing['phase'] ~= 'source_released' and existing['phase'] ~= 'aborted' then
+    return {-4, 'another migration is already active'}
+  end
+end
+
+local redis_time = redis.call('TIME')
+local now_ms = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+local cleanup_limit = tonumber(ARGV[22])
+local expired = redis.call('ZRANGEBYSCORE', KEYS[5], '-inf', now_ms, 'LIMIT', 0, cleanup_limit)
+for _, reservation_id in ipairs(expired) do
+  local encoded = redis.call('HGET', KEYS[6], reservation_id)
+  if encoded then
+    local cpu, memory, disk = string.match(encoded, '^(%d+):(%d+):(%d+)$')
+    if not cpu then
+      return {-2, 'corrupt reservation ' .. reservation_id}
+    end
+    redis.call('HINCRBY', KEYS[4], 'sandboxes', -1)
+    redis.call('HINCRBY', KEYS[4], 'starting', -1)
+    redis.call('HINCRBY', KEYS[4], 'cpu', -tonumber(cpu))
+    redis.call('HINCRBY', KEYS[4], 'memory', -tonumber(memory))
+    redis.call('HINCRBY', KEYS[4], 'disk', -tonumber(disk))
+    redis.call('HDEL', KEYS[6], reservation_id)
+  end
+  redis.call('ZREM', KEYS[5], reservation_id)
+end
+
+local pending = redis.call('HMGET', KEYS[4], 'sandboxes', 'starting', 'cpu', 'memory', 'disk')
+local after = {
+  tonumber(ARGV[10]) + tonumber(pending[1] or '0') + 1,
+  tonumber(ARGV[11]) + tonumber(pending[2] or '0') + 1,
+  tonumber(ARGV[12]) + tonumber(pending[3] or '0') + tonumber(ARGV[7]),
+  tonumber(ARGV[13]) + tonumber(pending[4] or '0') + tonumber(ARGV[8]),
+  tonumber(ARGV[14]) + tonumber(pending[5] or '0') + tonumber(ARGV[9])
+}
+local limits = {
+  tonumber(ARGV[15]), tonumber(ARGV[16]), tonumber(ARGV[17]),
+  tonumber(ARGV[18]), tonumber(ARGV[19])
+}
+for index = 1, 5 do
+  if limits[index] > 0 and after[index] > limits[index] then
+    return {-1, 'destination capacity exhausted'}
+  end
+end
+
+local reservation_id = ARGV[23]
+redis.call('SET', KEYS[3], ARGV[1])
+redis.call('HINCRBY', KEYS[4], 'sandboxes', 1)
+redis.call('HINCRBY', KEYS[4], 'starting', 1)
+redis.call('HINCRBY', KEYS[4], 'cpu', ARGV[7])
+redis.call('HINCRBY', KEYS[4], 'memory', ARGV[8])
+redis.call('HINCRBY', KEYS[4], 'disk', ARGV[9])
+redis.call('HSET', KEYS[6], reservation_id, ARGV[7] .. ':' .. ARGV[8] .. ':' .. ARGV[9])
+redis.call('ZADD', KEYS[5], now_ms + tonumber(ARGV[20]), reservation_id)
+redis.call('PEXPIRE', KEYS[4], ARGV[21])
+redis.call('PEXPIRE', KEYS[5], ARGV[21])
+redis.call('PEXPIRE', KEYS[6], ARGV[21])
+return {1, ARGV[1]}
+"#;
+
+const UPDATE_MIGRATION_SCRIPT: &str = r#"
+local raw = redis.call('GET', KEYS[3])
+if not raw then
+  return {-3, 'migration not found'}
+end
+local ok, migration = pcall(cjson.decode, raw)
+if not ok or not migration or not migration['migration_id'] or not migration['sandbox_id']
+    or not migration['source'] or not migration['source']['id']
+    or not migration['destination'] or not migration['destination']['id']
+    or not migration['phase'] then
+  return {-2, 'corrupt migration record'}
+end
+if migration['migration_id'] ~= ARGV[1] or migration['sandbox_id'] ~= ARGV[2] then
+  return {-3, 'migration not found'}
+end
+local actor = ARGV[3]
+local action = ARGV[4]
+local source_id = migration['source']['id']
+local destination_id = migration['destination']['id']
+local source_action = action == 'record_checkpoint' or action == 'quiesce_source'
+    or action == 'commit' or action == 'release_source'
+local destination_action = action == 'prepare_destination' or action == 'activate_destination'
+if source_action and actor ~= source_id then
+  return {-4, 'migration action must be submitted by the source'}
+end
+if destination_action and actor ~= destination_id then
+  return {-4, 'migration action must be submitted by the destination'}
+end
+if action == 'abort' and actor ~= source_id and actor ~= destination_id then
+  return {-4, 'migration abort must be submitted by a participating node'}
+end
+
+local phase = migration['phase']
+local terminal = phase == 'source_released' or phase == 'aborted'
+local post_commit = phase == 'committed' or phase == 'destination_active'
+    or phase == 'source_released'
+local reservation_id = ARGV[13]
+local redis_time = redis.call('TIME')
+local now_ms = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+
+local function release_reservation()
+  local encoded = redis.call('HGET', KEYS[8], reservation_id)
+  if encoded then
+    local cpu, memory, disk = string.match(encoded, '^(%d+):(%d+):(%d+)$')
+    if not cpu then
+      return false
+    end
+    redis.call('HINCRBY', KEYS[6], 'sandboxes', -1)
+    redis.call('HINCRBY', KEYS[6], 'starting', -1)
+    redis.call('HINCRBY', KEYS[6], 'cpu', -tonumber(cpu))
+    redis.call('HINCRBY', KEYS[6], 'memory', -tonumber(memory))
+    redis.call('HINCRBY', KEYS[6], 'disk', -tonumber(disk))
+    redis.call('HDEL', KEYS[8], reservation_id)
+  end
+  redis.call('ZREM', KEYS[7], reservation_id)
+  return true
+end
+
+if not terminal and not post_commit and action ~= 'abort' then
+  local encoded = redis.call('HGET', KEYS[8], reservation_id)
+  local expires_at = tonumber(redis.call('ZSCORE', KEYS[7], reservation_id) or '0')
+  if not encoded or expires_at <= now_ms then
+    if not release_reservation() then
+      return {-2, 'corrupt migration reservation'}
+    end
+    return {-5, 'destination reservation expired before migration completed'}
+  end
+  redis.call('ZADD', KEYS[7], now_ms + tonumber(ARGV[10]), reservation_id)
+  redis.call('PEXPIRE', KEYS[6], ARGV[11])
+  redis.call('PEXPIRE', KEYS[7], ARGV[11])
+  redis.call('PEXPIRE', KEYS[8], ARGV[11])
+end
+
+local changed = false
+if action == 'record_checkpoint' then
+  if phase ~= 'preparing' and phase ~= 'ready_to_cutover' then
+    if migration['checkpoint_id'] == ARGV[5] and migration['manifest_digest'] == ARGV[6]
+        and (not (ARGV[7] == '1') or migration['durable_coverage']) then
+      return {0, raw}
+    end
+    return {-4, 'checkpoint cannot change after source quiesce'}
+  end
+  if migration['checkpoint_id'] and migration['checkpoint_id'] ~= ARGV[5] then
+    return {-4, 'checkpoint identity changed within one migration'}
+  end
+  if migration['manifest_digest'] and migration['manifest_digest'] ~= ARGV[6] then
+    return {-4, 'manifest digest changed within one migration'}
+  end
+  migration['checkpoint_id'] = ARGV[5]
+  migration['manifest_digest'] = ARGV[6]
+  if ARGV[7] == '1' then
+    migration['durable_coverage'] = true
+  end
+  changed = true
+elseif action == 'prepare_destination' then
+  if phase ~= 'preparing' and phase ~= 'ready_to_cutover' then
+    if migration['destination_prepared'] then
+      return {0, raw}
+    end
+    return {-4, 'destination cannot prepare in the current phase'}
+  end
+  if not migration['checkpoint_id'] or not migration['manifest_digest'] then
+    return {-4, 'destination cannot prepare before checkpoint publication'}
+  end
+  migration['destination_prepared'] = true
+  changed = true
+elseif action == 'quiesce_source' then
+  if phase == 'ready_to_cutover' then
+    migration['phase'] = 'source_quiesced'
+    changed = true
+  elseif phase ~= 'source_quiesced' and not post_commit then
+    return {-4, 'source can only quiesce after durable destination preparation'}
+  end
+elseif action == 'commit' then
+  if phase == 'source_quiesced' then
+    if not migration['durable_coverage'] or not migration['destination_prepared'] then
+      return {-4, 'migration lacks durable prepared coverage'}
+    end
+    local assignment_raw = redis.call('GET', KEYS[1])
+    local fence_raw = redis.call('GET', KEYS[2])
+    if not assignment_raw or not fence_raw then
+      return {-4, 'active route or ownership fence expired before commit'}
+    end
+    local assignment_ok, assignment = pcall(cjson.decode, assignment_raw)
+    local fence_ok, fence = pcall(cjson.decode, fence_raw)
+    if not assignment_ok or not assignment or not assignment['node']
+        or not fence_ok or not fence or not fence['owner_node_id'] then
+      return {-2, 'corrupt assignment or ownership fence'}
+    end
+    local source_generation = tonumber(migration['source_generation'])
+    if assignment['state'] ~= 'confirmed' or assignment['node']['id'] ~= source_id
+        or tonumber(assignment['node']['generation']) ~= source_generation
+        or fence['retired'] or fence['owner_node_id'] ~= source_id
+        or tonumber(fence['generation']) ~= source_generation then
+      return {-4, 'active ownership changed before migration commit'}
+    end
+    assignment['node'] = migration['destination']
+    assignment['state'] = 'confirmed'
+    redis.call('PSETEX', KEYS[1], ARGV[12], cjson.encode(assignment))
+    redis.call('SET', KEYS[2], cjson.encode({
+      owner_node_id = destination_id,
+      generation = tonumber(migration['destination']['generation']),
+      retired = false
+    }))
+    redis.call('SREM', KEYS[4], ARGV[2])
+    redis.call('SADD', KEYS[5], ARGV[2])
+    migration['phase'] = 'committed'
+    changed = true
+  elseif not post_commit then
+    return {-4, 'migration can only commit after source quiesce'}
+  end
+elseif action == 'activate_destination' then
+  if phase == 'committed' then
+    migration['phase'] = 'destination_active'
+    changed = true
+  elseif phase ~= 'destination_active' and phase ~= 'source_released' then
+    return {-4, 'destination can only activate after ownership commits'}
+  end
+elseif action == 'release_source' then
+  if phase == 'destination_active' then
+    if not release_reservation() then
+      return {-2, 'corrupt migration reservation'}
+    end
+    migration['phase'] = 'source_released'
+    changed = true
+  elseif phase ~= 'source_released' then
+    return {-4, 'source can only release after destination activation'}
+  end
+elseif action == 'abort' then
+  if post_commit then
+    return {-4, 'a committed migration cannot abort back to its source'}
+  end
+  if phase ~= 'aborted' then
+    if not release_reservation() then
+      return {-2, 'corrupt migration reservation'}
+    end
+    migration['phase'] = 'aborted'
+    migration['abort_reason'] = ARGV[8]
+    changed = true
+  end
+else
+  return {-2, 'unknown migration action'}
+end
+
+if migration['phase'] == 'preparing' and migration['durable_coverage']
+    and migration['destination_prepared'] then
+  migration['phase'] = 'ready_to_cutover'
+  changed = true
+end
+if changed then
+  migration['updated_at_unix_ms'] = tonumber(ARGV[9])
+  raw = cjson.encode(migration)
+  redis.call('SET', KEYS[3], raw)
+  return {1, raw}
+end
+return {0, raw}
+"#;
 
 const CLAIM_SCRIPT: &str = r#"
 local existing = redis.call('GET', KEYS[1])
@@ -1260,6 +1768,115 @@ mod tests {
                 .await,
             Err(StoreError::OwnershipConflict { .. })
         ));
+
+        let migration_sandbox = uuid::Uuid::now_v7().to_string();
+        let migration_id = uuid::Uuid::now_v7().to_string();
+        let mut migration_source = Node::new("node-source", "https://node-source");
+        migration_source.generation = 7;
+        left.confirm(&migration_sandbox, migration_source.clone(), Instant::now())
+            .await
+            .unwrap();
+        let migration = left
+            .begin_migration(BeginMigration {
+                migration_id: migration_id.clone(),
+                sandbox_id: migration_sandbox.clone(),
+                source: migration_source,
+                destination: Node::new("node-destination", "https://node-destination"),
+                expected_generation: 7,
+                resources: SandboxResources {
+                    cpu: 1,
+                    memory_bytes: 1024,
+                    disk_bytes: 2048,
+                },
+                destination_observed: PendingResources::default(),
+                destination_limits: CapacityLimits::default(),
+                now: Instant::now(),
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+        assert_eq!(migration.destination.generation, 8);
+        let update = |actor: &str, action: MigrationAction, now_unix_ms| UpdateMigration {
+            migration_id: migration_id.clone(),
+            sandbox_id: migration_sandbox.clone(),
+            actor_node_id: actor.to_string(),
+            action,
+            now: Instant::now(),
+            now_unix_ms,
+        };
+        left.update_migration(update(
+            "node-source",
+            MigrationAction::RecordCheckpoint {
+                checkpoint_id: uuid::Uuid::now_v7().to_string(),
+                manifest_digest: format!("sha256:{}", "a".repeat(64)),
+                durable_coverage: true,
+            },
+            2,
+        ))
+        .await
+        .unwrap();
+        left.update_migration(update(
+            "node-destination",
+            MigrationAction::PrepareDestination,
+            3,
+        ))
+        .await
+        .unwrap();
+        left.update_migration(update("node-source", MigrationAction::QuiesceSource, 4))
+            .await
+            .unwrap();
+        let committed = left
+            .update_migration(update("node-source", MigrationAction::Commit, 5))
+            .await
+            .unwrap();
+        assert_eq!(committed.phase, MigrationPhase::Committed);
+        assert_eq!(
+            right
+                .lookup(&migration_sandbox, Instant::now())
+                .await
+                .unwrap()
+                .unwrap()
+                .node,
+            committed.destination
+        );
+        let stale_stream_id = uuid::Uuid::now_v7().to_string();
+        assert!(matches!(
+            right
+                .apply_lifecycle_batch(LifecycleBatch {
+                    node: Node::new("node-source", "https://node-source"),
+                    service_instance_id: "source-instance".to_string(),
+                    stream_id: stale_stream_id.clone(),
+                    events: vec![crate::assignment::LifecycleEvent {
+                        sandbox_id: migration_sandbox.clone(),
+                        kind: LifecycleEventKind::Resume,
+                        resources: SandboxResources {
+                            cpu: 1,
+                            memory_bytes: 1024,
+                            disk_bytes: 2048,
+                        },
+                        sequence: 1,
+                        event_id: format!("{stale_stream_id}:1"),
+                        occurred_at_unix_ms: 1,
+                    }],
+                    now: Instant::now(),
+                })
+                .await,
+            Err(StoreError::OwnershipConflict { .. })
+        ));
+        left.update_migration(update(
+            "node-destination",
+            MigrationAction::ActivateDestination,
+            6,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(
+            left.update_migration(update("node-source", MigrationAction::ReleaseSource, 7,))
+                .await
+                .unwrap()
+                .phase,
+            MigrationPhase::SourceReleased
+        );
     }
 
     fn assignment(outcome: &ClaimOutcome) -> &Assignment {

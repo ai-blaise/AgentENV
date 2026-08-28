@@ -2,6 +2,7 @@
 
 pub mod artifact;
 pub mod assignment;
+pub mod migration;
 pub mod model;
 pub mod placement;
 pub mod redis_store;
@@ -17,9 +18,13 @@ pub use assignment::{
     AssignmentStore, ClaimOutcome, ClaimRequest, InMemoryAssignmentStore, LifecycleBatch,
     LifecycleEvent, LifecycleEventKind, ReconcileRequest, ReconcileResult, StoreError,
 };
+pub use migration::{
+    BeginMigration, MigrationAction, MigrationPhase, MigrationRecord, UpdateMigration,
+    MAX_SAFE_GENERATION,
+};
 pub use model::{
-    Assignment, AssignmentState, CapacityLimits, Node, NodeObservation, NodeResources,
-    PendingResources, PlacementConfig, SandboxResources,
+    Assignment, AssignmentState, CapacityLimits, MigrationCapabilities, Node, NodeObservation,
+    NodeResources, PendingResources, PlacementConfig, SandboxResources,
 };
 pub use placement::{PlacementEngine, PlacementError};
 pub use redis_store::RedisAssignmentStore;

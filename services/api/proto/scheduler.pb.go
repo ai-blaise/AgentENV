@@ -145,6 +145,70 @@ func (SandboxEventType) EnumDescriptor() ([]byte, []int) {
 	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{1}
 }
 
+type MigrationPhase int32
+
+const (
+	MigrationPhase_MIGRATION_PHASE_UNSPECIFIED        MigrationPhase = 0
+	MigrationPhase_MIGRATION_PHASE_PREPARING          MigrationPhase = 1
+	MigrationPhase_MIGRATION_PHASE_READY_TO_CUTOVER   MigrationPhase = 2
+	MigrationPhase_MIGRATION_PHASE_SOURCE_QUIESCED    MigrationPhase = 3
+	MigrationPhase_MIGRATION_PHASE_COMMITTED          MigrationPhase = 4
+	MigrationPhase_MIGRATION_PHASE_DESTINATION_ACTIVE MigrationPhase = 5
+	MigrationPhase_MIGRATION_PHASE_SOURCE_RELEASED    MigrationPhase = 6
+	MigrationPhase_MIGRATION_PHASE_ABORTED            MigrationPhase = 7
+)
+
+// Enum value maps for MigrationPhase.
+var (
+	MigrationPhase_name = map[int32]string{
+		0: "MIGRATION_PHASE_UNSPECIFIED",
+		1: "MIGRATION_PHASE_PREPARING",
+		2: "MIGRATION_PHASE_READY_TO_CUTOVER",
+		3: "MIGRATION_PHASE_SOURCE_QUIESCED",
+		4: "MIGRATION_PHASE_COMMITTED",
+		5: "MIGRATION_PHASE_DESTINATION_ACTIVE",
+		6: "MIGRATION_PHASE_SOURCE_RELEASED",
+		7: "MIGRATION_PHASE_ABORTED",
+	}
+	MigrationPhase_value = map[string]int32{
+		"MIGRATION_PHASE_UNSPECIFIED":        0,
+		"MIGRATION_PHASE_PREPARING":          1,
+		"MIGRATION_PHASE_READY_TO_CUTOVER":   2,
+		"MIGRATION_PHASE_SOURCE_QUIESCED":    3,
+		"MIGRATION_PHASE_COMMITTED":          4,
+		"MIGRATION_PHASE_DESTINATION_ACTIVE": 5,
+		"MIGRATION_PHASE_SOURCE_RELEASED":    6,
+		"MIGRATION_PHASE_ABORTED":            7,
+	}
+)
+
+func (x MigrationPhase) Enum() *MigrationPhase {
+	p := new(MigrationPhase)
+	*p = x
+	return p
+}
+
+func (x MigrationPhase) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MigrationPhase) Descriptor() protoreflect.EnumDescriptor {
+	return file_api_proto_scheduler_proto_enumTypes[2].Descriptor()
+}
+
+func (MigrationPhase) Type() protoreflect.EnumType {
+	return &file_api_proto_scheduler_proto_enumTypes[2]
+}
+
+func (x MigrationPhase) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use MigrationPhase.Descriptor instead.
+func (MigrationPhase) EnumDescriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{2}
+}
+
 type Node struct {
 	state    protoimpl.MessageState `protogen:"open.v1"`
 	NodeId   string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
@@ -1156,18 +1220,19 @@ func (x *P2PEndpoint) GetAddress() string {
 }
 
 type ObservedNode struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	NodeId            string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	Endpoint          string                 `protobuf:"bytes,2,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
-	ClusterId         string                 `protobuf:"bytes,3,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
-	ServiceInstanceId string                 `protobuf:"bytes,4,opt,name=service_instance_id,json=serviceInstanceId,proto3" json:"service_instance_id,omitempty"`
-	Version           string                 `protobuf:"bytes,5,opt,name=version,proto3" json:"version,omitempty"`
-	Commit            string                 `protobuf:"bytes,6,opt,name=commit,proto3" json:"commit,omitempty"`
-	MachineInfo       *MachineInfo           `protobuf:"bytes,7,opt,name=machine_info,json=machineInfo,proto3" json:"machine_info,omitempty"`
-	Snapshot          *NodeSnapshot          `protobuf:"bytes,8,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
-	LastSeenUnixMs    int64                  `protobuf:"varint,9,opt,name=last_seen_unix_ms,json=lastSeenUnixMs,proto3" json:"last_seen_unix_ms,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	NodeId                string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	Endpoint              string                 `protobuf:"bytes,2,opt,name=endpoint,proto3" json:"endpoint,omitempty"`
+	ClusterId             string                 `protobuf:"bytes,3,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
+	ServiceInstanceId     string                 `protobuf:"bytes,4,opt,name=service_instance_id,json=serviceInstanceId,proto3" json:"service_instance_id,omitempty"`
+	Version               string                 `protobuf:"bytes,5,opt,name=version,proto3" json:"version,omitempty"`
+	Commit                string                 `protobuf:"bytes,6,opt,name=commit,proto3" json:"commit,omitempty"`
+	MachineInfo           *MachineInfo           `protobuf:"bytes,7,opt,name=machine_info,json=machineInfo,proto3" json:"machine_info,omitempty"`
+	Snapshot              *NodeSnapshot          `protobuf:"bytes,8,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
+	LastSeenUnixMs        int64                  `protobuf:"varint,9,opt,name=last_seen_unix_ms,json=lastSeenUnixMs,proto3" json:"last_seen_unix_ms,omitempty"`
+	MigrationCapabilities *MigrationCapabilities `protobuf:"bytes,10,opt,name=migration_capabilities,json=migrationCapabilities,proto3" json:"migration_capabilities,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *ObservedNode) Reset() {
@@ -1263,6 +1328,155 @@ func (x *ObservedNode) GetLastSeenUnixMs() int64 {
 	return 0
 }
 
+func (x *ObservedNode) GetMigrationCapabilities() *MigrationCapabilities {
+	if x != nil {
+		return x.MigrationCapabilities
+	}
+	return nil
+}
+
+// MigrationCapabilities is a strict snapshot/runtime compatibility domain.
+// Empty or unknown fields make a node ineligible for migration.
+type MigrationCapabilities struct {
+	state                  protoimpl.MessageState `protogen:"open.v1"`
+	CpuArchitecture        string                 `protobuf:"bytes,1,opt,name=cpu_architecture,json=cpuArchitecture,proto3" json:"cpu_architecture,omitempty"`
+	VirtualizationMode     string                 `protobuf:"bytes,2,opt,name=virtualization_mode,json=virtualizationMode,proto3" json:"virtualization_mode,omitempty"`
+	CpuTemplate            string                 `protobuf:"bytes,3,opt,name=cpu_template,json=cpuTemplate,proto3" json:"cpu_template,omitempty"`
+	FirecrackerVersion     string                 `protobuf:"bytes,4,opt,name=firecracker_version,json=firecrackerVersion,proto3" json:"firecracker_version,omitempty"`
+	SnapshotFormat         string                 `protobuf:"bytes,5,opt,name=snapshot_format,json=snapshotFormat,proto3" json:"snapshot_format,omitempty"`
+	KernelVersion          string                 `protobuf:"bytes,6,opt,name=kernel_version,json=kernelVersion,proto3" json:"kernel_version,omitempty"`
+	ToolsDriveVersion      string                 `protobuf:"bytes,7,opt,name=tools_drive_version,json=toolsDriveVersion,proto3" json:"tools_drive_version,omitempty"`
+	DeviceModel            string                 `protobuf:"bytes,8,opt,name=device_model,json=deviceModel,proto3" json:"device_model,omitempty"`
+	MemoryPageSize         uint64                 `protobuf:"varint,9,opt,name=memory_page_size,json=memoryPageSize,proto3" json:"memory_page_size,omitempty"`
+	IncrementalCheckpoints bool                   `protobuf:"varint,10,opt,name=incremental_checkpoints,json=incrementalCheckpoints,proto3" json:"incremental_checkpoints,omitempty"`
+	PeerRestore            bool                   `protobuf:"varint,11,opt,name=peer_restore,json=peerRestore,proto3" json:"peer_restore,omitempty"`
+	StableConnectionProxy  bool                   `protobuf:"varint,12,opt,name=stable_connection_proxy,json=stableConnectionProxy,proto3" json:"stable_connection_proxy,omitempty"`
+	VirtioMem              bool                   `protobuf:"varint,13,opt,name=virtio_mem,json=virtioMem,proto3" json:"virtio_mem,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
+}
+
+func (x *MigrationCapabilities) Reset() {
+	*x = MigrationCapabilities{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MigrationCapabilities) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MigrationCapabilities) ProtoMessage() {}
+
+func (x *MigrationCapabilities) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MigrationCapabilities.ProtoReflect.Descriptor instead.
+func (*MigrationCapabilities) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *MigrationCapabilities) GetCpuArchitecture() string {
+	if x != nil {
+		return x.CpuArchitecture
+	}
+	return ""
+}
+
+func (x *MigrationCapabilities) GetVirtualizationMode() string {
+	if x != nil {
+		return x.VirtualizationMode
+	}
+	return ""
+}
+
+func (x *MigrationCapabilities) GetCpuTemplate() string {
+	if x != nil {
+		return x.CpuTemplate
+	}
+	return ""
+}
+
+func (x *MigrationCapabilities) GetFirecrackerVersion() string {
+	if x != nil {
+		return x.FirecrackerVersion
+	}
+	return ""
+}
+
+func (x *MigrationCapabilities) GetSnapshotFormat() string {
+	if x != nil {
+		return x.SnapshotFormat
+	}
+	return ""
+}
+
+func (x *MigrationCapabilities) GetKernelVersion() string {
+	if x != nil {
+		return x.KernelVersion
+	}
+	return ""
+}
+
+func (x *MigrationCapabilities) GetToolsDriveVersion() string {
+	if x != nil {
+		return x.ToolsDriveVersion
+	}
+	return ""
+}
+
+func (x *MigrationCapabilities) GetDeviceModel() string {
+	if x != nil {
+		return x.DeviceModel
+	}
+	return ""
+}
+
+func (x *MigrationCapabilities) GetMemoryPageSize() uint64 {
+	if x != nil {
+		return x.MemoryPageSize
+	}
+	return 0
+}
+
+func (x *MigrationCapabilities) GetIncrementalCheckpoints() bool {
+	if x != nil {
+		return x.IncrementalCheckpoints
+	}
+	return false
+}
+
+func (x *MigrationCapabilities) GetPeerRestore() bool {
+	if x != nil {
+		return x.PeerRestore
+	}
+	return false
+}
+
+func (x *MigrationCapabilities) GetStableConnectionProxy() bool {
+	if x != nil {
+		return x.StableConnectionProxy
+	}
+	return false
+}
+
+func (x *MigrationCapabilities) GetVirtioMem() bool {
+	if x != nil {
+		return x.VirtioMem
+	}
+	return false
+}
+
 type HeartbeatRequest struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	NodeId            string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
@@ -1276,15 +1490,16 @@ type HeartbeatRequest struct {
 	P2PEndpoint       *P2PEndpoint           `protobuf:"bytes,9,opt,name=p2p_endpoint,json=p2pEndpoint,proto3" json:"p2p_endpoint,omitempty"`
 	// Stable identity and durable high-water mark of the node's lifecycle
 	// outbox. A new stream ID denotes replacement of the node's local state.
-	LifecycleStreamId     string `protobuf:"bytes,10,opt,name=lifecycle_stream_id,json=lifecycleStreamId,proto3" json:"lifecycle_stream_id,omitempty"`
-	LifecycleLastSequence uint64 `protobuf:"varint,11,opt,name=lifecycle_last_sequence,json=lifecycleLastSequence,proto3" json:"lifecycle_last_sequence,omitempty"`
+	LifecycleStreamId     string                 `protobuf:"bytes,10,opt,name=lifecycle_stream_id,json=lifecycleStreamId,proto3" json:"lifecycle_stream_id,omitempty"`
+	LifecycleLastSequence uint64                 `protobuf:"varint,11,opt,name=lifecycle_last_sequence,json=lifecycleLastSequence,proto3" json:"lifecycle_last_sequence,omitempty"`
+	MigrationCapabilities *MigrationCapabilities `protobuf:"bytes,12,opt,name=migration_capabilities,json=migrationCapabilities,proto3" json:"migration_capabilities,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
 
 func (x *HeartbeatRequest) Reset() {
 	*x = HeartbeatRequest{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[17]
+	mi := &file_api_proto_scheduler_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1296,7 +1511,7 @@ func (x *HeartbeatRequest) String() string {
 func (*HeartbeatRequest) ProtoMessage() {}
 
 func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[17]
+	mi := &file_api_proto_scheduler_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1309,7 +1524,7 @@ func (x *HeartbeatRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatRequest.ProtoReflect.Descriptor instead.
 func (*HeartbeatRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{17}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *HeartbeatRequest) GetNodeId() string {
@@ -1389,6 +1604,13 @@ func (x *HeartbeatRequest) GetLifecycleLastSequence() uint64 {
 	return 0
 }
 
+func (x *HeartbeatRequest) GetMigrationCapabilities() *MigrationCapabilities {
+	if x != nil {
+		return x.MigrationCapabilities
+	}
+	return nil
+}
+
 type HeartbeatResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	CpuConfigJson string                 `protobuf:"bytes,1,opt,name=cpu_config_json,json=cpuConfigJson,proto3" json:"cpu_config_json,omitempty"`
@@ -1398,7 +1620,7 @@ type HeartbeatResponse struct {
 
 func (x *HeartbeatResponse) Reset() {
 	*x = HeartbeatResponse{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[18]
+	mi := &file_api_proto_scheduler_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1410,7 +1632,7 @@ func (x *HeartbeatResponse) String() string {
 func (*HeartbeatResponse) ProtoMessage() {}
 
 func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[18]
+	mi := &file_api_proto_scheduler_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1423,7 +1645,7 @@ func (x *HeartbeatResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use HeartbeatResponse.ProtoReflect.Descriptor instead.
 func (*HeartbeatResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{18}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *HeartbeatResponse) GetCpuConfigJson() string {
@@ -1451,7 +1673,7 @@ type SandboxEvent struct {
 
 func (x *SandboxEvent) Reset() {
 	*x = SandboxEvent{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[19]
+	mi := &file_api_proto_scheduler_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1463,7 +1685,7 @@ func (x *SandboxEvent) String() string {
 func (*SandboxEvent) ProtoMessage() {}
 
 func (x *SandboxEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[19]
+	mi := &file_api_proto_scheduler_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1476,7 +1698,7 @@ func (x *SandboxEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SandboxEvent.ProtoReflect.Descriptor instead.
 func (*SandboxEvent) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{19}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *SandboxEvent) GetSandboxId() string {
@@ -1548,7 +1770,7 @@ type ReportSandboxEventRequest struct {
 
 func (x *ReportSandboxEventRequest) Reset() {
 	*x = ReportSandboxEventRequest{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[20]
+	mi := &file_api_proto_scheduler_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1560,7 +1782,7 @@ func (x *ReportSandboxEventRequest) String() string {
 func (*ReportSandboxEventRequest) ProtoMessage() {}
 
 func (x *ReportSandboxEventRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[20]
+	mi := &file_api_proto_scheduler_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1573,7 +1795,7 @@ func (x *ReportSandboxEventRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportSandboxEventRequest.ProtoReflect.Descriptor instead.
 func (*ReportSandboxEventRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{20}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *ReportSandboxEventRequest) GetNodeId() string {
@@ -1621,7 +1843,7 @@ type ReportSandboxEventResponse struct {
 
 func (x *ReportSandboxEventResponse) Reset() {
 	*x = ReportSandboxEventResponse{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[21]
+	mi := &file_api_proto_scheduler_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1633,7 +1855,7 @@ func (x *ReportSandboxEventResponse) String() string {
 func (*ReportSandboxEventResponse) ProtoMessage() {}
 
 func (x *ReportSandboxEventResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[21]
+	mi := &file_api_proto_scheduler_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1646,7 +1868,7 @@ func (x *ReportSandboxEventResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReportSandboxEventResponse.ProtoReflect.Descriptor instead.
 func (*ReportSandboxEventResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{21}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *ReportSandboxEventResponse) GetAcknowledgedSequence() uint64 {
@@ -1665,7 +1887,7 @@ type ListObservedNodesRequest struct {
 
 func (x *ListObservedNodesRequest) Reset() {
 	*x = ListObservedNodesRequest{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[22]
+	mi := &file_api_proto_scheduler_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1677,7 +1899,7 @@ func (x *ListObservedNodesRequest) String() string {
 func (*ListObservedNodesRequest) ProtoMessage() {}
 
 func (x *ListObservedNodesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[22]
+	mi := &file_api_proto_scheduler_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1690,7 +1912,7 @@ func (x *ListObservedNodesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListObservedNodesRequest.ProtoReflect.Descriptor instead.
 func (*ListObservedNodesRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{22}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *ListObservedNodesRequest) GetClusterId() string {
@@ -1709,7 +1931,7 @@ type ListObservedNodesResponse struct {
 
 func (x *ListObservedNodesResponse) Reset() {
 	*x = ListObservedNodesResponse{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[23]
+	mi := &file_api_proto_scheduler_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1721,7 +1943,7 @@ func (x *ListObservedNodesResponse) String() string {
 func (*ListObservedNodesResponse) ProtoMessage() {}
 
 func (x *ListObservedNodesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[23]
+	mi := &file_api_proto_scheduler_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1734,7 +1956,7 @@ func (x *ListObservedNodesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListObservedNodesResponse.ProtoReflect.Descriptor instead.
 func (*ListObservedNodesResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{23}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ListObservedNodesResponse) GetNodes() []*ObservedNode {
@@ -1754,7 +1976,7 @@ type P2PPeer struct {
 
 func (x *P2PPeer) Reset() {
 	*x = P2PPeer{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[24]
+	mi := &file_api_proto_scheduler_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1766,7 +1988,7 @@ func (x *P2PPeer) String() string {
 func (*P2PPeer) ProtoMessage() {}
 
 func (x *P2PPeer) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[24]
+	mi := &file_api_proto_scheduler_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1779,7 +2001,7 @@ func (x *P2PPeer) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use P2PPeer.ProtoReflect.Descriptor instead.
 func (*P2PPeer) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{24}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *P2PPeer) GetNodeId() string {
@@ -1807,7 +2029,7 @@ type ListP2PPeersRequest struct {
 
 func (x *ListP2PPeersRequest) Reset() {
 	*x = ListP2PPeersRequest{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[25]
+	mi := &file_api_proto_scheduler_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1819,7 +2041,7 @@ func (x *ListP2PPeersRequest) String() string {
 func (*ListP2PPeersRequest) ProtoMessage() {}
 
 func (x *ListP2PPeersRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[25]
+	mi := &file_api_proto_scheduler_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1832,7 +2054,7 @@ func (x *ListP2PPeersRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListP2PPeersRequest.ProtoReflect.Descriptor instead.
 func (*ListP2PPeersRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{25}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *ListP2PPeersRequest) GetClusterId() string {
@@ -1865,7 +2087,7 @@ type ListP2PPeersResponse struct {
 
 func (x *ListP2PPeersResponse) Reset() {
 	*x = ListP2PPeersResponse{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[26]
+	mi := &file_api_proto_scheduler_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1877,7 +2099,7 @@ func (x *ListP2PPeersResponse) String() string {
 func (*ListP2PPeersResponse) ProtoMessage() {}
 
 func (x *ListP2PPeersResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[26]
+	mi := &file_api_proto_scheduler_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1890,7 +2112,7 @@ func (x *ListP2PPeersResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListP2PPeersResponse.ProtoReflect.Descriptor instead.
 func (*ListP2PPeersResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{26}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *ListP2PPeersResponse) GetPeers() []*P2PPeer {
@@ -1912,7 +2134,7 @@ type RecordP2PArtifactRequest struct {
 
 func (x *RecordP2PArtifactRequest) Reset() {
 	*x = RecordP2PArtifactRequest{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[27]
+	mi := &file_api_proto_scheduler_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1924,7 +2146,7 @@ func (x *RecordP2PArtifactRequest) String() string {
 func (*RecordP2PArtifactRequest) ProtoMessage() {}
 
 func (x *RecordP2PArtifactRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[27]
+	mi := &file_api_proto_scheduler_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1937,7 +2159,7 @@ func (x *RecordP2PArtifactRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecordP2PArtifactRequest.ProtoReflect.Descriptor instead.
 func (*RecordP2PArtifactRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{27}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *RecordP2PArtifactRequest) GetClusterId() string {
@@ -1976,7 +2198,7 @@ type RecordP2PArtifactResponse struct {
 
 func (x *RecordP2PArtifactResponse) Reset() {
 	*x = RecordP2PArtifactResponse{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[28]
+	mi := &file_api_proto_scheduler_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1988,7 +2210,7 @@ func (x *RecordP2PArtifactResponse) String() string {
 func (*RecordP2PArtifactResponse) ProtoMessage() {}
 
 func (x *RecordP2PArtifactResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[28]
+	mi := &file_api_proto_scheduler_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2001,7 +2223,7 @@ func (x *RecordP2PArtifactResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RecordP2PArtifactResponse.ProtoReflect.Descriptor instead.
 func (*RecordP2PArtifactResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{28}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{29}
 }
 
 type ForgetP2PArtifactRequest struct {
@@ -2016,7 +2238,7 @@ type ForgetP2PArtifactRequest struct {
 
 func (x *ForgetP2PArtifactRequest) Reset() {
 	*x = ForgetP2PArtifactRequest{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[29]
+	mi := &file_api_proto_scheduler_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2028,7 +2250,7 @@ func (x *ForgetP2PArtifactRequest) String() string {
 func (*ForgetP2PArtifactRequest) ProtoMessage() {}
 
 func (x *ForgetP2PArtifactRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[29]
+	mi := &file_api_proto_scheduler_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2041,7 +2263,7 @@ func (x *ForgetP2PArtifactRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForgetP2PArtifactRequest.ProtoReflect.Descriptor instead.
 func (*ForgetP2PArtifactRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{29}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *ForgetP2PArtifactRequest) GetClusterId() string {
@@ -2080,7 +2302,7 @@ type ForgetP2PArtifactResponse struct {
 
 func (x *ForgetP2PArtifactResponse) Reset() {
 	*x = ForgetP2PArtifactResponse{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[30]
+	mi := &file_api_proto_scheduler_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2092,7 +2314,7 @@ func (x *ForgetP2PArtifactResponse) String() string {
 func (*ForgetP2PArtifactResponse) ProtoMessage() {}
 
 func (x *ForgetP2PArtifactResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[30]
+	mi := &file_api_proto_scheduler_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2105,7 +2327,7 @@ func (x *ForgetP2PArtifactResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ForgetP2PArtifactResponse.ProtoReflect.Descriptor instead.
 func (*ForgetP2PArtifactResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{30}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{31}
 }
 
 type LookupP2PArtifactRequest struct {
@@ -2120,7 +2342,7 @@ type LookupP2PArtifactRequest struct {
 
 func (x *LookupP2PArtifactRequest) Reset() {
 	*x = LookupP2PArtifactRequest{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[31]
+	mi := &file_api_proto_scheduler_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2132,7 +2354,7 @@ func (x *LookupP2PArtifactRequest) String() string {
 func (*LookupP2PArtifactRequest) ProtoMessage() {}
 
 func (x *LookupP2PArtifactRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[31]
+	mi := &file_api_proto_scheduler_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2145,7 +2367,7 @@ func (x *LookupP2PArtifactRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LookupP2PArtifactRequest.ProtoReflect.Descriptor instead.
 func (*LookupP2PArtifactRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{31}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *LookupP2PArtifactRequest) GetClusterId() string {
@@ -2185,7 +2407,7 @@ type LookupP2PArtifactResponse struct {
 
 func (x *LookupP2PArtifactResponse) Reset() {
 	*x = LookupP2PArtifactResponse{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[32]
+	mi := &file_api_proto_scheduler_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2197,7 +2419,7 @@ func (x *LookupP2PArtifactResponse) String() string {
 func (*LookupP2PArtifactResponse) ProtoMessage() {}
 
 func (x *LookupP2PArtifactResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[32]
+	mi := &file_api_proto_scheduler_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2210,7 +2432,7 @@ func (x *LookupP2PArtifactResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LookupP2PArtifactResponse.ProtoReflect.Descriptor instead.
 func (*LookupP2PArtifactResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{32}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *LookupP2PArtifactResponse) GetPeers() []*P2PPeer {
@@ -2230,7 +2452,7 @@ type GetNodeRequest struct {
 
 func (x *GetNodeRequest) Reset() {
 	*x = GetNodeRequest{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[33]
+	mi := &file_api_proto_scheduler_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2242,7 +2464,7 @@ func (x *GetNodeRequest) String() string {
 func (*GetNodeRequest) ProtoMessage() {}
 
 func (x *GetNodeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[33]
+	mi := &file_api_proto_scheduler_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2255,7 +2477,7 @@ func (x *GetNodeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNodeRequest.ProtoReflect.Descriptor instead.
 func (*GetNodeRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{33}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *GetNodeRequest) GetNodeId() string {
@@ -2281,7 +2503,7 @@ type GetNodeResponse struct {
 
 func (x *GetNodeResponse) Reset() {
 	*x = GetNodeResponse{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[34]
+	mi := &file_api_proto_scheduler_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2293,7 +2515,7 @@ func (x *GetNodeResponse) String() string {
 func (*GetNodeResponse) ProtoMessage() {}
 
 func (x *GetNodeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[34]
+	mi := &file_api_proto_scheduler_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2306,7 +2528,7 @@ func (x *GetNodeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNodeResponse.ProtoReflect.Descriptor instead.
 func (*GetNodeResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{34}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *GetNodeResponse) GetNode() *ObservedNode {
@@ -2326,7 +2548,7 @@ type UnregisterNodeRequest struct {
 
 func (x *UnregisterNodeRequest) Reset() {
 	*x = UnregisterNodeRequest{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[35]
+	mi := &file_api_proto_scheduler_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2338,7 +2560,7 @@ func (x *UnregisterNodeRequest) String() string {
 func (*UnregisterNodeRequest) ProtoMessage() {}
 
 func (x *UnregisterNodeRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[35]
+	mi := &file_api_proto_scheduler_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2351,7 +2573,7 @@ func (x *UnregisterNodeRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnregisterNodeRequest.ProtoReflect.Descriptor instead.
 func (*UnregisterNodeRequest) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{35}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *UnregisterNodeRequest) GetNodeId() string {
@@ -2376,7 +2598,7 @@ type UnregisterNodeResponse struct {
 
 func (x *UnregisterNodeResponse) Reset() {
 	*x = UnregisterNodeResponse{}
-	mi := &file_api_proto_scheduler_proto_msgTypes[36]
+	mi := &file_api_proto_scheduler_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2388,7 +2610,7 @@ func (x *UnregisterNodeResponse) String() string {
 func (*UnregisterNodeResponse) ProtoMessage() {}
 
 func (x *UnregisterNodeResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_api_proto_scheduler_proto_msgTypes[36]
+	mi := &file_api_proto_scheduler_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2401,7 +2623,595 @@ func (x *UnregisterNodeResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UnregisterNodeResponse.ProtoReflect.Descriptor instead.
 func (*UnregisterNodeResponse) Descriptor() ([]byte, []int) {
-	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{36}
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{37}
+}
+
+type Migration struct {
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	MigrationId         string                 `protobuf:"bytes,1,opt,name=migration_id,json=migrationId,proto3" json:"migration_id,omitempty"`
+	SandboxId           string                 `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	SourceGeneration    uint64                 `protobuf:"varint,3,opt,name=source_generation,json=sourceGeneration,proto3" json:"source_generation,omitempty"`
+	Source              *Node                  `protobuf:"bytes,4,opt,name=source,proto3" json:"source,omitempty"`
+	Destination         *Node                  `protobuf:"bytes,5,opt,name=destination,proto3" json:"destination,omitempty"`
+	Phase               MigrationPhase         `protobuf:"varint,6,opt,name=phase,proto3,enum=scheduler.v1.MigrationPhase" json:"phase,omitempty"`
+	CheckpointId        string                 `protobuf:"bytes,7,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
+	ManifestDigest      string                 `protobuf:"bytes,8,opt,name=manifest_digest,json=manifestDigest,proto3" json:"manifest_digest,omitempty"`
+	DurableCoverage     bool                   `protobuf:"varint,9,opt,name=durable_coverage,json=durableCoverage,proto3" json:"durable_coverage,omitempty"`
+	DestinationPrepared bool                   `protobuf:"varint,10,opt,name=destination_prepared,json=destinationPrepared,proto3" json:"destination_prepared,omitempty"`
+	CreatedAtUnixMs     int64                  `protobuf:"varint,11,opt,name=created_at_unix_ms,json=createdAtUnixMs,proto3" json:"created_at_unix_ms,omitempty"`
+	UpdatedAtUnixMs     int64                  `protobuf:"varint,12,opt,name=updated_at_unix_ms,json=updatedAtUnixMs,proto3" json:"updated_at_unix_ms,omitempty"`
+	AbortReason         string                 `protobuf:"bytes,13,opt,name=abort_reason,json=abortReason,proto3" json:"abort_reason,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
+}
+
+func (x *Migration) Reset() {
+	*x = Migration{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[38]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Migration) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Migration) ProtoMessage() {}
+
+func (x *Migration) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[38]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Migration.ProtoReflect.Descriptor instead.
+func (*Migration) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{38}
+}
+
+func (x *Migration) GetMigrationId() string {
+	if x != nil {
+		return x.MigrationId
+	}
+	return ""
+}
+
+func (x *Migration) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *Migration) GetSourceGeneration() uint64 {
+	if x != nil {
+		return x.SourceGeneration
+	}
+	return 0
+}
+
+func (x *Migration) GetSource() *Node {
+	if x != nil {
+		return x.Source
+	}
+	return nil
+}
+
+func (x *Migration) GetDestination() *Node {
+	if x != nil {
+		return x.Destination
+	}
+	return nil
+}
+
+func (x *Migration) GetPhase() MigrationPhase {
+	if x != nil {
+		return x.Phase
+	}
+	return MigrationPhase_MIGRATION_PHASE_UNSPECIFIED
+}
+
+func (x *Migration) GetCheckpointId() string {
+	if x != nil {
+		return x.CheckpointId
+	}
+	return ""
+}
+
+func (x *Migration) GetManifestDigest() string {
+	if x != nil {
+		return x.ManifestDigest
+	}
+	return ""
+}
+
+func (x *Migration) GetDurableCoverage() bool {
+	if x != nil {
+		return x.DurableCoverage
+	}
+	return false
+}
+
+func (x *Migration) GetDestinationPrepared() bool {
+	if x != nil {
+		return x.DestinationPrepared
+	}
+	return false
+}
+
+func (x *Migration) GetCreatedAtUnixMs() int64 {
+	if x != nil {
+		return x.CreatedAtUnixMs
+	}
+	return 0
+}
+
+func (x *Migration) GetUpdatedAtUnixMs() int64 {
+	if x != nil {
+		return x.UpdatedAtUnixMs
+	}
+	return 0
+}
+
+func (x *Migration) GetAbortReason() string {
+	if x != nil {
+		return x.AbortReason
+	}
+	return ""
+}
+
+type BeginMigrationRequest struct {
+	state                        protoimpl.MessageState `protogen:"open.v1"`
+	MigrationId                  string                 `protobuf:"bytes,1,opt,name=migration_id,json=migrationId,proto3" json:"migration_id,omitempty"`
+	SandboxId                    string                 `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	SourceNodeId                 string                 `protobuf:"bytes,3,opt,name=source_node_id,json=sourceNodeId,proto3" json:"source_node_id,omitempty"`
+	SourceServiceInstanceId      string                 `protobuf:"bytes,4,opt,name=source_service_instance_id,json=sourceServiceInstanceId,proto3" json:"source_service_instance_id,omitempty"`
+	ExpectedGeneration           uint64                 `protobuf:"varint,5,opt,name=expected_generation,json=expectedGeneration,proto3" json:"expected_generation,omitempty"`
+	DestinationNodeId            string                 `protobuf:"bytes,6,opt,name=destination_node_id,json=destinationNodeId,proto3" json:"destination_node_id,omitempty"`
+	DestinationServiceInstanceId string                 `protobuf:"bytes,7,opt,name=destination_service_instance_id,json=destinationServiceInstanceId,proto3" json:"destination_service_instance_id,omitempty"`
+	RequestedCpu                 uint32                 `protobuf:"varint,8,opt,name=requested_cpu,json=requestedCpu,proto3" json:"requested_cpu,omitempty"`
+	RequestedMemoryBytes         uint64                 `protobuf:"varint,9,opt,name=requested_memory_bytes,json=requestedMemoryBytes,proto3" json:"requested_memory_bytes,omitempty"`
+	RequestedDiskBytes           uint64                 `protobuf:"varint,10,opt,name=requested_disk_bytes,json=requestedDiskBytes,proto3" json:"requested_disk_bytes,omitempty"`
+	unknownFields                protoimpl.UnknownFields
+	sizeCache                    protoimpl.SizeCache
+}
+
+func (x *BeginMigrationRequest) Reset() {
+	*x = BeginMigrationRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *BeginMigrationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*BeginMigrationRequest) ProtoMessage() {}
+
+func (x *BeginMigrationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use BeginMigrationRequest.ProtoReflect.Descriptor instead.
+func (*BeginMigrationRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *BeginMigrationRequest) GetMigrationId() string {
+	if x != nil {
+		return x.MigrationId
+	}
+	return ""
+}
+
+func (x *BeginMigrationRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *BeginMigrationRequest) GetSourceNodeId() string {
+	if x != nil {
+		return x.SourceNodeId
+	}
+	return ""
+}
+
+func (x *BeginMigrationRequest) GetSourceServiceInstanceId() string {
+	if x != nil {
+		return x.SourceServiceInstanceId
+	}
+	return ""
+}
+
+func (x *BeginMigrationRequest) GetExpectedGeneration() uint64 {
+	if x != nil {
+		return x.ExpectedGeneration
+	}
+	return 0
+}
+
+func (x *BeginMigrationRequest) GetDestinationNodeId() string {
+	if x != nil {
+		return x.DestinationNodeId
+	}
+	return ""
+}
+
+func (x *BeginMigrationRequest) GetDestinationServiceInstanceId() string {
+	if x != nil {
+		return x.DestinationServiceInstanceId
+	}
+	return ""
+}
+
+func (x *BeginMigrationRequest) GetRequestedCpu() uint32 {
+	if x != nil {
+		return x.RequestedCpu
+	}
+	return 0
+}
+
+func (x *BeginMigrationRequest) GetRequestedMemoryBytes() uint64 {
+	if x != nil {
+		return x.RequestedMemoryBytes
+	}
+	return 0
+}
+
+func (x *BeginMigrationRequest) GetRequestedDiskBytes() uint64 {
+	if x != nil {
+		return x.RequestedDiskBytes
+	}
+	return 0
+}
+
+type RecordMigrationCheckpointRequest struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	MigrationId       string                 `protobuf:"bytes,1,opt,name=migration_id,json=migrationId,proto3" json:"migration_id,omitempty"`
+	SandboxId         string                 `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	NodeId            string                 `protobuf:"bytes,3,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	ServiceInstanceId string                 `protobuf:"bytes,4,opt,name=service_instance_id,json=serviceInstanceId,proto3" json:"service_instance_id,omitempty"`
+	CheckpointId      string                 `protobuf:"bytes,5,opt,name=checkpoint_id,json=checkpointId,proto3" json:"checkpoint_id,omitempty"`
+	ManifestDigest    string                 `protobuf:"bytes,6,opt,name=manifest_digest,json=manifestDigest,proto3" json:"manifest_digest,omitempty"`
+	DurableCoverage   bool                   `protobuf:"varint,7,opt,name=durable_coverage,json=durableCoverage,proto3" json:"durable_coverage,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *RecordMigrationCheckpointRequest) Reset() {
+	*x = RecordMigrationCheckpointRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RecordMigrationCheckpointRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RecordMigrationCheckpointRequest) ProtoMessage() {}
+
+func (x *RecordMigrationCheckpointRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RecordMigrationCheckpointRequest.ProtoReflect.Descriptor instead.
+func (*RecordMigrationCheckpointRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *RecordMigrationCheckpointRequest) GetMigrationId() string {
+	if x != nil {
+		return x.MigrationId
+	}
+	return ""
+}
+
+func (x *RecordMigrationCheckpointRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *RecordMigrationCheckpointRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *RecordMigrationCheckpointRequest) GetServiceInstanceId() string {
+	if x != nil {
+		return x.ServiceInstanceId
+	}
+	return ""
+}
+
+func (x *RecordMigrationCheckpointRequest) GetCheckpointId() string {
+	if x != nil {
+		return x.CheckpointId
+	}
+	return ""
+}
+
+func (x *RecordMigrationCheckpointRequest) GetManifestDigest() string {
+	if x != nil {
+		return x.ManifestDigest
+	}
+	return ""
+}
+
+func (x *RecordMigrationCheckpointRequest) GetDurableCoverage() bool {
+	if x != nil {
+		return x.DurableCoverage
+	}
+	return false
+}
+
+type MigrationStepRequest struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	MigrationId       string                 `protobuf:"bytes,1,opt,name=migration_id,json=migrationId,proto3" json:"migration_id,omitempty"`
+	SandboxId         string                 `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	NodeId            string                 `protobuf:"bytes,3,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	ServiceInstanceId string                 `protobuf:"bytes,4,opt,name=service_instance_id,json=serviceInstanceId,proto3" json:"service_instance_id,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *MigrationStepRequest) Reset() {
+	*x = MigrationStepRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MigrationStepRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MigrationStepRequest) ProtoMessage() {}
+
+func (x *MigrationStepRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MigrationStepRequest.ProtoReflect.Descriptor instead.
+func (*MigrationStepRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *MigrationStepRequest) GetMigrationId() string {
+	if x != nil {
+		return x.MigrationId
+	}
+	return ""
+}
+
+func (x *MigrationStepRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *MigrationStepRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *MigrationStepRequest) GetServiceInstanceId() string {
+	if x != nil {
+		return x.ServiceInstanceId
+	}
+	return ""
+}
+
+type AbortMigrationRequest struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	MigrationId       string                 `protobuf:"bytes,1,opt,name=migration_id,json=migrationId,proto3" json:"migration_id,omitempty"`
+	SandboxId         string                 `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	NodeId            string                 `protobuf:"bytes,3,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	ServiceInstanceId string                 `protobuf:"bytes,4,opt,name=service_instance_id,json=serviceInstanceId,proto3" json:"service_instance_id,omitempty"`
+	Reason            string                 `protobuf:"bytes,5,opt,name=reason,proto3" json:"reason,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *AbortMigrationRequest) Reset() {
+	*x = AbortMigrationRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AbortMigrationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AbortMigrationRequest) ProtoMessage() {}
+
+func (x *AbortMigrationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AbortMigrationRequest.ProtoReflect.Descriptor instead.
+func (*AbortMigrationRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *AbortMigrationRequest) GetMigrationId() string {
+	if x != nil {
+		return x.MigrationId
+	}
+	return ""
+}
+
+func (x *AbortMigrationRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *AbortMigrationRequest) GetNodeId() string {
+	if x != nil {
+		return x.NodeId
+	}
+	return ""
+}
+
+func (x *AbortMigrationRequest) GetServiceInstanceId() string {
+	if x != nil {
+		return x.ServiceInstanceId
+	}
+	return ""
+}
+
+func (x *AbortMigrationRequest) GetReason() string {
+	if x != nil {
+		return x.Reason
+	}
+	return ""
+}
+
+type GetMigrationRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MigrationId   string                 `protobuf:"bytes,1,opt,name=migration_id,json=migrationId,proto3" json:"migration_id,omitempty"`
+	SandboxId     string                 `protobuf:"bytes,2,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetMigrationRequest) Reset() {
+	*x = GetMigrationRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[43]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetMigrationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetMigrationRequest) ProtoMessage() {}
+
+func (x *GetMigrationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[43]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetMigrationRequest.ProtoReflect.Descriptor instead.
+func (*GetMigrationRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{43}
+}
+
+func (x *GetMigrationRequest) GetMigrationId() string {
+	if x != nil {
+		return x.MigrationId
+	}
+	return ""
+}
+
+func (x *GetMigrationRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+type MigrationResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Migration     *Migration             `protobuf:"bytes,1,opt,name=migration,proto3" json:"migration,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MigrationResponse) Reset() {
+	*x = MigrationResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[44]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MigrationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MigrationResponse) ProtoMessage() {}
+
+func (x *MigrationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[44]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MigrationResponse.ProtoReflect.Descriptor instead.
+func (*MigrationResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{44}
+}
+
+func (x *MigrationResponse) GetMigration() *Migration {
+	if x != nil {
+		return x.Migration
+	}
+	return nil
 }
 
 var File_api_proto_scheduler_proto protoreflect.FileDescriptor
@@ -2494,7 +3304,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x1dpaused_allocated_memory_bytes\x18\x10 \x01(\x04R\x1apausedAllocatedMemoryBytes\"A\n" +
 	"\vP2pEndpoint\x12\x18\n" +
 	"\abackend\x18\x01 \x01(\tR\abackend\x12\x18\n" +
-	"\aaddress\x18\x02 \x01(\tR\aaddress\"\xe5\x02\n" +
+	"\aaddress\x18\x02 \x01(\tR\aaddress\"\xc1\x03\n" +
 	"\fObservedNode\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1a\n" +
 	"\bendpoint\x18\x02 \x01(\tR\bendpoint\x12\x1d\n" +
@@ -2505,7 +3315,25 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x06commit\x18\x06 \x01(\tR\x06commit\x12<\n" +
 	"\fmachine_info\x18\a \x01(\v2\x19.scheduler.v1.MachineInfoR\vmachineInfo\x126\n" +
 	"\bsnapshot\x18\b \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12)\n" +
-	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\xe9\x03\n" +
+	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\x12Z\n" +
+	"\x16migration_capabilities\x18\n" +
+	" \x01(\v2#.scheduler.v1.MigrationCapabilitiesR\x15migrationCapabilities\"\xc7\x04\n" +
+	"\x15MigrationCapabilities\x12)\n" +
+	"\x10cpu_architecture\x18\x01 \x01(\tR\x0fcpuArchitecture\x12/\n" +
+	"\x13virtualization_mode\x18\x02 \x01(\tR\x12virtualizationMode\x12!\n" +
+	"\fcpu_template\x18\x03 \x01(\tR\vcpuTemplate\x12/\n" +
+	"\x13firecracker_version\x18\x04 \x01(\tR\x12firecrackerVersion\x12'\n" +
+	"\x0fsnapshot_format\x18\x05 \x01(\tR\x0esnapshotFormat\x12%\n" +
+	"\x0ekernel_version\x18\x06 \x01(\tR\rkernelVersion\x12.\n" +
+	"\x13tools_drive_version\x18\a \x01(\tR\x11toolsDriveVersion\x12!\n" +
+	"\fdevice_model\x18\b \x01(\tR\vdeviceModel\x12(\n" +
+	"\x10memory_page_size\x18\t \x01(\x04R\x0ememoryPageSize\x127\n" +
+	"\x17incremental_checkpoints\x18\n" +
+	" \x01(\bR\x16incrementalCheckpoints\x12!\n" +
+	"\fpeer_restore\x18\v \x01(\bR\vpeerRestore\x126\n" +
+	"\x17stable_connection_proxy\x18\f \x01(\bR\x15stableConnectionProxy\x12\x1d\n" +
+	"\n" +
+	"virtio_mem\x18\r \x01(\bR\tvirtioMem\"\xc5\x04\n" +
 	"\x10HeartbeatRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
@@ -2520,7 +3348,8 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\x12.\n" +
 	"\x13lifecycle_stream_id\x18\n" +
 	" \x01(\tR\x11lifecycleStreamId\x126\n" +
-	"\x17lifecycle_last_sequence\x18\v \x01(\x04R\x15lifecycleLastSequence\";\n" +
+	"\x17lifecycle_last_sequence\x18\v \x01(\x04R\x15lifecycleLastSequence\x12Z\n" +
+	"\x16migration_capabilities\x18\f \x01(\v2#.scheduler.v1.MigrationCapabilitiesR\x15migrationCapabilities\";\n" +
 	"\x11HeartbeatResponse\x12&\n" +
 	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\"\xdf\x02\n" +
 	"\fSandboxEvent\x12\x1d\n" +
@@ -2589,7 +3418,64 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x15UnregisterNodeRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12.\n" +
 	"\x13service_instance_id\x18\x02 \x01(\tR\x11serviceInstanceId\"\x18\n" +
-	"\x16UnregisterNodeResponse*\x92\x01\n" +
+	"\x16UnregisterNodeResponse\"\xb9\x04\n" +
+	"\tMigration\x12!\n" +
+	"\fmigration_id\x18\x01 \x01(\tR\vmigrationId\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12+\n" +
+	"\x11source_generation\x18\x03 \x01(\x04R\x10sourceGeneration\x12*\n" +
+	"\x06source\x18\x04 \x01(\v2\x12.scheduler.v1.NodeR\x06source\x124\n" +
+	"\vdestination\x18\x05 \x01(\v2\x12.scheduler.v1.NodeR\vdestination\x122\n" +
+	"\x05phase\x18\x06 \x01(\x0e2\x1c.scheduler.v1.MigrationPhaseR\x05phase\x12#\n" +
+	"\rcheckpoint_id\x18\a \x01(\tR\fcheckpointId\x12'\n" +
+	"\x0fmanifest_digest\x18\b \x01(\tR\x0emanifestDigest\x12)\n" +
+	"\x10durable_coverage\x18\t \x01(\bR\x0fdurableCoverage\x121\n" +
+	"\x14destination_prepared\x18\n" +
+	" \x01(\bR\x13destinationPrepared\x12+\n" +
+	"\x12created_at_unix_ms\x18\v \x01(\x03R\x0fcreatedAtUnixMs\x12+\n" +
+	"\x12updated_at_unix_ms\x18\f \x01(\x03R\x0fupdatedAtUnixMs\x12!\n" +
+	"\fabort_reason\x18\r \x01(\tR\vabortReason\"\xf1\x03\n" +
+	"\x15BeginMigrationRequest\x12!\n" +
+	"\fmigration_id\x18\x01 \x01(\tR\vmigrationId\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12$\n" +
+	"\x0esource_node_id\x18\x03 \x01(\tR\fsourceNodeId\x12;\n" +
+	"\x1asource_service_instance_id\x18\x04 \x01(\tR\x17sourceServiceInstanceId\x12/\n" +
+	"\x13expected_generation\x18\x05 \x01(\x04R\x12expectedGeneration\x12.\n" +
+	"\x13destination_node_id\x18\x06 \x01(\tR\x11destinationNodeId\x12E\n" +
+	"\x1fdestination_service_instance_id\x18\a \x01(\tR\x1cdestinationServiceInstanceId\x12#\n" +
+	"\rrequested_cpu\x18\b \x01(\rR\frequestedCpu\x124\n" +
+	"\x16requested_memory_bytes\x18\t \x01(\x04R\x14requestedMemoryBytes\x120\n" +
+	"\x14requested_disk_bytes\x18\n" +
+	" \x01(\x04R\x12requestedDiskBytes\"\xa6\x02\n" +
+	" RecordMigrationCheckpointRequest\x12!\n" +
+	"\fmigration_id\x18\x01 \x01(\tR\vmigrationId\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12\x17\n" +
+	"\anode_id\x18\x03 \x01(\tR\x06nodeId\x12.\n" +
+	"\x13service_instance_id\x18\x04 \x01(\tR\x11serviceInstanceId\x12#\n" +
+	"\rcheckpoint_id\x18\x05 \x01(\tR\fcheckpointId\x12'\n" +
+	"\x0fmanifest_digest\x18\x06 \x01(\tR\x0emanifestDigest\x12)\n" +
+	"\x10durable_coverage\x18\a \x01(\bR\x0fdurableCoverage\"\xa1\x01\n" +
+	"\x14MigrationStepRequest\x12!\n" +
+	"\fmigration_id\x18\x01 \x01(\tR\vmigrationId\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12\x17\n" +
+	"\anode_id\x18\x03 \x01(\tR\x06nodeId\x12.\n" +
+	"\x13service_instance_id\x18\x04 \x01(\tR\x11serviceInstanceId\"\xba\x01\n" +
+	"\x15AbortMigrationRequest\x12!\n" +
+	"\fmigration_id\x18\x01 \x01(\tR\vmigrationId\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\x12\x17\n" +
+	"\anode_id\x18\x03 \x01(\tR\x06nodeId\x12.\n" +
+	"\x13service_instance_id\x18\x04 \x01(\tR\x11serviceInstanceId\x12\x16\n" +
+	"\x06reason\x18\x05 \x01(\tR\x06reason\"W\n" +
+	"\x13GetMigrationRequest\x12!\n" +
+	"\fmigration_id\x18\x01 \x01(\tR\vmigrationId\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x02 \x01(\tR\tsandboxId\"J\n" +
+	"\x11MigrationResponse\x125\n" +
+	"\tmigration\x18\x01 \x01(\v2\x17.scheduler.v1.MigrationR\tmigration*\x92\x01\n" +
 	"\n" +
 	"NodeStatus\x12\x1b\n" +
 	"\x17NODE_STATUS_UNSPECIFIED\x10\x00\x12\x15\n" +
@@ -2603,7 +3489,16 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x19SANDBOX_EVENT_TYPE_DELETE\x10\x02\x12\x1c\n" +
 	"\x18SANDBOX_EVENT_TYPE_PAUSE\x10\x03\x12\x1d\n" +
 	"\x19SANDBOX_EVENT_TYPE_RESUME\x10\x04\x12\x1b\n" +
-	"\x17SANDBOX_EVENT_TYPE_FORK\x10\x052\xa3\t\n" +
+	"\x17SANDBOX_EVENT_TYPE_FORK\x10\x05*\xa4\x02\n" +
+	"\x0eMigrationPhase\x12\x1f\n" +
+	"\x1bMIGRATION_PHASE_UNSPECIFIED\x10\x00\x12\x1d\n" +
+	"\x19MIGRATION_PHASE_PREPARING\x10\x01\x12$\n" +
+	" MIGRATION_PHASE_READY_TO_CUTOVER\x10\x02\x12#\n" +
+	"\x1fMIGRATION_PHASE_SOURCE_QUIESCED\x10\x03\x12\x1d\n" +
+	"\x19MIGRATION_PHASE_COMMITTED\x10\x04\x12&\n" +
+	"\"MIGRATION_PHASE_DESTINATION_ACTIVE\x10\x05\x12#\n" +
+	"\x1fMIGRATION_PHASE_SOURCE_RELEASED\x10\x06\x12\x1b\n" +
+	"\x17MIGRATION_PHASE_ABORTED\x10\a2\xf4\x0f\n" +
 	"\tScheduler\x12I\n" +
 	"\bSchedule\x12\x1d.scheduler.v1.ScheduleRequest\x1a\x1e.scheduler.v1.ScheduleResponse\x12L\n" +
 	"\tListNodes\x12\x1e.scheduler.v1.ListNodesRequest\x1a\x1f.scheduler.v1.ListNodesResponse\x12O\n" +
@@ -2618,7 +3513,16 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x11ForgetP2pArtifact\x12&.scheduler.v1.ForgetP2pArtifactRequest\x1a'.scheduler.v1.ForgetP2pArtifactResponse\x12d\n" +
 	"\x11LookupP2pArtifact\x12&.scheduler.v1.LookupP2pArtifactRequest\x1a'.scheduler.v1.LookupP2pArtifactResponse\x12F\n" +
 	"\aGetNode\x12\x1c.scheduler.v1.GetNodeRequest\x1a\x1d.scheduler.v1.GetNodeResponse\x12[\n" +
-	"\x0eUnregisterNode\x12#.scheduler.v1.UnregisterNodeRequest\x1a$.scheduler.v1.UnregisterNodeResponseB)Z'agentenv/services/api/proto;schedulerv1b\x06proto3"
+	"\x0eUnregisterNode\x12#.scheduler.v1.UnregisterNodeRequest\x1a$.scheduler.v1.UnregisterNodeResponse\x12V\n" +
+	"\x0eBeginMigration\x12#.scheduler.v1.BeginMigrationRequest\x1a\x1f.scheduler.v1.MigrationResponse\x12l\n" +
+	"\x19RecordMigrationCheckpoint\x12..scheduler.v1.RecordMigrationCheckpointRequest\x1a\x1f.scheduler.v1.MigrationResponse\x12b\n" +
+	"\x1bPrepareMigrationDestination\x12\".scheduler.v1.MigrationStepRequest\x1a\x1f.scheduler.v1.MigrationResponse\x12]\n" +
+	"\x16QuiesceMigrationSource\x12\".scheduler.v1.MigrationStepRequest\x1a\x1f.scheduler.v1.MigrationResponse\x12V\n" +
+	"\x0fCommitMigration\x12\".scheduler.v1.MigrationStepRequest\x1a\x1f.scheduler.v1.MigrationResponse\x12c\n" +
+	"\x1cActivateMigrationDestination\x12\".scheduler.v1.MigrationStepRequest\x1a\x1f.scheduler.v1.MigrationResponse\x12V\n" +
+	"\x0eAbortMigration\x12#.scheduler.v1.AbortMigrationRequest\x1a\x1f.scheduler.v1.MigrationResponse\x12]\n" +
+	"\x16ReleaseMigrationSource\x12\".scheduler.v1.MigrationStepRequest\x1a\x1f.scheduler.v1.MigrationResponse\x12R\n" +
+	"\fGetMigration\x12!.scheduler.v1.GetMigrationRequest\x1a\x1f.scheduler.v1.MigrationResponseB)Z'agentenv/services/api/proto;schedulerv1b\x06proto3"
 
 var (
 	file_api_proto_scheduler_proto_rawDescOnce sync.Once
@@ -2632,106 +3536,139 @@ func file_api_proto_scheduler_proto_rawDescGZIP() []byte {
 	return file_api_proto_scheduler_proto_rawDescData
 }
 
-var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
+var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 47)
 var file_api_proto_scheduler_proto_goTypes = []any{
-	(NodeStatus)(0),                    // 0: scheduler.v1.NodeStatus
-	(SandboxEventType)(0),              // 1: scheduler.v1.SandboxEventType
-	(*Node)(nil),                       // 2: scheduler.v1.Node
-	(*ScheduleRequestHint)(nil),        // 3: scheduler.v1.ScheduleRequestHint
-	(*NewColdSandboxHint)(nil),         // 4: scheduler.v1.NewColdSandboxHint
-	(*NewSandboxHint)(nil),             // 5: scheduler.v1.NewSandboxHint
-	(*ScheduleRequest)(nil),            // 6: scheduler.v1.ScheduleRequest
-	(*ScheduleResponse)(nil),           // 7: scheduler.v1.ScheduleResponse
-	(*ListNodesRequest)(nil),           // 8: scheduler.v1.ListNodesRequest
-	(*ListNodesResponse)(nil),          // 9: scheduler.v1.ListNodesResponse
-	(*LookupNodeRequest)(nil),          // 10: scheduler.v1.LookupNodeRequest
-	(*LookupNodeResponse)(nil),         // 11: scheduler.v1.LookupNodeResponse
-	(*RecordAssignmentRequest)(nil),    // 12: scheduler.v1.RecordAssignmentRequest
-	(*RecordAssignmentResponse)(nil),   // 13: scheduler.v1.RecordAssignmentResponse
-	(*MachineInfo)(nil),                // 14: scheduler.v1.MachineInfo
-	(*DiskMetric)(nil),                 // 15: scheduler.v1.DiskMetric
-	(*NodeSnapshot)(nil),               // 16: scheduler.v1.NodeSnapshot
-	(*P2PEndpoint)(nil),                // 17: scheduler.v1.P2pEndpoint
-	(*ObservedNode)(nil),               // 18: scheduler.v1.ObservedNode
-	(*HeartbeatRequest)(nil),           // 19: scheduler.v1.HeartbeatRequest
-	(*HeartbeatResponse)(nil),          // 20: scheduler.v1.HeartbeatResponse
-	(*SandboxEvent)(nil),               // 21: scheduler.v1.SandboxEvent
-	(*ReportSandboxEventRequest)(nil),  // 22: scheduler.v1.ReportSandboxEventRequest
-	(*ReportSandboxEventResponse)(nil), // 23: scheduler.v1.ReportSandboxEventResponse
-	(*ListObservedNodesRequest)(nil),   // 24: scheduler.v1.ListObservedNodesRequest
-	(*ListObservedNodesResponse)(nil),  // 25: scheduler.v1.ListObservedNodesResponse
-	(*P2PPeer)(nil),                    // 26: scheduler.v1.P2pPeer
-	(*ListP2PPeersRequest)(nil),        // 27: scheduler.v1.ListP2pPeersRequest
-	(*ListP2PPeersResponse)(nil),       // 28: scheduler.v1.ListP2pPeersResponse
-	(*RecordP2PArtifactRequest)(nil),   // 29: scheduler.v1.RecordP2pArtifactRequest
-	(*RecordP2PArtifactResponse)(nil),  // 30: scheduler.v1.RecordP2pArtifactResponse
-	(*ForgetP2PArtifactRequest)(nil),   // 31: scheduler.v1.ForgetP2pArtifactRequest
-	(*ForgetP2PArtifactResponse)(nil),  // 32: scheduler.v1.ForgetP2pArtifactResponse
-	(*LookupP2PArtifactRequest)(nil),   // 33: scheduler.v1.LookupP2pArtifactRequest
-	(*LookupP2PArtifactResponse)(nil),  // 34: scheduler.v1.LookupP2pArtifactResponse
-	(*GetNodeRequest)(nil),             // 35: scheduler.v1.GetNodeRequest
-	(*GetNodeResponse)(nil),            // 36: scheduler.v1.GetNodeResponse
-	(*UnregisterNodeRequest)(nil),      // 37: scheduler.v1.UnregisterNodeRequest
-	(*UnregisterNodeResponse)(nil),     // 38: scheduler.v1.UnregisterNodeResponse
-	nil,                                // 39: scheduler.v1.NewColdSandboxHint.MetadataEntry
-	nil,                                // 40: scheduler.v1.NewSandboxHint.MetadataEntry
+	(NodeStatus)(0),                          // 0: scheduler.v1.NodeStatus
+	(SandboxEventType)(0),                    // 1: scheduler.v1.SandboxEventType
+	(MigrationPhase)(0),                      // 2: scheduler.v1.MigrationPhase
+	(*Node)(nil),                             // 3: scheduler.v1.Node
+	(*ScheduleRequestHint)(nil),              // 4: scheduler.v1.ScheduleRequestHint
+	(*NewColdSandboxHint)(nil),               // 5: scheduler.v1.NewColdSandboxHint
+	(*NewSandboxHint)(nil),                   // 6: scheduler.v1.NewSandboxHint
+	(*ScheduleRequest)(nil),                  // 7: scheduler.v1.ScheduleRequest
+	(*ScheduleResponse)(nil),                 // 8: scheduler.v1.ScheduleResponse
+	(*ListNodesRequest)(nil),                 // 9: scheduler.v1.ListNodesRequest
+	(*ListNodesResponse)(nil),                // 10: scheduler.v1.ListNodesResponse
+	(*LookupNodeRequest)(nil),                // 11: scheduler.v1.LookupNodeRequest
+	(*LookupNodeResponse)(nil),               // 12: scheduler.v1.LookupNodeResponse
+	(*RecordAssignmentRequest)(nil),          // 13: scheduler.v1.RecordAssignmentRequest
+	(*RecordAssignmentResponse)(nil),         // 14: scheduler.v1.RecordAssignmentResponse
+	(*MachineInfo)(nil),                      // 15: scheduler.v1.MachineInfo
+	(*DiskMetric)(nil),                       // 16: scheduler.v1.DiskMetric
+	(*NodeSnapshot)(nil),                     // 17: scheduler.v1.NodeSnapshot
+	(*P2PEndpoint)(nil),                      // 18: scheduler.v1.P2pEndpoint
+	(*ObservedNode)(nil),                     // 19: scheduler.v1.ObservedNode
+	(*MigrationCapabilities)(nil),            // 20: scheduler.v1.MigrationCapabilities
+	(*HeartbeatRequest)(nil),                 // 21: scheduler.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),                // 22: scheduler.v1.HeartbeatResponse
+	(*SandboxEvent)(nil),                     // 23: scheduler.v1.SandboxEvent
+	(*ReportSandboxEventRequest)(nil),        // 24: scheduler.v1.ReportSandboxEventRequest
+	(*ReportSandboxEventResponse)(nil),       // 25: scheduler.v1.ReportSandboxEventResponse
+	(*ListObservedNodesRequest)(nil),         // 26: scheduler.v1.ListObservedNodesRequest
+	(*ListObservedNodesResponse)(nil),        // 27: scheduler.v1.ListObservedNodesResponse
+	(*P2PPeer)(nil),                          // 28: scheduler.v1.P2pPeer
+	(*ListP2PPeersRequest)(nil),              // 29: scheduler.v1.ListP2pPeersRequest
+	(*ListP2PPeersResponse)(nil),             // 30: scheduler.v1.ListP2pPeersResponse
+	(*RecordP2PArtifactRequest)(nil),         // 31: scheduler.v1.RecordP2pArtifactRequest
+	(*RecordP2PArtifactResponse)(nil),        // 32: scheduler.v1.RecordP2pArtifactResponse
+	(*ForgetP2PArtifactRequest)(nil),         // 33: scheduler.v1.ForgetP2pArtifactRequest
+	(*ForgetP2PArtifactResponse)(nil),        // 34: scheduler.v1.ForgetP2pArtifactResponse
+	(*LookupP2PArtifactRequest)(nil),         // 35: scheduler.v1.LookupP2pArtifactRequest
+	(*LookupP2PArtifactResponse)(nil),        // 36: scheduler.v1.LookupP2pArtifactResponse
+	(*GetNodeRequest)(nil),                   // 37: scheduler.v1.GetNodeRequest
+	(*GetNodeResponse)(nil),                  // 38: scheduler.v1.GetNodeResponse
+	(*UnregisterNodeRequest)(nil),            // 39: scheduler.v1.UnregisterNodeRequest
+	(*UnregisterNodeResponse)(nil),           // 40: scheduler.v1.UnregisterNodeResponse
+	(*Migration)(nil),                        // 41: scheduler.v1.Migration
+	(*BeginMigrationRequest)(nil),            // 42: scheduler.v1.BeginMigrationRequest
+	(*RecordMigrationCheckpointRequest)(nil), // 43: scheduler.v1.RecordMigrationCheckpointRequest
+	(*MigrationStepRequest)(nil),             // 44: scheduler.v1.MigrationStepRequest
+	(*AbortMigrationRequest)(nil),            // 45: scheduler.v1.AbortMigrationRequest
+	(*GetMigrationRequest)(nil),              // 46: scheduler.v1.GetMigrationRequest
+	(*MigrationResponse)(nil),                // 47: scheduler.v1.MigrationResponse
+	nil,                                      // 48: scheduler.v1.NewColdSandboxHint.MetadataEntry
+	nil,                                      // 49: scheduler.v1.NewSandboxHint.MetadataEntry
 }
 var file_api_proto_scheduler_proto_depIdxs = []int32{
-	4,  // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
-	5,  // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
-	39, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
-	40, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
-	3,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
-	2,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
-	2,  // 6: scheduler.v1.ListNodesResponse.nodes:type_name -> scheduler.v1.Node
-	2,  // 7: scheduler.v1.LookupNodeResponse.node:type_name -> scheduler.v1.Node
-	2,  // 8: scheduler.v1.RecordAssignmentRequest.node:type_name -> scheduler.v1.Node
+	5,  // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
+	6,  // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
+	48, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
+	49, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
+	4,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
+	3,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
+	3,  // 6: scheduler.v1.ListNodesResponse.nodes:type_name -> scheduler.v1.Node
+	3,  // 7: scheduler.v1.LookupNodeResponse.node:type_name -> scheduler.v1.Node
+	3,  // 8: scheduler.v1.RecordAssignmentRequest.node:type_name -> scheduler.v1.Node
 	0,  // 9: scheduler.v1.NodeSnapshot.status:type_name -> scheduler.v1.NodeStatus
-	15, // 10: scheduler.v1.NodeSnapshot.disks:type_name -> scheduler.v1.DiskMetric
-	14, // 11: scheduler.v1.ObservedNode.machine_info:type_name -> scheduler.v1.MachineInfo
-	16, // 12: scheduler.v1.ObservedNode.snapshot:type_name -> scheduler.v1.NodeSnapshot
-	14, // 13: scheduler.v1.HeartbeatRequest.machine_info:type_name -> scheduler.v1.MachineInfo
-	16, // 14: scheduler.v1.HeartbeatRequest.snapshot:type_name -> scheduler.v1.NodeSnapshot
-	17, // 15: scheduler.v1.HeartbeatRequest.p2p_endpoint:type_name -> scheduler.v1.P2pEndpoint
-	1,  // 16: scheduler.v1.SandboxEvent.event_type:type_name -> scheduler.v1.SandboxEventType
-	21, // 17: scheduler.v1.ReportSandboxEventRequest.events:type_name -> scheduler.v1.SandboxEvent
-	18, // 18: scheduler.v1.ListObservedNodesResponse.nodes:type_name -> scheduler.v1.ObservedNode
-	17, // 19: scheduler.v1.P2pPeer.endpoint:type_name -> scheduler.v1.P2pEndpoint
-	26, // 20: scheduler.v1.ListP2pPeersResponse.peers:type_name -> scheduler.v1.P2pPeer
-	26, // 21: scheduler.v1.LookupP2pArtifactResponse.peers:type_name -> scheduler.v1.P2pPeer
-	18, // 22: scheduler.v1.GetNodeResponse.node:type_name -> scheduler.v1.ObservedNode
-	6,  // 23: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
-	8,  // 24: scheduler.v1.Scheduler.ListNodes:input_type -> scheduler.v1.ListNodesRequest
-	10, // 25: scheduler.v1.Scheduler.LookupNode:input_type -> scheduler.v1.LookupNodeRequest
-	12, // 26: scheduler.v1.Scheduler.RecordAssignment:input_type -> scheduler.v1.RecordAssignmentRequest
-	19, // 27: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
-	22, // 28: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
-	24, // 29: scheduler.v1.Scheduler.ListObservedNodes:input_type -> scheduler.v1.ListObservedNodesRequest
-	27, // 30: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
-	29, // 31: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
-	31, // 32: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
-	33, // 33: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
-	35, // 34: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
-	37, // 35: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
-	7,  // 36: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
-	9,  // 37: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
-	11, // 38: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
-	13, // 39: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
-	20, // 40: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
-	23, // 41: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
-	25, // 42: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
-	28, // 43: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
-	30, // 44: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
-	32, // 45: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
-	34, // 46: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
-	36, // 47: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
-	38, // 48: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
-	36, // [36:49] is the sub-list for method output_type
-	23, // [23:36] is the sub-list for method input_type
-	23, // [23:23] is the sub-list for extension type_name
-	23, // [23:23] is the sub-list for extension extendee
-	0,  // [0:23] is the sub-list for field type_name
+	16, // 10: scheduler.v1.NodeSnapshot.disks:type_name -> scheduler.v1.DiskMetric
+	15, // 11: scheduler.v1.ObservedNode.machine_info:type_name -> scheduler.v1.MachineInfo
+	17, // 12: scheduler.v1.ObservedNode.snapshot:type_name -> scheduler.v1.NodeSnapshot
+	20, // 13: scheduler.v1.ObservedNode.migration_capabilities:type_name -> scheduler.v1.MigrationCapabilities
+	15, // 14: scheduler.v1.HeartbeatRequest.machine_info:type_name -> scheduler.v1.MachineInfo
+	17, // 15: scheduler.v1.HeartbeatRequest.snapshot:type_name -> scheduler.v1.NodeSnapshot
+	18, // 16: scheduler.v1.HeartbeatRequest.p2p_endpoint:type_name -> scheduler.v1.P2pEndpoint
+	20, // 17: scheduler.v1.HeartbeatRequest.migration_capabilities:type_name -> scheduler.v1.MigrationCapabilities
+	1,  // 18: scheduler.v1.SandboxEvent.event_type:type_name -> scheduler.v1.SandboxEventType
+	23, // 19: scheduler.v1.ReportSandboxEventRequest.events:type_name -> scheduler.v1.SandboxEvent
+	19, // 20: scheduler.v1.ListObservedNodesResponse.nodes:type_name -> scheduler.v1.ObservedNode
+	18, // 21: scheduler.v1.P2pPeer.endpoint:type_name -> scheduler.v1.P2pEndpoint
+	28, // 22: scheduler.v1.ListP2pPeersResponse.peers:type_name -> scheduler.v1.P2pPeer
+	28, // 23: scheduler.v1.LookupP2pArtifactResponse.peers:type_name -> scheduler.v1.P2pPeer
+	19, // 24: scheduler.v1.GetNodeResponse.node:type_name -> scheduler.v1.ObservedNode
+	3,  // 25: scheduler.v1.Migration.source:type_name -> scheduler.v1.Node
+	3,  // 26: scheduler.v1.Migration.destination:type_name -> scheduler.v1.Node
+	2,  // 27: scheduler.v1.Migration.phase:type_name -> scheduler.v1.MigrationPhase
+	41, // 28: scheduler.v1.MigrationResponse.migration:type_name -> scheduler.v1.Migration
+	7,  // 29: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
+	9,  // 30: scheduler.v1.Scheduler.ListNodes:input_type -> scheduler.v1.ListNodesRequest
+	11, // 31: scheduler.v1.Scheduler.LookupNode:input_type -> scheduler.v1.LookupNodeRequest
+	13, // 32: scheduler.v1.Scheduler.RecordAssignment:input_type -> scheduler.v1.RecordAssignmentRequest
+	21, // 33: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
+	24, // 34: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
+	26, // 35: scheduler.v1.Scheduler.ListObservedNodes:input_type -> scheduler.v1.ListObservedNodesRequest
+	29, // 36: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
+	31, // 37: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
+	33, // 38: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
+	35, // 39: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
+	37, // 40: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
+	39, // 41: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
+	42, // 42: scheduler.v1.Scheduler.BeginMigration:input_type -> scheduler.v1.BeginMigrationRequest
+	43, // 43: scheduler.v1.Scheduler.RecordMigrationCheckpoint:input_type -> scheduler.v1.RecordMigrationCheckpointRequest
+	44, // 44: scheduler.v1.Scheduler.PrepareMigrationDestination:input_type -> scheduler.v1.MigrationStepRequest
+	44, // 45: scheduler.v1.Scheduler.QuiesceMigrationSource:input_type -> scheduler.v1.MigrationStepRequest
+	44, // 46: scheduler.v1.Scheduler.CommitMigration:input_type -> scheduler.v1.MigrationStepRequest
+	44, // 47: scheduler.v1.Scheduler.ActivateMigrationDestination:input_type -> scheduler.v1.MigrationStepRequest
+	45, // 48: scheduler.v1.Scheduler.AbortMigration:input_type -> scheduler.v1.AbortMigrationRequest
+	44, // 49: scheduler.v1.Scheduler.ReleaseMigrationSource:input_type -> scheduler.v1.MigrationStepRequest
+	46, // 50: scheduler.v1.Scheduler.GetMigration:input_type -> scheduler.v1.GetMigrationRequest
+	8,  // 51: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
+	10, // 52: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
+	12, // 53: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
+	14, // 54: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
+	22, // 55: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
+	25, // 56: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
+	27, // 57: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
+	30, // 58: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
+	32, // 59: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
+	34, // 60: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
+	36, // 61: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
+	38, // 62: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
+	40, // 63: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
+	47, // 64: scheduler.v1.Scheduler.BeginMigration:output_type -> scheduler.v1.MigrationResponse
+	47, // 65: scheduler.v1.Scheduler.RecordMigrationCheckpoint:output_type -> scheduler.v1.MigrationResponse
+	47, // 66: scheduler.v1.Scheduler.PrepareMigrationDestination:output_type -> scheduler.v1.MigrationResponse
+	47, // 67: scheduler.v1.Scheduler.QuiesceMigrationSource:output_type -> scheduler.v1.MigrationResponse
+	47, // 68: scheduler.v1.Scheduler.CommitMigration:output_type -> scheduler.v1.MigrationResponse
+	47, // 69: scheduler.v1.Scheduler.ActivateMigrationDestination:output_type -> scheduler.v1.MigrationResponse
+	47, // 70: scheduler.v1.Scheduler.AbortMigration:output_type -> scheduler.v1.MigrationResponse
+	47, // 71: scheduler.v1.Scheduler.ReleaseMigrationSource:output_type -> scheduler.v1.MigrationResponse
+	47, // 72: scheduler.v1.Scheduler.GetMigration:output_type -> scheduler.v1.MigrationResponse
+	51, // [51:73] is the sub-list for method output_type
+	29, // [29:51] is the sub-list for method input_type
+	29, // [29:29] is the sub-list for extension type_name
+	29, // [29:29] is the sub-list for extension extendee
+	0,  // [0:29] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_scheduler_proto_init() }
@@ -2748,8 +3685,8 @@ func file_api_proto_scheduler_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_scheduler_proto_rawDesc), len(file_api_proto_scheduler_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   39,
+			NumEnums:      3,
+			NumMessages:   47,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -24,6 +24,10 @@ import (
 )
 
 type stubSchedulerClient struct {
+	// Embed the generated client so additions to the Scheduler service do not
+	// force unrelated gateway tests to implement methods they never call.
+	// Explicit methods below still fail closed for every exercised RPC.
+	schedulerv1.SchedulerClient
 	scheduleFunc           func(context.Context, *schedulerv1.ScheduleRequest, ...grpc.CallOption) (*schedulerv1.ScheduleResponse, error)
 	listNodesFunc          func(context.Context, *schedulerv1.ListNodesRequest, ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error)
 	lookupNodeFunc         func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error)

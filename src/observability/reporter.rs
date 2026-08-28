@@ -12,7 +12,7 @@ use tonic::Request;
 use tracing::{debug, error, info, trace, warn};
 
 use super::ObservabilityService;
-use crate::cfg::{ClusterConfig, ObservabilitySchedulerReportConfig};
+use crate::cfg::{ClusterConfig, ConfigManager, ObservabilitySchedulerReportConfig};
 use crate::orchestrator::{SandboxLifecycleEvent, SandboxLifecycleEventType};
 use crate::p2p::P2pEndpoint;
 use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
@@ -409,6 +409,7 @@ impl ObservabilityReporter {
         now_ms: i64,
         p2p_endpoint: Option<&P2pEndpoint>,
     ) -> scheduler::HeartbeatRequest {
+        let migration_capabilities = migration_capabilities(&snapshot);
         scheduler::HeartbeatRequest {
             node_id: snapshot.node_id,
             cluster_id: snapshot.cluster_id.to_string(),
@@ -462,6 +463,7 @@ impl ObservabilityReporter {
             }),
             lifecycle_stream_id: snapshot.lifecycle_stream_id.to_string(),
             lifecycle_last_sequence: snapshot.lifecycle_last_sequence,
+            migration_capabilities: Some(migration_capabilities),
         }
     }
 
@@ -517,6 +519,44 @@ impl ObservabilityReporter {
             .context("unregister node rpc failed")?;
         Ok(())
     }
+}
+
+fn migration_capabilities(snapshot: &super::NodeSnapshot) -> scheduler::MigrationCapabilities {
+    let config = ConfigManager::global_config();
+    let cpu_template = snapshot
+        .machine_info
+        .cpu_config_json
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "{}:{}:{}",
+                snapshot.machine_info.cpu_family,
+                snapshot.machine_info.cpu_model,
+                snapshot.machine_info.cpu_model_name
+            )
+        });
+    scheduler::MigrationCapabilities {
+        cpu_architecture: snapshot.machine_info.cpu_architecture.clone(),
+        virtualization_mode: config.virtualization_mode.to_string(),
+        cpu_template,
+        firecracker_version: config.resolved_firecracker_version().to_string(),
+        snapshot_format: "agentenv-firecracker-manifest-v1".to_string(),
+        kernel_version: config.resolved_kernel_version().to_string(),
+        tools_drive_version: config.resolved_tools_version().to_string(),
+        device_model: "agentenv-firecracker-devices-v1".to_string(),
+        memory_page_size: host_page_size(),
+        incremental_checkpoints: config.memory_snapshot.track_dirty_pages,
+        peer_restore: config.p2p.enabled && config.snapshot.p2p_enabled,
+        stable_connection_proxy: false,
+        virtio_mem: false,
+    }
+}
+
+fn host_page_size() -> u64 {
+    // SAFETY: sysconf(_SC_PAGESIZE) has no pointer arguments or side effects.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    u64::try_from(page_size).unwrap_or(0)
 }
 
 impl ReporterConfig {

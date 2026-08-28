@@ -134,6 +134,7 @@ mod tests {
             disk_total_bytes: 100 * 1024,
             lifecycle_stream_id: String::new(),
             lifecycle_last_sequence: 0,
+            migration_capabilities: crate::model::MigrationCapabilities::default(),
         }
     }
 

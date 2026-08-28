@@ -9,7 +9,11 @@ use crate::assignment::{
     AssignmentStore, ClaimOutcome, ClaimRequest, LifecycleBatch, LifecycleEvent,
     LifecycleEventKind, ReconcileRequest, StoreError,
 };
-use crate::model::{CapacityLimits, Node, NodeObservation, PendingResources, SandboxResources};
+use crate::migration::{BeginMigration, MigrationAction, MigrationPhase, UpdateMigration};
+use crate::model::{
+    CapacityLimits, MigrationCapabilities, Node, NodeObservation, PendingResources,
+    SandboxResources,
+};
 use crate::placement::{PlacementEngine, PlacementError};
 use crate::proto;
 use crate::proto::scheduler_server::Scheduler;
@@ -140,6 +144,72 @@ where
                 address: observation.p2p_address,
             }),
         })
+    }
+
+    fn migration_participant(
+        &self,
+        node_id: &str,
+        service_instance_id: &str,
+        allow_draining: bool,
+    ) -> Result<(Node, NodeObservation), Status> {
+        if node_id.trim().is_empty() || service_instance_id.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "node_id and service_instance_id are required",
+            ));
+        }
+        let node = self
+            .registry
+            .resolve(node_id)
+            .ok_or_else(|| Status::failed_precondition("migration node is not registered"))?;
+        let observation = self.registry.observation(node_id).ok_or_else(|| {
+            Status::failed_precondition("migration node has not sent a heartbeat")
+        })?;
+        if observation.service_instance_id != service_instance_id {
+            return Err(Status::failed_precondition(
+                "migration node service instance changed",
+            ));
+        }
+        if !observation.ready
+            || Instant::now().saturating_duration_since(observation.observed_at)
+                > self.placement.config().heartbeat_ttl
+        {
+            return Err(Status::failed_precondition(
+                "migration node heartbeat is not fresh and ready",
+            ));
+        }
+        if !allow_draining && self.registry.is_draining(node_id).unwrap_or(true) {
+            return Err(Status::failed_precondition(
+                "migration destination is draining",
+            ));
+        }
+        Ok((node, observation))
+    }
+
+    async fn apply_migration_step(
+        &self,
+        request: proto::MigrationStepRequest,
+        action: MigrationAction,
+    ) -> Result<Response<proto::MigrationResponse>, Status> {
+        validate_migration_ids(&request.sandbox_id, &request.migration_id)?;
+        self.migration_participant(&request.node_id, &request.service_instance_id, true)?;
+        let action_name = action.name();
+        let record = self
+            .assignments
+            .update_migration(UpdateMigration {
+                migration_id: request.migration_id,
+                sandbox_id: request.sandbox_id,
+                actor_node_id: request.node_id,
+                action,
+                now: Instant::now(),
+                now_unix_ms: unix_millis(),
+            })
+            .await
+            .map_err(store_status)?;
+        metrics::counter!("agentenv_control_plane_migration_transition_total", "action" => action_name)
+            .increment(1);
+        Ok(Response::new(proto::MigrationResponse {
+            migration: Some(migration_to_proto(record)),
+        }))
     }
 }
 
@@ -348,6 +418,9 @@ where
             disk_total_bytes,
             lifecycle_stream_id: lifecycle_stream_id.to_string(),
             lifecycle_last_sequence: request.lifecycle_last_sequence,
+            migration_capabilities: migration_capabilities_from_proto(
+                request.migration_capabilities.as_ref(),
+            ),
         };
         let reconciled = self
             .assignments
@@ -599,6 +672,176 @@ where
         self.artifacts.forget_node(&request.node_id);
         Ok(Response::new(proto::UnregisterNodeResponse {}))
     }
+
+    async fn begin_migration(
+        &self,
+        request: Request<proto::BeginMigrationRequest>,
+    ) -> Result<Response<proto::MigrationResponse>, Status> {
+        let request = request.into_inner();
+        validate_migration_ids(&request.sandbox_id, &request.migration_id)?;
+        let (source, source_observation) = self.migration_participant(
+            &request.source_node_id,
+            &request.source_service_instance_id,
+            true,
+        )?;
+        let (destination, destination_observation) = self.migration_participant(
+            &request.destination_node_id,
+            &request.destination_service_instance_id,
+            false,
+        )?;
+        source_observation
+            .migration_capabilities
+            .compatible_with(&destination_observation.migration_capabilities)
+            .map_err(|reason| {
+                Status::failed_precondition(format!(
+                    "migration compatibility check failed: {reason}"
+                ))
+            })?;
+        let resources = SandboxResources {
+            cpu: request.requested_cpu,
+            memory_bytes: request.requested_memory_bytes,
+            disk_bytes: request.requested_disk_bytes,
+        };
+        let now = Instant::now();
+        let record = self
+            .assignments
+            .begin_migration(BeginMigration {
+                migration_id: request.migration_id,
+                sandbox_id: request.sandbox_id,
+                source,
+                destination,
+                expected_generation: request.expected_generation,
+                resources,
+                destination_observed: Self::observed_resources(&destination_observation),
+                destination_limits: self.effective_limits(&destination_observation),
+                now,
+                now_unix_ms: unix_millis(),
+            })
+            .await
+            .map_err(store_status)?;
+        metrics::counter!("agentenv_control_plane_migration_transition_total", "action" => "begin")
+            .increment(1);
+        Ok(Response::new(proto::MigrationResponse {
+            migration: Some(migration_to_proto(record)),
+        }))
+    }
+
+    async fn record_migration_checkpoint(
+        &self,
+        request: Request<proto::RecordMigrationCheckpointRequest>,
+    ) -> Result<Response<proto::MigrationResponse>, Status> {
+        let request = request.into_inner();
+        validate_migration_ids(&request.sandbox_id, &request.migration_id)?;
+        if request.checkpoint_id.len() > 128
+            || Uuid::parse_str(request.checkpoint_id.trim()).is_err()
+        {
+            return Err(Status::invalid_argument("checkpoint_id must be a UUID"));
+        }
+        validate_sha256_digest(&request.manifest_digest)?;
+        self.migration_participant(&request.node_id, &request.service_instance_id, true)?;
+        let record = self
+            .assignments
+            .update_migration(UpdateMigration {
+                migration_id: request.migration_id,
+                sandbox_id: request.sandbox_id,
+                actor_node_id: request.node_id,
+                action: MigrationAction::RecordCheckpoint {
+                    checkpoint_id: request.checkpoint_id,
+                    manifest_digest: request.manifest_digest,
+                    durable_coverage: request.durable_coverage,
+                },
+                now: Instant::now(),
+                now_unix_ms: unix_millis(),
+            })
+            .await
+            .map_err(store_status)?;
+        metrics::counter!("agentenv_control_plane_migration_transition_total", "action" => "record_checkpoint")
+            .increment(1);
+        Ok(Response::new(proto::MigrationResponse {
+            migration: Some(migration_to_proto(record)),
+        }))
+    }
+
+    async fn prepare_migration_destination(
+        &self,
+        request: Request<proto::MigrationStepRequest>,
+    ) -> Result<Response<proto::MigrationResponse>, Status> {
+        self.apply_migration_step(request.into_inner(), MigrationAction::PrepareDestination)
+            .await
+    }
+
+    async fn quiesce_migration_source(
+        &self,
+        request: Request<proto::MigrationStepRequest>,
+    ) -> Result<Response<proto::MigrationResponse>, Status> {
+        self.apply_migration_step(request.into_inner(), MigrationAction::QuiesceSource)
+            .await
+    }
+
+    async fn commit_migration(
+        &self,
+        request: Request<proto::MigrationStepRequest>,
+    ) -> Result<Response<proto::MigrationResponse>, Status> {
+        self.apply_migration_step(request.into_inner(), MigrationAction::Commit)
+            .await
+    }
+
+    async fn activate_migration_destination(
+        &self,
+        request: Request<proto::MigrationStepRequest>,
+    ) -> Result<Response<proto::MigrationResponse>, Status> {
+        self.apply_migration_step(request.into_inner(), MigrationAction::ActivateDestination)
+            .await
+    }
+
+    async fn abort_migration(
+        &self,
+        request: Request<proto::AbortMigrationRequest>,
+    ) -> Result<Response<proto::MigrationResponse>, Status> {
+        let request = request.into_inner();
+        if request.reason.trim().is_empty() || request.reason.len() > 1024 {
+            return Err(Status::invalid_argument(
+                "abort reason must contain between 1 and 1024 bytes",
+            ));
+        }
+        self.apply_migration_step(
+            proto::MigrationStepRequest {
+                migration_id: request.migration_id,
+                sandbox_id: request.sandbox_id,
+                node_id: request.node_id,
+                service_instance_id: request.service_instance_id,
+            },
+            MigrationAction::Abort {
+                reason: request.reason,
+            },
+        )
+        .await
+    }
+
+    async fn release_migration_source(
+        &self,
+        request: Request<proto::MigrationStepRequest>,
+    ) -> Result<Response<proto::MigrationResponse>, Status> {
+        self.apply_migration_step(request.into_inner(), MigrationAction::ReleaseSource)
+            .await
+    }
+
+    async fn get_migration(
+        &self,
+        request: Request<proto::GetMigrationRequest>,
+    ) -> Result<Response<proto::MigrationResponse>, Status> {
+        let request = request.into_inner();
+        validate_migration_ids(&request.sandbox_id, &request.migration_id)?;
+        let migration = self
+            .assignments
+            .lookup_migration(&request.sandbox_id, &request.migration_id)
+            .await
+            .map_err(store_status)?
+            .ok_or_else(|| Status::not_found("migration not found"))?;
+        Ok(Response::new(proto::MigrationResponse {
+            migration: Some(migration_to_proto(migration)),
+        }))
+    }
 }
 
 fn nonzero_u64(value: u64, fallback: u64) -> u64 {
@@ -669,8 +912,61 @@ fn store_status(error: StoreError) -> Status {
         StoreError::OwnershipConflict { .. } => Status::failed_precondition(error.to_string()),
         StoreError::Retired { .. } => Status::failed_precondition(error.to_string()),
         StoreError::SequenceConflict(_) => Status::failed_precondition(error.to_string()),
+        StoreError::MigrationNotFound => Status::not_found(error.to_string()),
+        StoreError::MigrationConflict(_) => Status::failed_precondition(error.to_string()),
         StoreError::Invariant(_) => Status::internal(error.to_string()),
         StoreError::Backend(_) => Status::unavailable("assignment store unavailable"),
+    }
+}
+
+fn validate_migration_ids(sandbox_id: &str, migration_id: &str) -> Result<(), Status> {
+    if Uuid::parse_str(sandbox_id.trim()).is_err() {
+        return Err(Status::invalid_argument("sandbox_id must be a UUID"));
+    }
+    if Uuid::parse_str(migration_id.trim()).is_err() {
+        return Err(Status::invalid_argument("migration_id must be a UUID"));
+    }
+    Ok(())
+}
+
+fn validate_sha256_digest(digest: &str) -> Result<(), Status> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return Err(Status::invalid_argument(
+            "manifest_digest must use sha256:<hex>",
+        ));
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(Status::invalid_argument(
+            "manifest_digest must contain 64 hexadecimal digits",
+        ));
+    }
+    Ok(())
+}
+
+fn migration_to_proto(migration: crate::migration::MigrationRecord) -> proto::Migration {
+    let phase = match migration.phase {
+        MigrationPhase::Preparing => proto::MigrationPhase::Preparing,
+        MigrationPhase::ReadyToCutover => proto::MigrationPhase::ReadyToCutover,
+        MigrationPhase::SourceQuiesced => proto::MigrationPhase::SourceQuiesced,
+        MigrationPhase::Committed => proto::MigrationPhase::Committed,
+        MigrationPhase::DestinationActive => proto::MigrationPhase::DestinationActive,
+        MigrationPhase::SourceReleased => proto::MigrationPhase::SourceReleased,
+        MigrationPhase::Aborted => proto::MigrationPhase::Aborted,
+    };
+    proto::Migration {
+        migration_id: migration.migration_id,
+        sandbox_id: migration.sandbox_id,
+        source_generation: migration.source_generation,
+        source: Some(node_to_proto(&migration.source)),
+        destination: Some(node_to_proto(&migration.destination)),
+        phase: phase as i32,
+        checkpoint_id: migration.checkpoint_id.unwrap_or_default(),
+        manifest_digest: migration.manifest_digest.unwrap_or_default(),
+        durable_coverage: migration.durable_coverage,
+        destination_prepared: migration.destination_prepared,
+        created_at_unix_ms: migration.created_at_unix_ms,
+        updated_at_unix_ms: migration.updated_at_unix_ms,
+        abort_reason: migration.abort_reason.unwrap_or_default(),
     }
 }
 
@@ -798,6 +1094,52 @@ fn observed_to_proto(
             paused_allocated_memory_bytes: 0,
         }),
         last_seen_unix_ms: observation.reported_at_unix_ms,
+        migration_capabilities: Some(migration_capabilities_to_proto(
+            observation.migration_capabilities,
+        )),
+    }
+}
+
+fn migration_capabilities_from_proto(
+    capabilities: Option<&proto::MigrationCapabilities>,
+) -> MigrationCapabilities {
+    let Some(capabilities) = capabilities else {
+        return MigrationCapabilities::default();
+    };
+    MigrationCapabilities {
+        cpu_architecture: capabilities.cpu_architecture.clone(),
+        virtualization_mode: capabilities.virtualization_mode.clone(),
+        cpu_template: capabilities.cpu_template.clone(),
+        firecracker_version: capabilities.firecracker_version.clone(),
+        snapshot_format: capabilities.snapshot_format.clone(),
+        kernel_version: capabilities.kernel_version.clone(),
+        tools_drive_version: capabilities.tools_drive_version.clone(),
+        device_model: capabilities.device_model.clone(),
+        memory_page_size: capabilities.memory_page_size,
+        incremental_checkpoints: capabilities.incremental_checkpoints,
+        peer_restore: capabilities.peer_restore,
+        stable_connection_proxy: capabilities.stable_connection_proxy,
+        virtio_mem: capabilities.virtio_mem,
+    }
+}
+
+fn migration_capabilities_to_proto(
+    capabilities: MigrationCapabilities,
+) -> proto::MigrationCapabilities {
+    proto::MigrationCapabilities {
+        cpu_architecture: capabilities.cpu_architecture,
+        virtualization_mode: capabilities.virtualization_mode,
+        cpu_template: capabilities.cpu_template,
+        firecracker_version: capabilities.firecracker_version,
+        snapshot_format: capabilities.snapshot_format,
+        kernel_version: capabilities.kernel_version,
+        tools_drive_version: capabilities.tools_drive_version,
+        device_model: capabilities.device_model,
+        memory_page_size: capabilities.memory_page_size,
+        incremental_checkpoints: capabilities.incremental_checkpoints,
+        peer_restore: capabilities.peer_restore,
+        stable_connection_proxy: capabilities.stable_connection_proxy,
+        virtio_mem: capabilities.virtio_mem,
     }
 }
 
@@ -920,6 +1262,21 @@ mod tests {
                 lifecycle_stream_id: lifecycle_stream_id.to_string(),
                 lifecycle_last_sequence,
                 sandbox_ids,
+                migration_capabilities: Some(proto::MigrationCapabilities {
+                    cpu_architecture: "x86_64".to_string(),
+                    virtualization_mode: "kvm".to_string(),
+                    cpu_template: "test-template".to_string(),
+                    firecracker_version: "1.12.0".to_string(),
+                    snapshot_format: "agentenv-firecracker-manifest-v1".to_string(),
+                    kernel_version: "6.1.0".to_string(),
+                    tools_drive_version: "0.1.3".to_string(),
+                    device_model: "agentenv-firecracker-devices-v1".to_string(),
+                    memory_page_size: 4096,
+                    incremental_checkpoints: true,
+                    peer_restore: true,
+                    stable_connection_proxy: false,
+                    virtio_mem: false,
+                }),
             }))
             .await
             .unwrap();
@@ -1185,6 +1542,144 @@ mod tests {
                 .unwrap_err()
                 .code(),
             tonic::Code::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_rpc_saga_moves_the_route_only_at_commit() {
+        let service = control_plane();
+        heartbeat(&service, "node-a").await;
+        heartbeat(&service, "node-b").await;
+        let sandbox_id = Uuid::now_v7().to_string();
+        let migration_id = Uuid::now_v7().to_string();
+        let scheduled = service
+            .schedule(Request::new(proto::ScheduleRequest {
+                sandbox_id: sandbox_id.clone(),
+                ..proto::ScheduleRequest::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .node
+            .unwrap();
+        service
+            .record_assignment(Request::new(proto::RecordAssignmentRequest {
+                sandbox_id: sandbox_id.clone(),
+                node: Some(scheduled.clone()),
+            }))
+            .await
+            .unwrap();
+        let destination_id = if scheduled.node_id == "node-a" {
+            "node-b"
+        } else {
+            "node-a"
+        };
+        let migration = service
+            .begin_migration(Request::new(proto::BeginMigrationRequest {
+                migration_id: migration_id.clone(),
+                sandbox_id: sandbox_id.clone(),
+                source_node_id: scheduled.node_id.clone(),
+                source_service_instance_id: format!("{}-instance", scheduled.node_id),
+                expected_generation: scheduled.generation,
+                destination_node_id: destination_id.to_string(),
+                destination_service_instance_id: format!("{destination_id}-instance"),
+                requested_cpu: 1,
+                requested_memory_bytes: 512 * MIB,
+                requested_disk_bytes: 1024 * MIB,
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .migration
+            .unwrap();
+        assert_eq!(
+            proto::MigrationPhase::try_from(migration.phase).unwrap(),
+            proto::MigrationPhase::Preparing
+        );
+        assert_eq!(migration.destination.as_ref().unwrap().generation, 2);
+
+        let source_step = || proto::MigrationStepRequest {
+            migration_id: migration_id.clone(),
+            sandbox_id: sandbox_id.clone(),
+            node_id: scheduled.node_id.clone(),
+            service_instance_id: format!("{}-instance", scheduled.node_id),
+        };
+        let destination_step = || proto::MigrationStepRequest {
+            migration_id: migration_id.clone(),
+            sandbox_id: sandbox_id.clone(),
+            node_id: destination_id.to_string(),
+            service_instance_id: format!("{destination_id}-instance"),
+        };
+        assert_eq!(
+            service
+                .prepare_migration_destination(Request::new(destination_step()))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        service
+            .record_migration_checkpoint(Request::new(proto::RecordMigrationCheckpointRequest {
+                migration_id: migration_id.clone(),
+                sandbox_id: sandbox_id.clone(),
+                node_id: scheduled.node_id.clone(),
+                service_instance_id: format!("{}-instance", scheduled.node_id),
+                checkpoint_id: Uuid::now_v7().to_string(),
+                manifest_digest: format!("sha256:{}", "a".repeat(64)),
+                durable_coverage: true,
+            }))
+            .await
+            .unwrap();
+        service
+            .prepare_migration_destination(Request::new(destination_step()))
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .lookup_node(Request::new(proto::LookupNodeRequest {
+                    sandbox_id: sandbox_id.clone(),
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .node
+                .unwrap()
+                .node_id,
+            scheduled.node_id
+        );
+        service
+            .quiesce_migration_source(Request::new(source_step()))
+            .await
+            .unwrap();
+        service
+            .commit_migration(Request::new(source_step()))
+            .await
+            .unwrap();
+        let route = service
+            .lookup_node(Request::new(proto::LookupNodeRequest {
+                sandbox_id: sandbox_id.clone(),
+            }))
+            .await
+            .unwrap()
+            .into_inner()
+            .node
+            .unwrap();
+        assert_eq!(route.node_id, destination_id);
+        assert_eq!(route.generation, scheduled.generation + 1);
+        service
+            .activate_migration_destination(Request::new(destination_step()))
+            .await
+            .unwrap();
+        let released = service
+            .release_migration_source(Request::new(source_step()))
+            .await
+            .unwrap()
+            .into_inner()
+            .migration
+            .unwrap();
+        assert_eq!(
+            proto::MigrationPhase::try_from(released.phase).unwrap(),
+            proto::MigrationPhase::SourceReleased
         );
     }
 }

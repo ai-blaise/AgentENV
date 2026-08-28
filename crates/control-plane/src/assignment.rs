@@ -6,6 +6,10 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::migration::{
+    validate_begin, validate_update, BeginMigration, MigrationAction, MigrationPhase,
+    MigrationRecord, UpdateMigration,
+};
 use crate::model::{
     Assignment, AssignmentState, CapacityLimits, Node, PendingResources, SandboxResources,
 };
@@ -89,6 +93,10 @@ pub enum StoreError {
     Invariant(String),
     #[error("lifecycle stream conflict: {0}")]
     SequenceConflict(String),
+    #[error("migration not found")]
+    MigrationNotFound,
+    #[error("migration conflict: {0}")]
+    MigrationConflict(String),
     #[error("assignment backend unavailable: {0}")]
     Backend(String),
 }
@@ -119,6 +127,23 @@ pub trait AssignmentStore: Send + Sync + 'static {
         &self,
         request: ReconcileRequest,
     ) -> Result<ReconcileResult, StoreError>;
+
+    /// Begin a migration while atomically reserving destination capacity.
+    async fn begin_migration(&self, request: BeginMigration)
+        -> Result<MigrationRecord, StoreError>;
+
+    /// Apply one idempotent migration transition. Ownership cutover and route
+    /// generation advancement are atomic with the `Commit` action.
+    async fn update_migration(
+        &self,
+        request: UpdateMigration,
+    ) -> Result<MigrationRecord, StoreError>;
+
+    async fn lookup_migration(
+        &self,
+        sandbox_id: &str,
+        migration_id: &str,
+    ) -> Result<Option<MigrationRecord>, StoreError>;
 }
 
 #[derive(Clone)]
@@ -129,6 +154,7 @@ struct TimedAssignment {
 
 #[derive(Clone)]
 struct Reservation {
+    node_id: String,
     resources: PendingResources,
     expires_at: Instant,
 }
@@ -141,6 +167,7 @@ struct InMemoryState {
     lifecycle_cursors: HashMap<String, LifecycleCursor>,
     reconcile_misses: HashMap<(String, String), u8>,
     fences: HashMap<String, FenceRecord>,
+    migrations: HashMap<String, MigrationRecord>,
 }
 
 #[derive(Clone, Debug)]
@@ -268,6 +295,7 @@ impl AssignmentStore for InMemoryAssignmentStore {
         state.reservations.insert(
             request.sandbox_id,
             Reservation {
+                node_id: request.node.id.clone(),
                 resources: request_resources,
                 expires_at,
             },
@@ -535,6 +563,375 @@ impl AssignmentStore for InMemoryAssignmentStore {
         }
         Ok(result)
     }
+
+    async fn begin_migration(
+        &self,
+        request: BeginMigration,
+    ) -> Result<MigrationRecord, StoreError> {
+        validate_begin(&request).map_err(StoreError::Invalid)?;
+        let mut state = self.state.lock();
+        cleanup_expired(&mut state, request.now);
+
+        let assignment = state
+            .assignments
+            .get(&request.sandbox_id)
+            .map(|timed| timed.assignment.clone())
+            .ok_or(StoreError::MigrationNotFound)?;
+        if assignment.state != AssignmentState::Confirmed
+            || assignment.node.id != request.source.id
+            || assignment.node.generation != request.expected_generation
+        {
+            return Err(StoreError::MigrationConflict(
+                "source owner or generation does not match the active route".to_string(),
+            ));
+        }
+        validate_owner_fence(&state, &request.sandbox_id, &request.source.id)?;
+
+        if let Some(existing) = state.migrations.get(&request.sandbox_id).cloned() {
+            if existing.migration_id == request.migration_id {
+                if existing.source != request.source
+                    || existing.destination.id != request.destination.id
+                    || existing.source_generation != request.expected_generation
+                {
+                    return Err(StoreError::MigrationConflict(
+                        "migration ID was reused with different parameters".to_string(),
+                    ));
+                }
+                return Ok(existing.clone());
+            }
+            if !existing.phase.is_terminal() {
+                return Err(StoreError::MigrationConflict(format!(
+                    "migration {} is already active",
+                    existing.migration_id
+                )));
+            }
+            release_reservation(
+                &mut state,
+                &migration_reservation_id(&existing.migration_id),
+            )?;
+        }
+
+        let requested = PendingResources::for_request(request.resources);
+        let pending = state
+            .pending_by_node
+            .get(&request.destination.id)
+            .copied()
+            .unwrap_or_default();
+        let Some(after) = request
+            .destination_observed
+            .checked_add(pending)
+            .and_then(|current| current.checked_add(requested))
+        else {
+            return Err(StoreError::CapacityExhausted {
+                node_id: request.destination.id,
+            });
+        };
+        if !request.destination_limits.admits(after) {
+            return Err(StoreError::CapacityExhausted {
+                node_id: request.destination.id,
+            });
+        }
+
+        let destination = Node {
+            generation: request.expected_generation + 1,
+            ..request.destination
+        };
+        let record = MigrationRecord {
+            migration_id: request.migration_id.clone(),
+            sandbox_id: request.sandbox_id.clone(),
+            source_generation: request.expected_generation,
+            source: request.source,
+            destination,
+            phase: MigrationPhase::Preparing,
+            checkpoint_id: None,
+            manifest_digest: None,
+            durable_coverage: false,
+            destination_prepared: false,
+            created_at_unix_ms: request.now_unix_ms,
+            updated_at_unix_ms: request.now_unix_ms,
+            abort_reason: None,
+        };
+        let reservation_id = migration_reservation_id(&request.migration_id);
+        state.reservations.insert(
+            reservation_id,
+            Reservation {
+                node_id: record.destination.id.clone(),
+                resources: requested,
+                expires_at: request.now + self.lease_ttl,
+            },
+        );
+        state
+            .pending_by_node
+            .insert(record.destination.id.clone(), after);
+        state.migrations.insert(request.sandbox_id, record.clone());
+        Ok(record)
+    }
+
+    async fn update_migration(
+        &self,
+        request: UpdateMigration,
+    ) -> Result<MigrationRecord, StoreError> {
+        validate_update(&request).map_err(StoreError::Invalid)?;
+        let mut state = self.state.lock();
+        cleanup_expired(&mut state, request.now);
+        let mut record = state
+            .migrations
+            .get(&request.sandbox_id)
+            .cloned()
+            .filter(|record| record.migration_id == request.migration_id)
+            .ok_or(StoreError::MigrationNotFound)?;
+        validate_migration_actor(&record, &request)?;
+
+        let reservation_id = migration_reservation_id(&record.migration_id);
+        if !record.phase.is_terminal() {
+            let reservation = state.reservations.get_mut(&reservation_id).ok_or_else(|| {
+                StoreError::MigrationConflict(
+                    "destination reservation expired before migration completed".to_string(),
+                )
+            })?;
+            reservation.expires_at = request.now + self.lease_ttl;
+        }
+
+        let previous_phase = record.phase;
+        match &request.action {
+            MigrationAction::RecordCheckpoint {
+                checkpoint_id,
+                manifest_digest,
+                durable_coverage,
+            } => {
+                ensure_precommit(&record)?;
+                if record
+                    .checkpoint_id
+                    .as_ref()
+                    .is_some_and(|existing| existing != checkpoint_id)
+                    || record
+                        .manifest_digest
+                        .as_ref()
+                        .is_some_and(|existing| existing != manifest_digest)
+                {
+                    return Err(StoreError::MigrationConflict(
+                        "checkpoint identity changed within one migration".to_string(),
+                    ));
+                }
+                record.checkpoint_id = Some(checkpoint_id.clone());
+                record.manifest_digest = Some(manifest_digest.clone());
+                record.durable_coverage |= durable_coverage;
+                promote_ready(&mut record);
+            }
+            MigrationAction::PrepareDestination => {
+                ensure_precommit(&record)?;
+                if record.checkpoint_id.is_none() || record.manifest_digest.is_none() {
+                    return Err(StoreError::MigrationConflict(
+                        "destination cannot prepare before a checkpoint is recorded".to_string(),
+                    ));
+                }
+                record.destination_prepared = true;
+                promote_ready(&mut record);
+            }
+            MigrationAction::QuiesceSource => match record.phase {
+                MigrationPhase::ReadyToCutover => record.phase = MigrationPhase::SourceQuiesced,
+                MigrationPhase::SourceQuiesced => {}
+                phase if phase.is_post_commit() => {}
+                _ => {
+                    return Err(StoreError::MigrationConflict(
+                        "source can only quiesce after durable destination preparation".to_string(),
+                    ));
+                }
+            },
+            MigrationAction::Commit => {
+                if record.phase == MigrationPhase::SourceQuiesced {
+                    commit_in_memory(&mut state, &record, request.now, self.lease_ttl)?;
+                    record.phase = MigrationPhase::Committed;
+                } else if record.phase.is_post_commit() {
+                    validate_committed_route(&state, &record)?;
+                } else {
+                    return Err(StoreError::MigrationConflict(
+                        "migration can only commit after the source is quiesced".to_string(),
+                    ));
+                }
+            }
+            MigrationAction::ActivateDestination => match record.phase {
+                MigrationPhase::Committed => record.phase = MigrationPhase::DestinationActive,
+                MigrationPhase::DestinationActive | MigrationPhase::SourceReleased => {}
+                _ => {
+                    return Err(StoreError::MigrationConflict(
+                        "destination can only activate after ownership commits".to_string(),
+                    ));
+                }
+            },
+            MigrationAction::ReleaseSource => match record.phase {
+                MigrationPhase::DestinationActive => {
+                    release_reservation(&mut state, &reservation_id)?;
+                    record.phase = MigrationPhase::SourceReleased;
+                }
+                MigrationPhase::SourceReleased => {}
+                _ => {
+                    return Err(StoreError::MigrationConflict(
+                        "source can only release after destination activation".to_string(),
+                    ));
+                }
+            },
+            MigrationAction::Abort { reason } => {
+                if record.phase.is_post_commit() {
+                    return Err(StoreError::MigrationConflict(
+                        "a committed migration cannot abort back to its source".to_string(),
+                    ));
+                }
+                if record.phase != MigrationPhase::Aborted {
+                    release_reservation(&mut state, &reservation_id)?;
+                    record.phase = MigrationPhase::Aborted;
+                    record.abort_reason = Some(reason.clone());
+                }
+            }
+        }
+        if record.phase != previous_phase || !record.phase.is_terminal() {
+            record.updated_at_unix_ms = request.now_unix_ms;
+        }
+        state.migrations.insert(request.sandbox_id, record.clone());
+        Ok(record)
+    }
+
+    async fn lookup_migration(
+        &self,
+        sandbox_id: &str,
+        migration_id: &str,
+    ) -> Result<Option<MigrationRecord>, StoreError> {
+        if sandbox_id.trim().is_empty() || migration_id.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "sandbox_id and migration_id must be non-empty",
+            ));
+        }
+        Ok(self
+            .state
+            .lock()
+            .migrations
+            .get(sandbox_id)
+            .filter(|record| record.migration_id == migration_id)
+            .cloned())
+    }
+}
+
+fn migration_reservation_id(migration_id: &str) -> String {
+    format!("migration.{migration_id}")
+}
+
+fn validate_migration_actor(
+    record: &MigrationRecord,
+    request: &UpdateMigration,
+) -> Result<(), StoreError> {
+    let allowed = match request.action {
+        MigrationAction::RecordCheckpoint { .. }
+        | MigrationAction::QuiesceSource
+        | MigrationAction::Commit
+        | MigrationAction::ReleaseSource => request.actor_node_id == record.source.id,
+        MigrationAction::PrepareDestination | MigrationAction::ActivateDestination => {
+            request.actor_node_id == record.destination.id
+        }
+        MigrationAction::Abort { .. } => {
+            request.actor_node_id == record.source.id
+                || request.actor_node_id == record.destination.id
+        }
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(StoreError::MigrationConflict(
+            "migration action was submitted by the wrong node".to_string(),
+        ))
+    }
+}
+
+fn ensure_precommit(record: &MigrationRecord) -> Result<(), StoreError> {
+    if record.phase.is_post_commit() || record.phase == MigrationPhase::Aborted {
+        Err(StoreError::MigrationConflict(
+            "pre-commit migration state can no longer change".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn promote_ready(record: &mut MigrationRecord) {
+    if record.phase == MigrationPhase::Preparing
+        && record.durable_coverage
+        && record.destination_prepared
+    {
+        record.phase = MigrationPhase::ReadyToCutover;
+    }
+}
+
+fn commit_in_memory(
+    state: &mut InMemoryState,
+    record: &MigrationRecord,
+    now: Instant,
+    lease_ttl: Duration,
+) -> Result<(), StoreError> {
+    let existing = state
+        .assignments
+        .get(&record.sandbox_id)
+        .ok_or(StoreError::MigrationNotFound)?;
+    if existing.assignment.state != AssignmentState::Confirmed
+        || existing.assignment.node.id != record.source.id
+        || existing.assignment.node.generation != record.source_generation
+    {
+        return Err(StoreError::MigrationConflict(
+            "active route changed before migration commit".to_string(),
+        ));
+    }
+    let fence = state
+        .fences
+        .get_mut(&record.sandbox_id)
+        .ok_or_else(|| StoreError::Invariant("migration source fence is missing".to_string()))?;
+    if fence.retired
+        || fence.owner_node_id != record.source.id
+        || fence.generation != record.source_generation
+    {
+        return Err(StoreError::MigrationConflict(
+            "ownership fence changed before migration commit".to_string(),
+        ));
+    }
+    fence.owner_node_id.clone_from(&record.destination.id);
+    fence.generation = record.destination.generation;
+    state.assignments.insert(
+        record.sandbox_id.clone(),
+        TimedAssignment {
+            assignment: Assignment {
+                sandbox_id: record.sandbox_id.clone(),
+                node: record.destination.clone(),
+                state: AssignmentState::Confirmed,
+            },
+            expires_at: Some(now + lease_ttl),
+        },
+    );
+    state
+        .reconcile_misses
+        .remove(&(record.source.id.clone(), record.sandbox_id.clone()));
+    Ok(())
+}
+
+fn validate_committed_route(
+    state: &InMemoryState,
+    record: &MigrationRecord,
+) -> Result<(), StoreError> {
+    let matches = state
+        .assignments
+        .get(&record.sandbox_id)
+        .is_some_and(|assignment| {
+            assignment.assignment.node == record.destination
+                && assignment.assignment.state == AssignmentState::Confirmed
+        })
+        && state.fences.get(&record.sandbox_id).is_some_and(|fence| {
+            !fence.retired
+                && fence.owner_node_id == record.destination.id
+                && fence.generation == record.destination.generation
+        });
+    if matches {
+        Ok(())
+    } else {
+        Err(StoreError::MigrationConflict(
+            "committed migration route or fence is inconsistent".to_string(),
+        ))
+    }
 }
 
 fn validate_lifecycle_batch(batch: &LifecycleBatch) -> Result<(), StoreError> {
@@ -742,22 +1139,20 @@ fn release_reservation(state: &mut InMemoryState, sandbox_id: &str) -> Result<()
     let Some(reservation) = state.reservations.remove(sandbox_id) else {
         return Ok(());
     };
-    let Some(assignment) = state.assignments.get(sandbox_id) else {
-        return Err(StoreError::Invariant(format!(
-            "reservation {sandbox_id} has no assignment"
-        )));
-    };
-    let node_id = &assignment.assignment.node.id;
-    let current = state.pending_by_node.get(node_id).copied().ok_or_else(|| {
-        StoreError::Invariant(format!("reservation {sandbox_id} has no node total"))
-    })?;
+    let current = state
+        .pending_by_node
+        .get(&reservation.node_id)
+        .copied()
+        .ok_or_else(|| {
+            StoreError::Invariant(format!("reservation {sandbox_id} has no node total"))
+        })?;
     let remaining = current.checked_sub(reservation.resources).ok_or_else(|| {
         StoreError::Invariant(format!("reservation {sandbox_id} underflowed node total"))
     })?;
     if remaining == PendingResources::default() {
-        state.pending_by_node.remove(node_id);
+        state.pending_by_node.remove(&reservation.node_id);
     } else {
-        state.pending_by_node.insert(node_id.clone(), remaining);
+        state.pending_by_node.insert(reservation.node_id, remaining);
     }
     Ok(())
 }
@@ -1104,6 +1499,193 @@ mod tests {
                 .node
                 .generation,
             7
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_cutover_is_generation_fenced_and_idempotent() {
+        let now = Instant::now();
+        let store =
+            InMemoryAssignmentStore::new(Duration::from_secs(10), Duration::from_secs(60)).unwrap();
+        let mut source = Node::new("node-a", "http://node-a");
+        source.generation = 7;
+        store
+            .confirm("sandbox-1", source.clone(), now)
+            .await
+            .unwrap();
+        let begin = BeginMigration {
+            migration_id: "migration-1".to_string(),
+            sandbox_id: "sandbox-1".to_string(),
+            source: source.clone(),
+            destination: Node::new("node-b", "http://node-b"),
+            expected_generation: 7,
+            resources: SandboxResources {
+                cpu: 2,
+                memory_bytes: 1024,
+                disk_bytes: 2048,
+            },
+            destination_observed: PendingResources::default(),
+            destination_limits: CapacityLimits {
+                max_sandboxes: Some(1),
+                max_starting: Some(1),
+                max_cpu: Some(2),
+                max_memory_bytes: Some(1024),
+                max_disk_bytes: Some(2048),
+            },
+            now,
+            now_unix_ms: 1,
+        };
+        let migration = store.begin_migration(begin.clone()).await.unwrap();
+        assert_eq!(migration.phase, MigrationPhase::Preparing);
+        assert_eq!(migration.destination.generation, 8);
+        assert_eq!(store.begin_migration(begin).await.unwrap(), migration);
+
+        let update = |actor: &str, action: MigrationAction, timestamp| UpdateMigration {
+            migration_id: "migration-1".to_string(),
+            sandbox_id: "sandbox-1".to_string(),
+            actor_node_id: actor.to_string(),
+            action,
+            now,
+            now_unix_ms: timestamp,
+        };
+        assert!(matches!(
+            store
+                .update_migration(update("node-b", MigrationAction::PrepareDestination, 2))
+                .await,
+            Err(StoreError::MigrationConflict(_))
+        ));
+        store
+            .update_migration(update(
+                "node-a",
+                MigrationAction::RecordCheckpoint {
+                    checkpoint_id: "checkpoint-1".to_string(),
+                    manifest_digest: "sha256:digest".to_string(),
+                    durable_coverage: true,
+                },
+                3,
+            ))
+            .await
+            .unwrap();
+        let ready = store
+            .update_migration(update("node-b", MigrationAction::PrepareDestination, 4))
+            .await
+            .unwrap();
+        assert_eq!(ready.phase, MigrationPhase::ReadyToCutover);
+        store
+            .update_migration(update("node-a", MigrationAction::QuiesceSource, 5))
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .update_migration(update("node-b", MigrationAction::Commit, 6))
+                .await,
+            Err(StoreError::MigrationConflict(_))
+        ));
+        let committed = store
+            .update_migration(update("node-a", MigrationAction::Commit, 6))
+            .await
+            .unwrap();
+        assert_eq!(committed.phase, MigrationPhase::Committed);
+        assert_eq!(
+            store.lookup("sandbox-1", now).await.unwrap().unwrap().node,
+            committed.destination
+        );
+        assert_eq!(
+            store
+                .update_migration(update("node-a", MigrationAction::Commit, 7))
+                .await
+                .unwrap()
+                .phase,
+            MigrationPhase::Committed
+        );
+        store
+            .update_migration(update("node-b", MigrationAction::ActivateDestination, 8))
+            .await
+            .unwrap();
+        let released = store
+            .update_migration(update("node-a", MigrationAction::ReleaseSource, 9))
+            .await
+            .unwrap();
+        assert_eq!(released.phase, MigrationPhase::SourceReleased);
+        assert_eq!(
+            store.pending_for_node("node-b", now),
+            PendingResources::default()
+        );
+        assert!(matches!(
+            store
+                .update_migration(update(
+                    "node-a",
+                    MigrationAction::Abort {
+                        reason: "too late".to_string()
+                    },
+                    10
+                ))
+                .await,
+            Err(StoreError::MigrationConflict(_))
+        ));
+
+        let stale_source_event = lifecycle_batch(
+            "node-a",
+            &uuid::Uuid::now_v7().to_string(),
+            1,
+            [("sandbox-1", LifecycleEventKind::Resume)],
+        );
+        assert!(matches!(
+            store.apply_lifecycle_batch(stale_source_event).await,
+            Err(StoreError::OwnershipConflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn migration_abort_preserves_source_and_releases_destination_capacity() {
+        let now = Instant::now();
+        let store =
+            InMemoryAssignmentStore::new(Duration::from_secs(10), Duration::from_secs(60)).unwrap();
+        let source = Node::new("node-a", "http://node-a");
+        store
+            .confirm("sandbox-1", source.clone(), now)
+            .await
+            .unwrap();
+        store
+            .begin_migration(BeginMigration {
+                migration_id: "migration-1".to_string(),
+                sandbox_id: "sandbox-1".to_string(),
+                source: source.clone(),
+                destination: Node::new("node-b", "http://node-b"),
+                expected_generation: 1,
+                resources: SandboxResources {
+                    cpu: 1,
+                    memory_bytes: 1024,
+                    disk_bytes: 2048,
+                },
+                destination_observed: PendingResources::default(),
+                destination_limits: CapacityLimits::default(),
+                now,
+                now_unix_ms: 1,
+            })
+            .await
+            .unwrap();
+        let aborted = store
+            .update_migration(UpdateMigration {
+                migration_id: "migration-1".to_string(),
+                sandbox_id: "sandbox-1".to_string(),
+                actor_node_id: "node-b".to_string(),
+                action: MigrationAction::Abort {
+                    reason: "destination failed".to_string(),
+                },
+                now,
+                now_unix_ms: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(aborted.phase, MigrationPhase::Aborted);
+        assert_eq!(
+            store.lookup("sandbox-1", now).await.unwrap().unwrap().node,
+            source
+        );
+        assert_eq!(
+            store.pending_for_node("node-b", now),
+            PendingResources::default()
         );
     }
 

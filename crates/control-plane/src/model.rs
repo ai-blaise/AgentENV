@@ -94,11 +94,81 @@ pub struct NodeObservation {
     pub disk_total_bytes: u64,
     pub lifecycle_stream_id: String,
     pub lifecycle_last_sequence: u64,
+    pub migration_capabilities: MigrationCapabilities,
 }
 
 impl NodeObservation {
     pub fn total_sandboxes(&self) -> Option<u64> {
         u64::from(self.active_sandboxes).checked_add(u64::from(self.paused_sandboxes))
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct MigrationCapabilities {
+    pub cpu_architecture: String,
+    pub virtualization_mode: String,
+    pub cpu_template: String,
+    pub firecracker_version: String,
+    pub snapshot_format: String,
+    pub kernel_version: String,
+    pub tools_drive_version: String,
+    pub device_model: String,
+    pub memory_page_size: u64,
+    pub incremental_checkpoints: bool,
+    pub peer_restore: bool,
+    pub stable_connection_proxy: bool,
+    pub virtio_mem: bool,
+}
+
+impl MigrationCapabilities {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.cpu_architecture.trim().is_empty()
+            || self.virtualization_mode.trim().is_empty()
+            || self.cpu_template.trim().is_empty()
+            || self.firecracker_version.trim().is_empty()
+            || self.snapshot_format.trim().is_empty()
+            || self.kernel_version.trim().is_empty()
+            || self.tools_drive_version.trim().is_empty()
+            || self.device_model.trim().is_empty()
+            || self.memory_page_size == 0
+            || !self.memory_page_size.is_power_of_two()
+        {
+            return Err("migration capability fingerprint is incomplete");
+        }
+        Ok(())
+    }
+
+    pub fn compatible_with(&self, destination: &Self) -> Result<(), &'static str> {
+        self.validate()?;
+        destination.validate()?;
+        if self.cpu_architecture != destination.cpu_architecture {
+            return Err("CPU architecture differs");
+        }
+        if self.virtualization_mode != destination.virtualization_mode {
+            return Err("virtualization mode differs");
+        }
+        if self.cpu_template != destination.cpu_template {
+            return Err("CPU template differs");
+        }
+        if self.firecracker_version != destination.firecracker_version {
+            return Err("Firecracker version differs");
+        }
+        if self.snapshot_format != destination.snapshot_format {
+            return Err("snapshot format differs");
+        }
+        if self.kernel_version != destination.kernel_version {
+            return Err("guest kernel version differs");
+        }
+        if self.tools_drive_version != destination.tools_drive_version {
+            return Err("tools drive version differs");
+        }
+        if self.device_model != destination.device_model {
+            return Err("device model differs");
+        }
+        if self.memory_page_size != destination.memory_page_size {
+            return Err("memory page geometry differs");
+        }
+        Ok(())
     }
 }
 

@@ -707,13 +707,23 @@ impl AppConfig {
             .for_mode(self.virtualization_mode)
     }
 
+    pub fn resolved_firecracker_version(&self) -> &str {
+        self.firecracker
+            .version
+            .as_deref()
+            .unwrap_or(&self.manifest_firecracker().version)
+    }
+
+    pub fn resolved_kernel_version(&self) -> &str {
+        self.kernel
+            .version
+            .as_deref()
+            .unwrap_or(&self.manifest_kernel().version)
+    }
+
     pub fn resolved_firecracker_binary_path(&self) -> PathBuf {
         self.firecracker.binary_path.clone().unwrap_or_else(|| {
-            let version = self
-                .firecracker
-                .version
-                .as_deref()
-                .unwrap_or(&self.manifest_firecracker().version);
+            let version = self.resolved_firecracker_version();
             self.deps_path
                 .join("firecracker")
                 .join(version)
@@ -723,11 +733,7 @@ impl AppConfig {
 
     pub fn resolved_kernel_image_path(&self) -> PathBuf {
         self.kernel.image_path.clone().unwrap_or_else(|| {
-            let version = self
-                .kernel
-                .version
-                .as_deref()
-                .unwrap_or(&self.manifest_kernel().version);
+            let version = self.resolved_kernel_version();
             self.deps_path
                 .join("kernel")
                 .join(version)
