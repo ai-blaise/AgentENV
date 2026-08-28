@@ -25,6 +25,7 @@ use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
 
 use super::admission::{AdmissionController, AdmissionLimits};
+use super::events::LifecycleEventOutbox;
 use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
@@ -103,6 +104,7 @@ pub struct Orchestrator<
     next_proxy_route_version: AtomicU64,
     counters: OrchestratorCounters,
     sandbox_event_tx: broadcast::Sender<SandboxLifecycleEvent>,
+    lifecycle_outbox: Arc<LifecycleEventOutbox>,
     default_sandbox_timeout: Duration,
     is_shutting_down: std::sync::atomic::AtomicBool,
     shutdown_tx: watch::Sender<bool>,
@@ -132,11 +134,32 @@ where
     pub async fn with_file_backed_store_and_factory(factory: F) -> Result<Arc<Self>> {
         let config = ConfigManager::global_config();
         let store = InMemoryMetadataStore::new();
+        let lifecycle_outbox = Arc::new(
+            LifecycleEventOutbox::open(
+                config
+                    .orchestrator
+                    .persisted_sandbox_store_path
+                    .join("lifecycle-events.db"),
+            )
+            .await
+            .map_err(|error| {
+                OrchestratorError::InternalError(format!(
+                    "failed to open lifecycle event outbox: {error:#}"
+                ))
+            })?,
+        );
         let persister = FileBackedSandboxPersister::new(
             config.orchestrator.persisted_sandbox_store_path.clone(),
             config.virtualization_mode,
         );
-        Self::new(store, factory, persister).await
+        Self::new_inner_with_outbox(
+            store,
+            factory,
+            persister,
+            local_image_services_from_global_config().runtime_refs,
+            lifecycle_outbox,
+        )
+        .await
     }
 }
 
@@ -156,6 +179,23 @@ where
         factory: F,
         persister: P,
         image_refs: Arc<dyn RuntimeImageRefs>,
+    ) -> Result<Arc<Self>> {
+        Self::new_inner_with_outbox(
+            store,
+            factory,
+            persister,
+            image_refs,
+            Arc::new(LifecycleEventOutbox::in_memory()),
+        )
+        .await
+    }
+
+    async fn new_inner_with_outbox(
+        store: S,
+        factory: F,
+        persister: P,
+        image_refs: Arc<dyn RuntimeImageRefs>,
+        lifecycle_outbox: Arc<LifecycleEventOutbox>,
     ) -> Result<Arc<Self>> {
         let app_config = ConfigManager::global_config();
         let config = &app_config.orchestrator;
@@ -214,6 +254,7 @@ where
             next_proxy_route_version: AtomicU64::new(1),
             counters: OrchestratorCounters::default(),
             sandbox_event_tx,
+            lifecycle_outbox,
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
             shutdown_tx,
@@ -591,7 +632,8 @@ where
                     SandboxLifecycleEventType::Create,
                     metadata.id,
                     metadata.resources,
-                );
+                )
+                .await;
                 Ok(metadata)
             }
             Err(err) => {
@@ -794,7 +836,8 @@ where
                 SandboxLifecycleEventType::Fork,
                 metadata.id,
                 metadata.resources,
-            );
+            )
+            .await;
             successes += 1;
             outcomes.push(Ok(metadata));
         }
@@ -1165,7 +1208,8 @@ where
                 SandboxLifecycleEventType::Delete,
                 metadata.id,
                 metadata.resources,
-            );
+            )
+            .await;
         }
         if let Err(err) = self
             .persister
@@ -1438,7 +1482,8 @@ where
         } else {
             self.admission.mark_paused(sandbox_id, resources);
         }
-        self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
+        self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources)
+            .await;
         info!("sandbox paused");
 
         Ok(())
@@ -1580,7 +1625,8 @@ where
                 SandboxLifecycleEventType::Resume,
                 metadata.id,
                 metadata.resources,
-            );
+            )
+            .await;
         }
         resumed
     }
@@ -1896,18 +1942,40 @@ where
         self.sandbox_event_tx.subscribe()
     }
 
-    fn publish_sandbox_event(
+    pub async fn pending_sandbox_events(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SandboxLifecycleEvent>> {
+        self.lifecycle_outbox.pending(limit).await
+    }
+
+    pub async fn acknowledge_sandbox_events(&self, through_sequence: u64) -> anyhow::Result<()> {
+        self.lifecycle_outbox.acknowledge(through_sequence).await
+    }
+
+    pub async fn sandbox_event_position(&self) -> (uuid::Uuid, u64, u64) {
+        self.lifecycle_outbox.position().await
+    }
+
+    async fn publish_sandbox_event(
         &self,
         event_type: SandboxLifecycleEventType,
         sandbox_id: SandboxId,
         resources: SandboxResources,
     ) {
-        let event = SandboxLifecycleEvent {
-            event_type,
-            sandbox_id,
-            resources,
-        };
-        let _ = self.sandbox_event_tx.send(event);
+        match self
+            .lifecycle_outbox
+            .append(event_type, sandbox_id, resources)
+            .await
+        {
+            Ok(event) => {
+                let _ = self.sandbox_event_tx.send(event);
+            }
+            Err(error) => {
+                metrics::counter!("agentenv_lifecycle_outbox_append_failures_total").increment(1);
+                warn!(%sandbox_id, %error, "failed to durably append sandbox lifecycle event");
+            }
+        }
     }
 
     /// Waits for `sandbox_id` to leave `transitional_state`, then returns the

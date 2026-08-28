@@ -132,6 +132,8 @@ mod tests {
             memory_total_bytes: 100 * 1024,
             disk_used_bytes: allocated_cpu * 1024,
             disk_total_bytes: 100 * 1024,
+            lifecycle_stream_id: String::new(),
+            lifecycle_last_sequence: 0,
         }
     }
 

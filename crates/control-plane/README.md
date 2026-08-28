@@ -12,7 +12,13 @@ while adding the invariants needed for large microVM fleets:
 - create requests carry a stable UUIDv7 from the gateway;
 - Redis Lua scripts atomically claim that UUID and reserve node capacity across
   scheduler replicas;
-- assignment confirmation releases pending capacity and extends routing state;
+- confirmations become durable routes; their shadow capacity remains reserved
+  until a heartbeat proves the sandbox is included in observed utilization;
+- node lifecycle events are sequenced in a synchronous RocksDB outbox, retried
+  until acknowledged, appended to a bounded Redis Stream, and atomically
+  materialized into routes;
+- full heartbeat inventories repair missing routes and require three consecutive
+  omissions by default before deleting a confirmed route;
 - route generations are explicit in the wire contract;
 - Redis TLS and control-plane mTLS are supported; plaintext and in-memory modes
   require explicit unsafe flags.
@@ -30,8 +36,9 @@ cargo run -p agentenv-control-plane -- \
 
 Production deployments should provide `AGENTENV_REDIS_URL` using `rediss://`,
 configure the server certificate/private key/client CA, set explicit capacity
-ceilings, and run more than one replica. The Redis key hash tag is the cluster
-ID, so one AgentENV cell is atomic within one Redis Cluster slot. Partition very
+ceilings, tune `--reconciliation-miss-threshold` only with an explicit failure
+model, and run more than one replica. The Redis key hash tag is the cluster ID,
+so one AgentENV cell is atomic within one Redis Cluster slot. Partition very
 large fleets into independent cells rather than placing an unbounded global
 fleet behind a single Redis slot.
 
@@ -39,8 +46,11 @@ Safe rolling upgrade order:
 
 1. deploy envd nodes that accept `x-agentenv-sandbox-id` on create;
 2. deploy the gateway/protobuf update that generates and forwards stable IDs;
-3. deploy the Rust control plane and point gateway scheduler clients at it;
-4. retire the legacy Go scheduler only after route lookups are healthy.
+3. deploy envd nodes with the durable lifecycle outbox enabled and confirm that
+   their heartbeat inventories are healthy;
+4. deploy the Rust control plane and point gateway scheduler clients at it;
+5. retire the legacy Go scheduler only after event acknowledgements and route
+   reconciliation metrics are healthy.
 
 The stable create header is deliberately forwarded to envd, where a canonical
 request fingerprint prevents the same UUID from being reused with a different

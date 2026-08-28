@@ -38,7 +38,7 @@ pub struct CreateSandboxRequest {
     pub custom_extension_params: Option<CustomExtensionParams>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SandboxLifecycleEventType {
     Create,
     Delete,
@@ -47,11 +47,15 @@ pub enum SandboxLifecycleEventType {
     Fork,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxLifecycleEvent {
     pub event_type: SandboxLifecycleEventType,
     pub sandbox_id: SandboxId,
     pub resources: SandboxResources,
+    pub stream_id: uuid::Uuid,
+    pub sequence: u64,
+    pub event_id: String,
+    pub occurred_at_unix_ms: i64,
 }
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, Serialize, Deserialize)]

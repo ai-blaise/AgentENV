@@ -92,6 +92,8 @@ pub struct NodeObservation {
     pub memory_total_bytes: u64,
     pub disk_used_bytes: u64,
     pub disk_total_bytes: u64,
+    pub lifecycle_stream_id: String,
+    pub lifecycle_last_sequence: u64,
 }
 
 impl NodeObservation {

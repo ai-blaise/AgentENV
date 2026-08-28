@@ -3,10 +3,12 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tonic::{Request, Response, Status};
-use tracing::warn;
 use uuid::Uuid;
 
-use crate::assignment::{AssignmentStore, ClaimOutcome, ClaimRequest, StoreError};
+use crate::assignment::{
+    AssignmentStore, ClaimOutcome, ClaimRequest, LifecycleBatch, LifecycleEvent,
+    LifecycleEventKind, ReconcileRequest, StoreError,
+};
 use crate::model::{CapacityLimits, Node, NodeObservation, PendingResources, SandboxResources};
 use crate::placement::{PlacementEngine, PlacementError};
 use crate::proto;
@@ -15,6 +17,8 @@ use crate::registry::{HeartbeatError, NodeRegistry};
 use crate::ArtifactIndex;
 
 const MIB: u64 = 1024 * 1024;
+const MAX_LIFECYCLE_EVENT_BATCH: usize = 256;
+const MAX_SANDBOX_INVENTORY: usize = 100_000;
 
 pub struct ControlPlane<S: ?Sized> {
     registry: Arc<NodeRegistry>,
@@ -22,6 +26,7 @@ pub struct ControlPlane<S: ?Sized> {
     assignments: Arc<S>,
     artifacts: ArtifactIndex,
     reservation_ttl: std::time::Duration,
+    reconciliation_miss_threshold: u8,
 }
 
 impl<S> ControlPlane<S>
@@ -33,11 +38,15 @@ where
         placement: PlacementEngine,
         assignments: Arc<S>,
         reservation_ttl: std::time::Duration,
+        reconciliation_miss_threshold: u8,
         artifact_capacity: usize,
         artifact_node_limit: usize,
     ) -> Result<Self, &'static str> {
         if reservation_ttl.is_zero() {
             return Err("reservation_ttl must be greater than zero");
+        }
+        if reconciliation_miss_threshold == 0 {
+            return Err("reconciliation_miss_threshold must be greater than zero");
         }
         Ok(Self {
             registry,
@@ -45,6 +54,7 @@ where
             assignments,
             artifacts: ArtifactIndex::new(artifact_capacity, artifact_node_limit)?,
             reservation_ttl,
+            reconciliation_miss_threshold,
         })
     }
 
@@ -99,12 +109,6 @@ where
             cpu: observation.allocated_cpu,
             memory_bytes: observation.allocated_memory_bytes,
             disk_bytes: observation.disk_used_bytes,
-        }
-    }
-
-    fn release_local_reservation(&self, sandbox_id: &str, node_id: &str) {
-        if let Err(error) = self.registry.remove_pending(sandbox_id, node_id) {
-            warn!(%sandbox_id, %node_id, %error, "failed to release local placement reservation");
         }
     }
 
@@ -267,7 +271,6 @@ where
             .confirm(&request.sandbox_id, registered, Instant::now())
             .await
             .map_err(store_status)?;
-        self.release_local_reservation(&request.sandbox_id, &requested_node.id);
         Ok(Response::new(proto::RecordAssignmentResponse {}))
     }
 
@@ -276,10 +279,47 @@ where
         request: Request<proto::HeartbeatRequest>,
     ) -> Result<Response<proto::HeartbeatResponse>, Status> {
         let request = request.into_inner();
+        let node_id = request.node_id.trim();
+        let node = self
+            .registry
+            .resolve(node_id)
+            .ok_or_else(|| Status::invalid_argument("node is not registered"))?;
+        if request.cluster_id.trim().is_empty() || request.service_instance_id.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "cluster_id and service_instance_id are required",
+            ));
+        }
+        if request.sandbox_ids.len() > MAX_SANDBOX_INVENTORY {
+            return Err(Status::resource_exhausted(
+                "sandbox inventory exceeds 100000 entries",
+            ));
+        }
+        let mut sandbox_ids = request
+            .sandbox_ids
+            .iter()
+            .map(|sandbox_id| {
+                Uuid::parse_str(sandbox_id.trim())
+                    .map(|id| id.to_string())
+                    .map_err(|_| Status::invalid_argument("sandbox inventory contains a non-UUID"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        sandbox_ids.sort_unstable();
+        sandbox_ids.dedup();
         let snapshot = request
             .snapshot
             .as_ref()
             .ok_or_else(|| Status::invalid_argument("snapshot is required"))?;
+        let lifecycle_stream_id = request.lifecycle_stream_id.trim();
+        if lifecycle_stream_id.is_empty() && request.lifecycle_last_sequence != 0 {
+            return Err(Status::invalid_argument(
+                "lifecycle_stream_id is required when lifecycle_last_sequence is non-zero",
+            ));
+        }
+        if !lifecycle_stream_id.is_empty() && Uuid::parse_str(lifecycle_stream_id).is_err() {
+            return Err(Status::invalid_argument(
+                "lifecycle_stream_id must be a UUID",
+            ));
+        }
         let machine = request.machine_info.as_ref();
         let p2p = request.p2p_endpoint.as_ref();
         let (disk_used_bytes, disk_total_bytes) = primary_disk_capacity(snapshot)?;
@@ -306,10 +346,29 @@ where
             memory_total_bytes: snapshot.memory_total_bytes,
             disk_used_bytes,
             disk_total_bytes,
+            lifecycle_stream_id: lifecycle_stream_id.to_string(),
+            lifecycle_last_sequence: request.lifecycle_last_sequence,
         };
+        let reconciled = self
+            .assignments
+            .reconcile_node(ReconcileRequest {
+                node,
+                sandbox_ids: sandbox_ids.clone(),
+                missing_heartbeat_threshold: self.reconciliation_miss_threshold,
+                now: Instant::now(),
+            })
+            .await
+            .map_err(store_status)?;
         self.registry
             .heartbeat(&request.node_id, observation)
             .map_err(heartbeat_status)?;
+        for sandbox_id in &sandbox_ids {
+            let _ = self.registry.remove_pending(sandbox_id, node_id);
+        }
+        metrics::counter!("agentenv_control_plane_reconciled_routes_total", "action" => "repaired")
+            .increment(reconciled.repaired);
+        metrics::counter!("agentenv_control_plane_reconciled_routes_total", "action" => "removed")
+            .increment(reconciled.removed);
         Ok(Response::new(proto::HeartbeatResponse {
             cpu_config_json: String::new(),
         }))
@@ -320,12 +379,55 @@ where
         request: Request<proto::ReportSandboxEventRequest>,
     ) -> Result<Response<proto::ReportSandboxEventResponse>, Status> {
         let request = request.into_inner();
-        if self.registry.resolve(request.node_id.trim()).is_none() {
-            return Err(Status::invalid_argument("node is not registered"));
+        let node_id = request.node_id.trim();
+        let node = self
+            .registry
+            .resolve(node_id)
+            .ok_or_else(|| Status::invalid_argument("node is not registered"))?;
+        let observation = self
+            .registry
+            .observation(node_id)
+            .ok_or_else(|| Status::failed_precondition("node has not sent a heartbeat"))?;
+        if observation.cluster_id != request.cluster_id {
+            return Err(Status::failed_precondition("node cluster does not match"));
         }
+        if observation.service_instance_id != request.service_instance_id {
+            return Err(Status::failed_precondition("service instance mismatch"));
+        }
+        let stream_id = Uuid::parse_str(request.lifecycle_stream_id.trim())
+            .map_err(|_| Status::invalid_argument("lifecycle_stream_id must be a UUID"))?
+            .to_string();
+        if observation.lifecycle_stream_id != stream_id {
+            return Err(Status::failed_precondition(
+                "lifecycle stream does not match the latest heartbeat",
+            ));
+        }
+        if request.events.is_empty() || request.events.len() > MAX_LIFECYCLE_EVENT_BATCH {
+            return Err(Status::invalid_argument(
+                "lifecycle event batch must contain between 1 and 256 events",
+            ));
+        }
+        let events = request
+            .events
+            .into_iter()
+            .map(|event| lifecycle_event_from_proto(event, &stream_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let event_count = events.len();
+        let acknowledged = self
+            .assignments
+            .apply_lifecycle_batch(LifecycleBatch {
+                node: node.clone(),
+                service_instance_id: request.service_instance_id,
+                stream_id,
+                events,
+            })
+            .await
+            .map_err(store_status)?;
         metrics::counter!("agentenv_control_plane_sandbox_events_total")
-            .increment(request.events.len() as u64);
-        Ok(Response::new(proto::ReportSandboxEventResponse {}))
+            .increment(event_count as u64);
+        Ok(Response::new(proto::ReportSandboxEventResponse {
+            acknowledged_sequence: acknowledged,
+        }))
     }
 
     async fn list_observed_nodes(
@@ -564,9 +666,53 @@ fn store_status(error: StoreError) -> Status {
         StoreError::Invalid(_) => Status::invalid_argument(error.to_string()),
         StoreError::CapacityExhausted { .. } => Status::unavailable(error.to_string()),
         StoreError::OwnershipConflict { .. } => Status::failed_precondition(error.to_string()),
+        StoreError::SequenceConflict(_) => Status::failed_precondition(error.to_string()),
         StoreError::Invariant(_) => Status::internal(error.to_string()),
         StoreError::Backend(_) => Status::unavailable("assignment store unavailable"),
     }
+}
+
+fn lifecycle_event_from_proto(
+    event: proto::SandboxEvent,
+    stream_id: &str,
+) -> Result<LifecycleEvent, Status> {
+    let sandbox_id = Uuid::parse_str(event.sandbox_id.trim())
+        .map_err(|_| Status::invalid_argument("event sandbox_id must be a UUID"))?
+        .to_string();
+    if event.sequence == 0 {
+        return Err(Status::invalid_argument(
+            "event sequence must be greater than zero",
+        ));
+    }
+    let expected_event_id = format!("{stream_id}:{}", event.sequence);
+    if event.event_id != expected_event_id {
+        return Err(Status::invalid_argument(
+            "event_id must match lifecycle_stream_id and sequence",
+        ));
+    }
+    if event.event_id.len() > 192 {
+        return Err(Status::invalid_argument("event_id exceeds size limit"));
+    }
+    let kind = match proto::SandboxEventType::try_from(event.event_type) {
+        Ok(proto::SandboxEventType::Create) => LifecycleEventKind::Create,
+        Ok(proto::SandboxEventType::Delete) => LifecycleEventKind::Delete,
+        Ok(proto::SandboxEventType::Pause) => LifecycleEventKind::Pause,
+        Ok(proto::SandboxEventType::Resume) => LifecycleEventKind::Resume,
+        Ok(proto::SandboxEventType::Fork) => LifecycleEventKind::Fork,
+        _ => return Err(Status::invalid_argument("event_type is required")),
+    };
+    Ok(LifecycleEvent {
+        sandbox_id,
+        kind,
+        resources: SandboxResources {
+            cpu: event.requested_cpu,
+            memory_bytes: event.requested_memory_bytes,
+            disk_bytes: event.requested_disk_bytes,
+        },
+        sequence: event.sequence,
+        event_id: event.event_id,
+        occurred_at_unix_ms: event.occurred_at_unix_ms,
+    })
 }
 
 fn primary_disk_capacity(snapshot: &proto::NodeSnapshot) -> Result<(u64, u64), Status> {
@@ -709,6 +855,7 @@ mod tests {
             placement,
             assignments,
             Duration::from_secs(30),
+            3,
             100,
             4,
         )
@@ -716,6 +863,32 @@ mod tests {
     }
 
     async fn heartbeat(service: &ControlPlane<InMemoryAssignmentStore>, node_id: &str) {
+        heartbeat_with_stream(service, node_id, "", 0).await;
+    }
+
+    async fn heartbeat_with_stream(
+        service: &ControlPlane<InMemoryAssignmentStore>,
+        node_id: &str,
+        lifecycle_stream_id: &str,
+        lifecycle_last_sequence: u64,
+    ) {
+        heartbeat_with_inventory(
+            service,
+            node_id,
+            lifecycle_stream_id,
+            lifecycle_last_sequence,
+            Vec::new(),
+        )
+        .await;
+    }
+
+    async fn heartbeat_with_inventory(
+        service: &ControlPlane<InMemoryAssignmentStore>,
+        node_id: &str,
+        lifecycle_stream_id: &str,
+        lifecycle_last_sequence: u64,
+        sandbox_ids: Vec<String>,
+    ) {
         service
             .heartbeat(Request::new(proto::HeartbeatRequest {
                 node_id: node_id.to_string(),
@@ -742,14 +915,16 @@ mod tests {
                     backend: "iroh".to_string(),
                     address: format!("{node_id}.internal:443"),
                 }),
-                ..proto::HeartbeatRequest::default()
+                lifecycle_stream_id: lifecycle_stream_id.to_string(),
+                lifecycle_last_sequence,
+                sandbox_ids,
             }))
             .await
             .unwrap();
     }
 
     #[tokio::test]
-    async fn stable_schedule_claim_replays_and_confirmation_releases_pending() {
+    async fn stable_schedule_claim_replays_and_confirmation_retains_shadow_capacity() {
         let service = control_plane();
         heartbeat(&service, "node-a").await;
         heartbeat(&service, "node-b").await;
@@ -797,16 +972,33 @@ mod tests {
                 .registry
                 .pending(&first.node_id, Instant::now())
                 .unwrap(),
-            PendingResources::default()
+            PendingResources {
+                sandboxes: 1,
+                starting: 1,
+                cpu: 1,
+                memory_bytes: 512 * MIB,
+                disk_bytes: 1024 * MIB,
+            }
         );
         let looked_up = service
-            .lookup_node(Request::new(proto::LookupNodeRequest { sandbox_id }))
+            .lookup_node(Request::new(proto::LookupNodeRequest {
+                sandbox_id: sandbox_id.clone(),
+            }))
             .await
             .unwrap()
             .into_inner()
             .node
             .unwrap();
         assert_eq!(looked_up, first);
+
+        heartbeat_with_inventory(&service, &first.node_id, "", 0, vec![sandbox_id]).await;
+        assert_eq!(
+            service
+                .registry
+                .pending(&first.node_id, Instant::now())
+                .unwrap(),
+            PendingResources::default()
+        );
     }
 
     #[tokio::test]
@@ -849,5 +1041,148 @@ mod tests {
             .peers;
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].node_id, "node-a");
+    }
+
+    fn lifecycle_event(
+        sandbox_id: &str,
+        stream_id: &str,
+        sequence: u64,
+        event_type: proto::SandboxEventType,
+    ) -> proto::SandboxEvent {
+        proto::SandboxEvent {
+            sandbox_id: sandbox_id.to_string(),
+            event_type: event_type as i32,
+            requested_cpu: 1,
+            requested_memory_bytes: 512 * MIB,
+            requested_disk_bytes: 1024 * MIB,
+            sequence,
+            event_id: format!("{stream_id}:{sequence}"),
+            occurred_at_unix_ms: unix_millis(),
+        }
+    }
+
+    #[tokio::test]
+    async fn lifecycle_events_materialize_routes_ack_duplicates_and_reject_gaps() {
+        let service = control_plane();
+        let sandbox_id = Uuid::now_v7().to_string();
+        let stream_id = Uuid::now_v7().to_string();
+        heartbeat_with_stream(&service, "node-a", &stream_id, 2).await;
+        let request = |sequence, event_type| {
+            Request::new(proto::ReportSandboxEventRequest {
+                node_id: "node-a".to_string(),
+                cluster_id: "cluster-1".to_string(),
+                service_instance_id: "node-a-instance".to_string(),
+                events: vec![lifecycle_event(
+                    &sandbox_id,
+                    &stream_id,
+                    sequence,
+                    event_type,
+                )],
+                lifecycle_stream_id: stream_id.clone(),
+            })
+        };
+
+        let first = service
+            .report_sandbox_event(request(1, proto::SandboxEventType::Create))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(first.acknowledged_sequence, 1);
+        assert_eq!(
+            service
+                .lookup_node(Request::new(proto::LookupNodeRequest {
+                    sandbox_id: sandbox_id.clone(),
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+                .node
+                .unwrap()
+                .node_id,
+            "node-a"
+        );
+
+        let replay = service
+            .report_sandbox_event(request(1, proto::SandboxEventType::Create))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(replay.acknowledged_sequence, 1);
+        let gap = service
+            .report_sandbox_event(request(3, proto::SandboxEventType::Delete))
+            .await
+            .unwrap_err();
+        assert_eq!(gap.code(), tonic::Code::FailedPrecondition);
+
+        let deleted = service
+            .report_sandbox_event(request(2, proto::SandboxEventType::Delete))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(deleted.acknowledged_sequence, 2);
+        assert_eq!(
+            service
+                .lookup_node(Request::new(proto::LookupNodeRequest { sandbox_id }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_events_require_the_current_service_instance() {
+        let service = control_plane();
+        let stream_id = Uuid::now_v7().to_string();
+        heartbeat_with_stream(&service, "node-a", &stream_id, 1).await;
+        let error = service
+            .report_sandbox_event(Request::new(proto::ReportSandboxEventRequest {
+                node_id: "node-a".to_string(),
+                cluster_id: "cluster-1".to_string(),
+                service_instance_id: "stale-instance".to_string(),
+                events: vec![lifecycle_event(
+                    &Uuid::now_v7().to_string(),
+                    &stream_id,
+                    1,
+                    proto::SandboxEventType::Create,
+                )],
+                lifecycle_stream_id: stream_id,
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_inventory_repairs_and_hysteretically_removes_routes() {
+        let service = control_plane();
+        let sandbox_id = Uuid::now_v7().to_string();
+        let stream_id = Uuid::now_v7().to_string();
+        heartbeat_with_inventory(&service, "node-a", &stream_id, 0, vec![sandbox_id.clone()]).await;
+        assert!(service
+            .lookup_node(Request::new(proto::LookupNodeRequest {
+                sandbox_id: sandbox_id.clone(),
+            }))
+            .await
+            .is_ok());
+
+        for _ in 0..2 {
+            heartbeat_with_stream(&service, "node-a", &stream_id, 0).await;
+            assert!(service
+                .lookup_node(Request::new(proto::LookupNodeRequest {
+                    sandbox_id: sandbox_id.clone(),
+                }))
+                .await
+                .is_ok());
+        }
+        heartbeat_with_stream(&service, "node-a", &stream_id, 0).await;
+        assert_eq!(
+            service
+                .lookup_node(Request::new(proto::LookupNodeRequest { sandbox_id }))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::NotFound
+        );
     }
 }

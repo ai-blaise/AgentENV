@@ -1,4 +1,5 @@
 mod admission;
+mod events;
 mod launch_plan;
 mod metrics;
 mod persistence;

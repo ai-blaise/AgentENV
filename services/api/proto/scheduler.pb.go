@@ -1274,8 +1274,12 @@ type HeartbeatRequest struct {
 	Snapshot          *NodeSnapshot          `protobuf:"bytes,7,opt,name=snapshot,proto3" json:"snapshot,omitempty"`
 	SandboxIds        []string               `protobuf:"bytes,8,rep,name=sandbox_ids,json=sandboxIds,proto3" json:"sandbox_ids,omitempty"`
 	P2PEndpoint       *P2PEndpoint           `protobuf:"bytes,9,opt,name=p2p_endpoint,json=p2pEndpoint,proto3" json:"p2p_endpoint,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	// Stable identity and durable high-water mark of the node's lifecycle
+	// outbox. A new stream ID denotes replacement of the node's local state.
+	LifecycleStreamId     string `protobuf:"bytes,10,opt,name=lifecycle_stream_id,json=lifecycleStreamId,proto3" json:"lifecycle_stream_id,omitempty"`
+	LifecycleLastSequence uint64 `protobuf:"varint,11,opt,name=lifecycle_last_sequence,json=lifecycleLastSequence,proto3" json:"lifecycle_last_sequence,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *HeartbeatRequest) Reset() {
@@ -1371,6 +1375,20 @@ func (x *HeartbeatRequest) GetP2PEndpoint() *P2PEndpoint {
 	return nil
 }
 
+func (x *HeartbeatRequest) GetLifecycleStreamId() string {
+	if x != nil {
+		return x.LifecycleStreamId
+	}
+	return ""
+}
+
+func (x *HeartbeatRequest) GetLifecycleLastSequence() uint64 {
+	if x != nil {
+		return x.LifecycleLastSequence
+	}
+	return 0
+}
+
 type HeartbeatResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	CpuConfigJson string                 `protobuf:"bytes,1,opt,name=cpu_config_json,json=cpuConfigJson,proto3" json:"cpu_config_json,omitempty"`
@@ -1422,8 +1440,13 @@ type SandboxEvent struct {
 	RequestedCpu         uint32                 `protobuf:"varint,3,opt,name=requested_cpu,json=requestedCpu,proto3" json:"requested_cpu,omitempty"`
 	RequestedMemoryBytes uint64                 `protobuf:"varint,4,opt,name=requested_memory_bytes,json=requestedMemoryBytes,proto3" json:"requested_memory_bytes,omitempty"`
 	RequestedDiskBytes   uint64                 `protobuf:"varint,5,opt,name=requested_disk_bytes,json=requestedDiskBytes,proto3" json:"requested_disk_bytes,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// Strictly increasing within lifecycle_stream_id.
+	Sequence uint64 `protobuf:"varint,6,opt,name=sequence,proto3" json:"sequence,omitempty"`
+	// Stable idempotency key, normally "<stream-id>:<sequence>".
+	EventId          string `protobuf:"bytes,7,opt,name=event_id,json=eventId,proto3" json:"event_id,omitempty"`
+	OccurredAtUnixMs int64  `protobuf:"varint,8,opt,name=occurred_at_unix_ms,json=occurredAtUnixMs,proto3" json:"occurred_at_unix_ms,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *SandboxEvent) Reset() {
@@ -1491,12 +1514,34 @@ func (x *SandboxEvent) GetRequestedDiskBytes() uint64 {
 	return 0
 }
 
+func (x *SandboxEvent) GetSequence() uint64 {
+	if x != nil {
+		return x.Sequence
+	}
+	return 0
+}
+
+func (x *SandboxEvent) GetEventId() string {
+	if x != nil {
+		return x.EventId
+	}
+	return ""
+}
+
+func (x *SandboxEvent) GetOccurredAtUnixMs() int64 {
+	if x != nil {
+		return x.OccurredAtUnixMs
+	}
+	return 0
+}
+
 type ReportSandboxEventRequest struct {
 	state             protoimpl.MessageState `protogen:"open.v1"`
 	NodeId            string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
 	ClusterId         string                 `protobuf:"bytes,2,opt,name=cluster_id,json=clusterId,proto3" json:"cluster_id,omitempty"`
 	ServiceInstanceId string                 `protobuf:"bytes,3,opt,name=service_instance_id,json=serviceInstanceId,proto3" json:"service_instance_id,omitempty"`
 	Events            []*SandboxEvent        `protobuf:"bytes,4,rep,name=events,proto3" json:"events,omitempty"`
+	LifecycleStreamId string                 `protobuf:"bytes,5,opt,name=lifecycle_stream_id,json=lifecycleStreamId,proto3" json:"lifecycle_stream_id,omitempty"`
 	unknownFields     protoimpl.UnknownFields
 	sizeCache         protoimpl.SizeCache
 }
@@ -1559,10 +1604,19 @@ func (x *ReportSandboxEventRequest) GetEvents() []*SandboxEvent {
 	return nil
 }
 
+func (x *ReportSandboxEventRequest) GetLifecycleStreamId() string {
+	if x != nil {
+		return x.LifecycleStreamId
+	}
+	return ""
+}
+
 type ReportSandboxEventResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Highest contiguous sequence durably materialized by the control plane.
+	AcknowledgedSequence uint64 `protobuf:"varint,1,opt,name=acknowledged_sequence,json=acknowledgedSequence,proto3" json:"acknowledged_sequence,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *ReportSandboxEventResponse) Reset() {
@@ -1593,6 +1647,13 @@ func (x *ReportSandboxEventResponse) ProtoReflect() protoreflect.Message {
 // Deprecated: Use ReportSandboxEventResponse.ProtoReflect.Descriptor instead.
 func (*ReportSandboxEventResponse) Descriptor() ([]byte, []int) {
 	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *ReportSandboxEventResponse) GetAcknowledgedSequence() uint64 {
+	if x != nil {
+		return x.AcknowledgedSequence
+	}
+	return 0
 }
 
 type ListObservedNodesRequest struct {
@@ -2444,7 +2505,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x06commit\x18\x06 \x01(\tR\x06commit\x12<\n" +
 	"\fmachine_info\x18\a \x01(\v2\x19.scheduler.v1.MachineInfoR\vmachineInfo\x126\n" +
 	"\bsnapshot\x18\b \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12)\n" +
-	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\x81\x03\n" +
+	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\xe9\x03\n" +
 	"\x10HeartbeatRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
@@ -2456,9 +2517,12 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\bsnapshot\x18\a \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12\x1f\n" +
 	"\vsandbox_ids\x18\b \x03(\tR\n" +
 	"sandboxIds\x12<\n" +
-	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\";\n" +
+	"\fp2p_endpoint\x18\t \x01(\v2\x19.scheduler.v1.P2pEndpointR\vp2pEndpoint\x12.\n" +
+	"\x13lifecycle_stream_id\x18\n" +
+	" \x01(\tR\x11lifecycleStreamId\x126\n" +
+	"\x17lifecycle_last_sequence\x18\v \x01(\x04R\x15lifecycleLastSequence\";\n" +
 	"\x11HeartbeatResponse\x12&\n" +
-	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\"\xf9\x01\n" +
+	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\"\xdf\x02\n" +
 	"\fSandboxEvent\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12=\n" +
@@ -2466,14 +2530,19 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"event_type\x18\x02 \x01(\x0e2\x1e.scheduler.v1.SandboxEventTypeR\teventType\x12#\n" +
 	"\rrequested_cpu\x18\x03 \x01(\rR\frequestedCpu\x124\n" +
 	"\x16requested_memory_bytes\x18\x04 \x01(\x04R\x14requestedMemoryBytes\x120\n" +
-	"\x14requested_disk_bytes\x18\x05 \x01(\x04R\x12requestedDiskBytes\"\xb7\x01\n" +
+	"\x14requested_disk_bytes\x18\x05 \x01(\x04R\x12requestedDiskBytes\x12\x1a\n" +
+	"\bsequence\x18\x06 \x01(\x04R\bsequence\x12\x19\n" +
+	"\bevent_id\x18\a \x01(\tR\aeventId\x12-\n" +
+	"\x13occurred_at_unix_ms\x18\b \x01(\x03R\x10occurredAtUnixMs\"\xe7\x01\n" +
 	"\x19ReportSandboxEventRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
 	"cluster_id\x18\x02 \x01(\tR\tclusterId\x12.\n" +
 	"\x13service_instance_id\x18\x03 \x01(\tR\x11serviceInstanceId\x122\n" +
-	"\x06events\x18\x04 \x03(\v2\x1a.scheduler.v1.SandboxEventR\x06events\"\x1c\n" +
-	"\x1aReportSandboxEventResponse\"9\n" +
+	"\x06events\x18\x04 \x03(\v2\x1a.scheduler.v1.SandboxEventR\x06events\x12.\n" +
+	"\x13lifecycle_stream_id\x18\x05 \x01(\tR\x11lifecycleStreamId\"Q\n" +
+	"\x1aReportSandboxEventResponse\x123\n" +
+	"\x15acknowledged_sequence\x18\x01 \x01(\x04R\x14acknowledgedSequence\"9\n" +
 	"\x18ListObservedNodesRequest\x12\x1d\n" +
 	"\n" +
 	"cluster_id\x18\x01 \x01(\tR\tclusterId\"M\n" +

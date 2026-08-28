@@ -176,6 +176,10 @@ message HeartbeatRequest {
   NodeSnapshot snapshot = 7;
   repeated string sandbox_ids = 8;
   P2pEndpoint p2p_endpoint = 9;
+  // Stable identity and durable high-water mark of the node's lifecycle
+  // outbox. A new stream ID denotes replacement of the node's local state.
+  string lifecycle_stream_id = 10;
+  uint64 lifecycle_last_sequence = 11;
 }
 
 message HeartbeatResponse {
@@ -199,6 +203,11 @@ message SandboxEvent {
   uint32 requested_cpu = 3;
   uint64 requested_memory_bytes = 4;
   uint64 requested_disk_bytes = 5;
+  // Strictly increasing within lifecycle_stream_id.
+  uint64 sequence = 6;
+  // Stable idempotency key, normally "<stream-id>:<sequence>".
+  string event_id = 7;
+  int64 occurred_at_unix_ms = 8;
 }
 
 message ReportSandboxEventRequest {
@@ -206,9 +215,13 @@ message ReportSandboxEventRequest {
   string cluster_id = 2;
   string service_instance_id = 3;
   repeated SandboxEvent events = 4;
+  string lifecycle_stream_id = 5;
 }
 
-message ReportSandboxEventResponse {}
+message ReportSandboxEventResponse {
+  // Highest contiguous sequence durably materialized by the control plane.
+  uint64 acknowledged_sequence = 1;
+}
 
 message ListObservedNodesRequest {
   string cluster_id = 1;

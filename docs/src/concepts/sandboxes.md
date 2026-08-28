@@ -464,5 +464,5 @@ proxy policy is activated.
 | Path | Contents | Config |
 |---|---|---|
 | `$AENV_HOME/snapshot-store/` | Committed snapshot and template artifacts (rootfs layers, memory snapshots, metadata) | `[backend.posix_fs]`<br/>`snapshot_store` |
-| `$AENV_HOME/persisted-sandboxes/` | Paused sandbox state persisted across server restarts | `[orchestrator]`<br/>`persisted_sandbox_store_path` |
+| `$AENV_HOME/persisted-sandboxes/` | Paused sandbox state and the durable lifecycle-event outbox persisted across server restarts | `[orchestrator]`<br/>`persisted_sandbox_store_path` |
 | `$AENV_HOME/image-cache/` | Converted OCI image layers (overlaybd format) cached after first cold start or template build | `[image.cache]`<br/>`root_dir` |

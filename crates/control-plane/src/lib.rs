@@ -14,7 +14,8 @@ pub mod proto {
 
 pub use artifact::ArtifactIndex;
 pub use assignment::{
-    AssignmentStore, ClaimOutcome, ClaimRequest, InMemoryAssignmentStore, StoreError,
+    AssignmentStore, ClaimOutcome, ClaimRequest, InMemoryAssignmentStore, LifecycleBatch,
+    LifecycleEvent, LifecycleEventKind, ReconcileRequest, ReconcileResult, StoreError,
 };
 pub use model::{
     Assignment, AssignmentState, CapacityLimits, Node, NodeObservation, NodeResources,

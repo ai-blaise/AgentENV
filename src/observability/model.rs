@@ -46,6 +46,8 @@ pub struct NodeSnapshot {
     pub create_successes: u64,
     pub create_fails: u64,
     pub sandbox_starting_count: u32,
+    pub lifecycle_stream_id: uuid::Uuid,
+    pub lifecycle_last_sequence: u64,
     /// Number of sandboxes currently in the Paused state on this node.
     pub paused_sandbox_count: u32,
 }

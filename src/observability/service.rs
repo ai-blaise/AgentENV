@@ -70,6 +70,8 @@ impl ObservabilityService {
     pub async fn node_snapshot(&self) -> Result<NodeSnapshot> {
         let runtime = self.orchestrator.metrics_snapshot().await?;
         let host = self.host_metrics.collect();
+        let (lifecycle_stream_id, lifecycle_last_sequence, _) =
+            self.orchestrator.sandbox_event_position().await;
 
         Ok(NodeSnapshot {
             version: self.identity.version.clone(),
@@ -94,6 +96,8 @@ impl ObservabilityService {
             create_successes: runtime.create_successes,
             create_fails: runtime.create_fails,
             sandbox_starting_count: runtime.starting_sandbox_count,
+            lifecycle_stream_id,
+            lifecycle_last_sequence,
             paused_sandbox_count: runtime.paused_sandbox_count,
         })
     }
@@ -108,5 +112,19 @@ impl ObservabilityService {
 
     pub fn service_instance_id(&self) -> &str {
         &self.identity.service_instance_id
+    }
+
+    pub async fn pending_sandbox_events(&self, limit: usize) -> Result<Vec<SandboxLifecycleEvent>> {
+        self.orchestrator.pending_sandbox_events(limit).await
+    }
+
+    pub async fn acknowledge_sandbox_events(&self, through_sequence: u64) -> Result<()> {
+        self.orchestrator
+            .acknowledge_sandbox_events(through_sequence)
+            .await
+    }
+
+    pub async fn sandbox_event_position(&self) -> (uuid::Uuid, u64, u64) {
+        self.orchestrator.sandbox_event_position().await
     }
 }

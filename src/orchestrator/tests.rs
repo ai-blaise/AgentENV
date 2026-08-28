@@ -132,6 +132,7 @@ fn make_orchestrator_without_background_with_admission<
         next_proxy_route_version: AtomicU64::new(1),
         counters: Default::default(),
         sandbox_event_tx,
+        lifecycle_outbox: Arc::new(LifecycleEventOutbox::in_memory()),
         default_sandbox_timeout: Duration::from_secs(15),
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         shutdown_tx: tokio::sync::watch::channel(false).0,

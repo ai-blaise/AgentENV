@@ -55,6 +55,9 @@ struct Args {
     reservation_ttl_seconds: u64,
     #[arg(long, default_value_t = 3600)]
     assignment_ttl_seconds: u64,
+    /// Consecutive full heartbeats a confirmed route may be absent from before removal.
+    #[arg(long, default_value_t = 3)]
+    reconciliation_miss_threshold: u8,
     #[arg(long, default_value_t = 3)]
     sample_size: usize,
     #[arg(long, default_value_t = 32)]
@@ -202,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
         placement,
         assignments,
         reservation_ttl,
+        args.reconciliation_miss_threshold,
         args.artifact_capacity,
         args.artifact_node_limit,
     )
@@ -265,6 +269,9 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     }
     if args.assignment_ttl_seconds < args.reservation_ttl_seconds {
         bail!("assignment TTL must be at least the reservation TTL");
+    }
+    if args.reconciliation_miss_threshold == 0 {
+        bail!("reconciliation miss threshold must be greater than zero");
     }
     let tls_count = [
         args.tls_cert.is_some(),

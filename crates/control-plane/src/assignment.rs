@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::model::{
@@ -27,6 +28,48 @@ pub enum ClaimOutcome {
     Existing(Assignment),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleEventKind {
+    Create,
+    Delete,
+    Pause,
+    Resume,
+    Fork,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LifecycleEvent {
+    pub sandbox_id: String,
+    pub kind: LifecycleEventKind,
+    pub resources: SandboxResources,
+    pub sequence: u64,
+    pub event_id: String,
+    pub occurred_at_unix_ms: i64,
+}
+
+#[derive(Clone, Debug)]
+pub struct LifecycleBatch {
+    pub node: Node,
+    pub service_instance_id: String,
+    pub stream_id: String,
+    pub events: Vec<LifecycleEvent>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ReconcileRequest {
+    pub node: Node,
+    pub sandbox_ids: Vec<String>,
+    pub missing_heartbeat_threshold: u8,
+    pub now: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReconcileResult {
+    pub repaired: u64,
+    pub removed: u64,
+}
+
 #[derive(Debug, Error, Eq, PartialEq)]
 pub enum StoreError {
     #[error("assignment input is invalid: {0}")]
@@ -41,6 +84,8 @@ pub enum StoreError {
     },
     #[error("assignment store invariant failed: {0}")]
     Invariant(String),
+    #[error("lifecycle stream conflict: {0}")]
+    SequenceConflict(String),
     #[error("assignment backend unavailable: {0}")]
     Backend(String),
 }
@@ -61,17 +106,28 @@ pub trait AssignmentStore: Send + Sync + 'static {
         node: Node,
         now: Instant,
     ) -> Result<Assignment, StoreError>;
+
+    /// Atomically advance a node event cursor and materialize its route changes.
+    async fn apply_lifecycle_batch(&self, batch: LifecycleBatch) -> Result<u64, StoreError>;
+
+    /// Repair missing routes from a full node inventory and remove confirmed
+    /// routes only after they are absent from multiple consecutive heartbeats.
+    async fn reconcile_node(
+        &self,
+        request: ReconcileRequest,
+    ) -> Result<ReconcileResult, StoreError>;
 }
 
 #[derive(Clone)]
 struct TimedAssignment {
     assignment: Assignment,
-    expires_at: Instant,
+    expires_at: Option<Instant>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Reservation {
     resources: PendingResources,
+    expires_at: Instant,
 }
 
 #[derive(Default)]
@@ -79,6 +135,14 @@ struct InMemoryState {
     assignments: HashMap<String, TimedAssignment>,
     reservations: HashMap<String, Reservation>,
     pending_by_node: HashMap<String, PendingResources>,
+    lifecycle_cursors: HashMap<String, LifecycleCursor>,
+    reconcile_misses: HashMap<(String, String), u8>,
+}
+
+#[derive(Clone, Debug)]
+struct LifecycleCursor {
+    stream_id: String,
+    sequence: u64,
 }
 
 /// Linearizable single-process assignment store used for tests and explicit
@@ -87,7 +151,6 @@ struct InMemoryState {
 pub struct InMemoryAssignmentStore {
     state: Mutex<InMemoryState>,
     reservation_ttl: Duration,
-    confirmed_ttl: Duration,
 }
 
 impl InMemoryAssignmentStore {
@@ -103,7 +166,6 @@ impl InMemoryAssignmentStore {
         Ok(Self {
             state: Mutex::new(InMemoryState::default()),
             reservation_ttl,
-            confirmed_ttl,
         })
     }
 
@@ -177,13 +239,14 @@ impl AssignmentStore for InMemoryAssignmentStore {
             request.sandbox_id.clone(),
             TimedAssignment {
                 assignment: assignment.clone(),
-                expires_at,
+                expires_at: Some(expires_at),
             },
         );
         state.reservations.insert(
             request.sandbox_id,
             Reservation {
                 resources: request_resources,
+                expires_at,
             },
         );
         state
@@ -217,7 +280,6 @@ impl AssignmentStore for InMemoryAssignmentStore {
             }
         }
 
-        release_reservation(&mut state, sandbox_id)?;
         let generation = state
             .assignments
             .get(sandbox_id)
@@ -233,11 +295,274 @@ impl AssignmentStore for InMemoryAssignmentStore {
             sandbox_id.to_string(),
             TimedAssignment {
                 assignment: assignment.clone(),
-                expires_at: now + self.confirmed_ttl,
+                expires_at: None,
             },
         );
         Ok(assignment)
     }
+
+    async fn apply_lifecycle_batch(&self, batch: LifecycleBatch) -> Result<u64, StoreError> {
+        validate_lifecycle_batch(&batch)?;
+        let mut state = self.state.lock();
+        let cursor = state.lifecycle_cursors.get(&batch.node.id).cloned();
+        let acknowledged = cursor.as_ref().map_or(0, |cursor| cursor.sequence);
+        let first = batch.events[0].sequence;
+        let last = batch.events.last().map_or(first, |event| event.sequence);
+        let stream_changed = cursor
+            .as_ref()
+            .is_some_and(|cursor| cursor.stream_id != batch.stream_id);
+
+        if stream_changed || cursor.is_none() {
+            if first != 1 {
+                return Err(StoreError::SequenceConflict(format!(
+                    "new lifecycle stream for node {} must begin at sequence 1",
+                    batch.node.id
+                )));
+            }
+        } else if first > acknowledged.saturating_add(1) {
+            return Err(StoreError::SequenceConflict(format!(
+                "lifecycle sequence gap for node {}: expected {}, received {first}",
+                batch.node.id,
+                acknowledged.saturating_add(1)
+            )));
+        }
+
+        let already_applied = if stream_changed { 0 } else { acknowledged };
+        if !stream_changed && last <= already_applied {
+            return Ok(already_applied);
+        }
+
+        for event in batch
+            .events
+            .iter()
+            .filter(|event| event.sequence > already_applied)
+        {
+            if matches!(
+                event.kind,
+                LifecycleEventKind::Create | LifecycleEventKind::Resume | LifecycleEventKind::Fork
+            ) {
+                if let Some(existing) = state.assignments.get(&event.sandbox_id) {
+                    if existing.assignment.node.id != batch.node.id {
+                        return Err(StoreError::OwnershipConflict {
+                            sandbox_id: event.sandbox_id.clone(),
+                            assigned_node: existing.assignment.node.id.clone(),
+                            requested_node: batch.node.id.clone(),
+                        });
+                    }
+                }
+            }
+        }
+
+        for event in batch
+            .events
+            .iter()
+            .filter(|event| event.sequence > already_applied)
+        {
+            match event.kind {
+                LifecycleEventKind::Create
+                | LifecycleEventKind::Resume
+                | LifecycleEventKind::Fork => {
+                    let generation = state
+                        .assignments
+                        .get(&event.sandbox_id)
+                        .map_or(batch.node.generation.max(1), |existing| {
+                            existing.assignment.node.generation.max(1)
+                        });
+                    state.assignments.insert(
+                        event.sandbox_id.clone(),
+                        TimedAssignment {
+                            assignment: Assignment {
+                                sandbox_id: event.sandbox_id.clone(),
+                                node: Node {
+                                    generation,
+                                    ..batch.node.clone()
+                                },
+                                state: AssignmentState::Confirmed,
+                            },
+                            expires_at: None,
+                        },
+                    );
+                    state
+                        .reconcile_misses
+                        .remove(&(batch.node.id.clone(), event.sandbox_id.clone()));
+                }
+                LifecycleEventKind::Delete => {
+                    if state
+                        .assignments
+                        .get(&event.sandbox_id)
+                        .is_some_and(|assignment| assignment.assignment.node.id == batch.node.id)
+                    {
+                        release_reservation(&mut state, &event.sandbox_id)?;
+                        state.assignments.remove(&event.sandbox_id);
+                    }
+                    state
+                        .reconcile_misses
+                        .remove(&(batch.node.id.clone(), event.sandbox_id.clone()));
+                }
+                LifecycleEventKind::Pause => {}
+            }
+        }
+        state.lifecycle_cursors.insert(
+            batch.node.id,
+            LifecycleCursor {
+                stream_id: batch.stream_id,
+                sequence: last,
+            },
+        );
+        Ok(last)
+    }
+
+    async fn reconcile_node(
+        &self,
+        request: ReconcileRequest,
+    ) -> Result<ReconcileResult, StoreError> {
+        validate_reconcile_request(&request)?;
+        let desired = request.sandbox_ids.iter().cloned().collect::<HashSet<_>>();
+        let mut state = self.state.lock();
+        cleanup_expired(&mut state, request.now);
+
+        for sandbox_id in &desired {
+            if let Some(existing) = state.assignments.get(sandbox_id) {
+                if existing.assignment.node.id != request.node.id {
+                    return Err(StoreError::OwnershipConflict {
+                        sandbox_id: sandbox_id.clone(),
+                        assigned_node: existing.assignment.node.id.clone(),
+                        requested_node: request.node.id.clone(),
+                    });
+                }
+            }
+        }
+
+        let mut result = ReconcileResult::default();
+        for sandbox_id in &desired {
+            release_reservation(&mut state, sandbox_id)?;
+            let generation = state.assignments.get(sandbox_id).map_or(
+                request.node.generation.max(1),
+                |existing| {
+                    existing
+                        .assignment
+                        .node
+                        .generation
+                        .max(request.node.generation)
+                        .max(1)
+                },
+            );
+            let reconciled_node = Node {
+                generation,
+                ..request.node.clone()
+            };
+            let needs_repair = state.assignments.get(sandbox_id).is_none_or(|existing| {
+                existing.assignment.state != AssignmentState::Confirmed
+                    || existing.assignment.node != reconciled_node
+            });
+            if needs_repair {
+                state.assignments.insert(
+                    sandbox_id.clone(),
+                    TimedAssignment {
+                        assignment: Assignment {
+                            sandbox_id: sandbox_id.clone(),
+                            node: reconciled_node,
+                            state: AssignmentState::Confirmed,
+                        },
+                        expires_at: None,
+                    },
+                );
+                result.repaired = result.repaired.saturating_add(1);
+            }
+            state
+                .reconcile_misses
+                .remove(&(request.node.id.clone(), sandbox_id.clone()));
+        }
+
+        let missing = state
+            .assignments
+            .iter()
+            .filter(|(sandbox_id, assignment)| {
+                assignment.assignment.node.id == request.node.id
+                    && assignment.assignment.state == AssignmentState::Confirmed
+                    && !desired.contains(*sandbox_id)
+            })
+            .map(|(sandbox_id, _)| sandbox_id.clone())
+            .collect::<Vec<_>>();
+        for sandbox_id in missing {
+            let key = (request.node.id.clone(), sandbox_id.clone());
+            let misses = state.reconcile_misses.entry(key.clone()).or_default();
+            *misses = misses.saturating_add(1);
+            if *misses >= request.missing_heartbeat_threshold {
+                state.assignments.remove(&sandbox_id);
+                state.reconcile_misses.remove(&key);
+                result.removed = result.removed.saturating_add(1);
+            }
+        }
+        Ok(result)
+    }
+}
+
+fn validate_lifecycle_batch(batch: &LifecycleBatch) -> Result<(), StoreError> {
+    if batch.node.id.trim().is_empty()
+        || batch.node.endpoint.trim().is_empty()
+        || batch.service_instance_id.trim().is_empty()
+        || batch.stream_id.trim().is_empty()
+    {
+        return Err(StoreError::Invalid(
+            "node, service_instance_id, and stream_id must be non-empty",
+        ));
+    }
+    if batch.events.is_empty() {
+        return Err(StoreError::Invalid(
+            "lifecycle event batch must be non-empty",
+        ));
+    }
+    let mut expected = batch.events[0].sequence;
+    if expected == 0 {
+        return Err(StoreError::Invalid(
+            "lifecycle event sequence must be greater than zero",
+        ));
+    }
+    for event in &batch.events {
+        if event.sequence != expected {
+            return Err(StoreError::Invalid(
+                "lifecycle event sequences must be contiguous",
+            ));
+        }
+        if event.sandbox_id.trim().is_empty() || event.event_id.trim().is_empty() {
+            return Err(StoreError::Invalid(
+                "lifecycle sandbox_id and event_id must be non-empty",
+            ));
+        }
+        if event.event_id != format!("{}:{}", batch.stream_id, event.sequence) {
+            return Err(StoreError::Invalid(
+                "lifecycle event_id must match stream_id and sequence",
+            ));
+        }
+        expected = expected.checked_add(1).ok_or_else(|| {
+            StoreError::Invariant("lifecycle event sequence exhausted".to_string())
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_reconcile_request(request: &ReconcileRequest) -> Result<(), StoreError> {
+    if request.node.id.trim().is_empty() || request.node.endpoint.trim().is_empty() {
+        return Err(StoreError::Invalid(
+            "reconcile node_id and endpoint must be non-empty",
+        ));
+    }
+    if request.missing_heartbeat_threshold == 0 {
+        return Err(StoreError::Invalid(
+            "missing heartbeat threshold must be greater than zero",
+        ));
+    }
+    if request
+        .sandbox_ids
+        .iter()
+        .any(|sandbox_id| sandbox_id.trim().is_empty())
+    {
+        return Err(StoreError::Invalid(
+            "reconcile sandbox IDs must be non-empty",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_claim(request: &ClaimRequest) -> Result<(), StoreError> {
@@ -267,10 +592,19 @@ fn after_pending(
 }
 
 fn cleanup_expired(state: &mut InMemoryState, now: Instant) {
+    let expired_reservations = state
+        .reservations
+        .iter()
+        .filter(|(_, reservation)| reservation.expires_at <= now)
+        .map(|(sandbox_id, _)| sandbox_id.clone())
+        .collect::<Vec<_>>();
+    for sandbox_id in expired_reservations {
+        let _ = release_reservation(state, &sandbox_id);
+    }
     let expired = state
         .assignments
         .iter()
-        .filter(|(_, assignment)| assignment.expires_at <= now)
+        .filter(|(_, assignment)| assignment.expires_at.is_some_and(|expiry| expiry <= now))
         .map(|(sandbox_id, _)| sandbox_id.clone())
         .collect::<Vec<_>>();
     for sandbox_id in expired {
@@ -332,6 +666,38 @@ mod tests {
         }
     }
 
+    fn lifecycle_batch(
+        node_id: &str,
+        stream_id: &str,
+        first_sequence: u64,
+        events: impl IntoIterator<Item = (&'static str, LifecycleEventKind)>,
+    ) -> LifecycleBatch {
+        LifecycleBatch {
+            node: Node::new(node_id, format!("http://{node_id}")),
+            service_instance_id: "instance-1".to_string(),
+            stream_id: stream_id.to_string(),
+            events: events
+                .into_iter()
+                .enumerate()
+                .map(|(offset, (sandbox_id, kind))| {
+                    let sequence = first_sequence + u64::try_from(offset).unwrap();
+                    LifecycleEvent {
+                        sandbox_id: sandbox_id.to_string(),
+                        kind,
+                        resources: SandboxResources {
+                            cpu: 1,
+                            memory_bytes: 1024,
+                            disk_bytes: 2048,
+                        },
+                        sequence,
+                        event_id: format!("{stream_id}:{sequence}"),
+                        occurred_at_unix_ms: 1,
+                    }
+                })
+                .collect(),
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_claims_for_one_id_have_one_owner() {
         let now = Instant::now();
@@ -373,7 +739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn confirmation_releases_pending_and_fences_wrong_node() {
+    async fn confirmation_retains_shadow_capacity_and_fences_wrong_node() {
         let now = Instant::now();
         let store =
             InMemoryAssignmentStore::new(Duration::from_secs(10), Duration::from_secs(60)).unwrap();
@@ -391,7 +757,148 @@ mod tests {
         assert_eq!(confirmed.state, AssignmentState::Confirmed);
         assert_eq!(
             store.pending_for_node("node-a", now),
+            PendingResources::for_request(claim("ignored", "node-a", now).resources)
+        );
+        assert_eq!(
+            store.pending_for_node("node-a", now + Duration::from_secs(11)),
             PendingResources::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn lifecycle_batches_are_idempotent_contiguous_and_materialized() {
+        let store =
+            InMemoryAssignmentStore::new(Duration::from_secs(10), Duration::from_secs(60)).unwrap();
+        let stream_id = uuid::Uuid::now_v7().to_string();
+        let create = || {
+            lifecycle_batch(
+                "node-a",
+                &stream_id,
+                1,
+                [("sandbox-1", LifecycleEventKind::Create)],
+            )
+        };
+        assert_eq!(store.apply_lifecycle_batch(create()).await.unwrap(), 1);
+        assert_eq!(store.apply_lifecycle_batch(create()).await.unwrap(), 1);
+        assert!(store
+            .lookup("sandbox-1", Instant::now() + Duration::from_secs(3600))
+            .await
+            .unwrap()
+            .is_some());
+
+        let gap = lifecycle_batch(
+            "node-a",
+            &stream_id,
+            3,
+            [("sandbox-1", LifecycleEventKind::Delete)],
+        );
+        assert!(matches!(
+            store.apply_lifecycle_batch(gap).await.unwrap_err(),
+            StoreError::SequenceConflict(_)
+        ));
+
+        let delete = lifecycle_batch(
+            "node-a",
+            &stream_id,
+            2,
+            [("sandbox-1", LifecycleEventKind::Delete)],
+        );
+        assert_eq!(store.apply_lifecycle_batch(delete).await.unwrap(), 2);
+        assert!(store
+            .lookup("sandbox-1", Instant::now())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_materialization_fences_a_different_owner() {
+        let now = Instant::now();
+        let store =
+            InMemoryAssignmentStore::new(Duration::from_secs(10), Duration::from_secs(60)).unwrap();
+        store
+            .claim(claim("sandbox-1", "node-a", now))
+            .await
+            .unwrap();
+        let batch = lifecycle_batch(
+            "node-b",
+            &uuid::Uuid::now_v7().to_string(),
+            1,
+            [("sandbox-1", LifecycleEventKind::Create)],
+        );
+        assert!(matches!(
+            store.apply_lifecycle_batch(batch).await.unwrap_err(),
+            StoreError::OwnershipConflict { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_repairs_routes_and_requires_consecutive_misses_to_remove() {
+        let now = Instant::now();
+        let store =
+            InMemoryAssignmentStore::new(Duration::from_secs(10), Duration::from_secs(60)).unwrap();
+        let node = Node::new("node-a", "http://node-a");
+        let request = |sandbox_ids: &[&str]| ReconcileRequest {
+            node: node.clone(),
+            sandbox_ids: sandbox_ids.iter().map(|id| (*id).to_string()).collect(),
+            missing_heartbeat_threshold: 3,
+            now,
+        };
+
+        let repaired = store.reconcile_node(request(&["sandbox-1"])).await.unwrap();
+        assert_eq!(repaired.repaired, 1);
+        assert!(store.lookup("sandbox-1", now).await.unwrap().is_some());
+
+        for _ in 0..2 {
+            let result = store.reconcile_node(request(&[])).await.unwrap();
+            assert_eq!(result.removed, 0);
+            assert!(store.lookup("sandbox-1", now).await.unwrap().is_some());
+        }
+        let removed = store.reconcile_node(request(&[])).await.unwrap();
+        assert_eq!(removed.removed, 1);
+        assert!(store.lookup("sandbox-1", now).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_and_reconciliation_never_regress_route_generation() {
+        let now = Instant::now();
+        let store =
+            InMemoryAssignmentStore::new(Duration::from_secs(10), Duration::from_secs(60)).unwrap();
+        let mut generation_seven = Node::new("node-a", "http://node-a");
+        generation_seven.generation = 7;
+        store
+            .confirm("sandbox-1", generation_seven, now)
+            .await
+            .unwrap();
+
+        store
+            .reconcile_node(ReconcileRequest {
+                node: Node::new("node-a", "http://node-a"),
+                sandbox_ids: vec!["sandbox-1".to_string()],
+                missing_heartbeat_threshold: 3,
+                now,
+            })
+            .await
+            .unwrap();
+        let stream_id = uuid::Uuid::now_v7().to_string();
+        store
+            .apply_lifecycle_batch(lifecycle_batch(
+                "node-a",
+                &stream_id,
+                1,
+                [("sandbox-1", LifecycleEventKind::Resume)],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .lookup("sandbox-1", now)
+                .await
+                .unwrap()
+                .unwrap()
+                .node
+                .generation,
+            7
         );
     }
 

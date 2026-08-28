@@ -8,6 +8,7 @@ import (
 
 	schedulerv1 "agentenv/services/api/proto"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -188,6 +189,56 @@ func TestRecordAssignmentRejectsUnknownNode(t *testing.T) {
 	})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected invalid argument, got %v", err)
+	}
+}
+
+func TestReportSandboxEventAcknowledgesValidatedContiguousBatch(t *testing.T) {
+	service := NewService(
+		zap.NewNop(),
+		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStore(defaultObservedReportTTL),
+	)
+	registerObservedNodeForTest(t, service, "node-a", "svc-a")
+	streamID := uuid.Must(uuid.NewV7()).String()
+	events := []*schedulerv1.SandboxEvent{
+		{
+			SandboxId: "sandbox-1",
+			EventType: schedulerv1.SandboxEventType_SANDBOX_EVENT_TYPE_CREATE,
+			Sequence:  8,
+			EventId:   streamID + ":8",
+		},
+		{
+			SandboxId: "sandbox-2",
+			EventType: schedulerv1.SandboxEventType_SANDBOX_EVENT_TYPE_FORK,
+			Sequence:  9,
+			EventId:   streamID + ":9",
+		},
+	}
+	response, err := service.ReportSandboxEvent(context.Background(), &schedulerv1.ReportSandboxEventRequest{
+		NodeId:            "node-a",
+		ClusterId:         "cluster-1",
+		ServiceInstanceId: "svc-a",
+		LifecycleStreamId: streamID,
+		Events:            events,
+	})
+	if err != nil {
+		t.Fatalf("report sandbox event failed: %v", err)
+	}
+	if response.GetAcknowledgedSequence() != 9 {
+		t.Fatalf("expected acknowledgement 9, got %d", response.GetAcknowledgedSequence())
+	}
+
+	events[1].Sequence = 10
+	_, err = service.ReportSandboxEvent(context.Background(), &schedulerv1.ReportSandboxEventRequest{
+		NodeId:            "node-a",
+		ClusterId:         "cluster-1",
+		ServiceInstanceId: "svc-a",
+		LifecycleStreamId: streamID,
+		Events:            events,
+	})
+	if status.Code(err) != codes.InvalidArgument {
+		t.Fatalf("expected non-contiguous batch rejection, got %v", err)
 	}
 }
 

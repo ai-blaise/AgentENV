@@ -10,6 +10,7 @@ import (
 	schedulerv1 "agentenv/services/api/proto"
 	"agentenv/services/shared/config"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -234,12 +235,49 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 }
 
 func (s *Service) ReportSandboxEvent(_ context.Context, req *schedulerv1.ReportSandboxEventRequest) (*schedulerv1.ReportSandboxEventResponse, error) {
-	s.logger.Debug("scheduler ignored sandbox event batch",
+	if req == nil {
+		return nil, status.Error(codes.InvalidArgument, "request is required")
+	}
+	if _, ok := s.nodes.Resolve(strings.TrimSpace(req.GetNodeId())); !ok {
+		return nil, status.Error(codes.InvalidArgument, "node is not registered")
+	}
+	observed, ok := s.nodes.GetObserved(req.GetNodeId(), req.GetClusterId(), time.Now())
+	if !ok {
+		return nil, status.Error(codes.FailedPrecondition, "node has not sent a current heartbeat")
+	}
+	if observed.GetServiceInstanceId() != req.GetServiceInstanceId() {
+		return nil, status.Error(codes.FailedPrecondition, "service instance mismatch")
+	}
+	streamID, err := uuid.Parse(strings.TrimSpace(req.GetLifecycleStreamId()))
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, "lifecycle_stream_id must be a UUID")
+	}
+	if len(req.GetEvents()) == 0 || len(req.GetEvents()) > 256 {
+		return nil, status.Error(codes.InvalidArgument, "lifecycle event batch must contain between 1 and 256 events")
+	}
+	expected := req.GetEvents()[0].GetSequence()
+	if expected == 0 {
+		return nil, status.Error(codes.InvalidArgument, "event sequence must be greater than zero")
+	}
+	for _, event := range req.GetEvents() {
+		if event.GetSequence() != expected {
+			return nil, status.Error(codes.InvalidArgument, "lifecycle event sequences must be contiguous")
+		}
+		if event.GetEventId() != fmt.Sprintf("%s:%d", streamID.String(), expected) {
+			return nil, status.Error(codes.InvalidArgument, "event_id must match lifecycle_stream_id and sequence")
+		}
+		if event.GetEventType() == schedulerv1.SandboxEventType_SANDBOX_EVENT_TYPE_UNSPECIFIED {
+			return nil, status.Error(codes.InvalidArgument, "event_type is required")
+		}
+		expected++
+	}
+	acknowledged := req.GetEvents()[len(req.GetEvents())-1].GetSequence()
+	s.logger.Debug("scheduler acknowledged durable sandbox event batch; heartbeat inventory remains authoritative during rolling migration",
 		zap.String("node_id", req.GetNodeId()),
 		zap.String("service_instance_id", req.GetServiceInstanceId()),
 		zap.Int("event_count", len(req.GetEvents())),
 	)
-	return &schedulerv1.ReportSandboxEventResponse{}, nil
+	return &schedulerv1.ReportSandboxEventResponse{AcknowledgedSequence: acknowledged}, nil
 }
 
 func (s *Service) RunObservedNodesMetrics(ctx context.Context, interval time.Duration) {

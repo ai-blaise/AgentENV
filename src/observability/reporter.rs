@@ -19,6 +19,9 @@ use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
 
 const MAX_REPORT_BACKOFF: Duration = Duration::from_secs(60);
 const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_EVENT_BATCH: usize = 256;
+const EVENT_OUTBOX_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const INITIAL_EVENT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Returned by [`ObservabilityReporter::send_heartbeat`] when the scheduler
 /// rejects the heartbeat because this node's ID is not in its configured node
@@ -155,28 +158,95 @@ impl ObservabilityReporter {
         });
 
         let event_join = tokio::spawn(async move {
+            let mut backoff = INITIAL_EVENT_BACKOFF;
             loop {
-                tokio::select! {
-                    changed = event_shutdown_rx.changed() => {
-                        if changed.is_err() || *event_shutdown_rx.borrow() {
+                let events = match event_service.pending_sandbox_events(MAX_EVENT_BATCH).await {
+                    Ok(events) => events,
+                    Err(error) => {
+                        error!(%error, "failed to read durable sandbox event outbox");
+                        if Self::wait_or_shutdown(backoff, &mut event_shutdown_rx).await {
                             info!("observability sandbox event reporter stopping");
                             return;
                         }
+                        backoff = cmp::min(backoff.saturating_mul(2), MAX_REPORT_BACKOFF);
+                        continue;
                     }
-                    events = Self::recv_sandbox_event_batch(&mut sandbox_event_rx) => {
-                        let Some(events) = events else {
-                            return;
-                        };
-                        if let Err(err) = Self::send_sandbox_events(
-                            &event_config,
-                            &event_service,
-                            &event_scheduler_channel,
-                            events,
-                        ).await {
-                            warn!(error = %err, "observability sandbox event batch report failed");
+                };
+
+                if events.is_empty() {
+                    backoff = INITIAL_EVENT_BACKOFF;
+                    tokio::select! {
+                        changed = event_shutdown_rx.changed() => {
+                            if changed.is_err() || *event_shutdown_rx.borrow() {
+                                info!("observability sandbox event reporter stopping");
+                                return;
+                            }
+                        }
+                        _ = sleep(EVENT_OUTBOX_POLL_INTERVAL) => {}
+                        signal = sandbox_event_rx.recv() => {
+                            match signal {
+                                Ok(_) => {}
+                                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                    debug!(skipped, "sandbox event wake-up receiver lagged; durable outbox will be drained");
+                                }
+                                Err(broadcast::error::RecvError::Closed) => {
+                                    debug!("sandbox event wake-up channel closed");
+                                    return;
+                                }
+                            }
                         }
                     }
+                    continue;
                 }
+
+                let first_sequence = events.first().map_or(0, |event| event.sequence);
+                let last_sent = events.last().map_or(0, |event| event.sequence);
+                match Self::send_sandbox_events(
+                    &event_config,
+                    &event_service,
+                    &event_scheduler_channel,
+                    events,
+                )
+                .await
+                {
+                    Ok(acknowledged) => {
+                        if acknowledged < last_sent {
+                            warn!(
+                                acknowledged,
+                                last_sent,
+                                "scheduler returned a non-contiguous sandbox event acknowledgement"
+                            );
+                        } else if let Err(error) =
+                            event_service.acknowledge_sandbox_events(acknowledged).await
+                        {
+                            error!(%error, acknowledged, "failed to persist sandbox event acknowledgement");
+                            if Self::wait_or_shutdown(backoff, &mut event_shutdown_rx).await {
+                                info!("observability sandbox event reporter stopping");
+                                return;
+                            }
+                            backoff = cmp::min(backoff.saturating_mul(2), MAX_REPORT_BACKOFF);
+                            continue;
+                        } else {
+                            backoff = INITIAL_EVENT_BACKOFF;
+                            continue;
+                        }
+                    }
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            first_sequence,
+                            last_sequence = last_sent,
+                            retry_after_millis = backoff.as_millis(),
+                            "sandbox event batch remains in durable outbox after report failure"
+                        );
+                    }
+                }
+
+                if Self::wait_or_shutdown(backoff, &mut event_shutdown_rx).await {
+                    info!("observability sandbox event reporter stopping");
+                    return;
+                }
+                backoff = cmp::min(backoff.saturating_mul(2), MAX_REPORT_BACKOFF);
             }
         });
 
@@ -298,39 +368,11 @@ impl ObservabilityReporter {
         Ok(())
     }
 
-    async fn recv_sandbox_event_batch(
-        rx: &mut broadcast::Receiver<SandboxLifecycleEvent>,
-    ) -> Option<Vec<SandboxLifecycleEvent>> {
-        let first = loop {
-            match rx.recv().await {
-                Ok(event) => break event,
-                Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    warn!(skipped, "observability sandbox event receiver lagged");
-                }
-                Err(broadcast::error::RecvError::Closed) => {
-                    debug!("observability sandbox event channel closed");
-                    return None;
-                }
-            }
-        };
-
-        let mut events = Vec::with_capacity(rx.len() + 1);
-        events.push(first);
-        loop {
-            match rx.try_recv() {
-                Ok(event) => events.push(event),
-                Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
-                    warn!(skipped, "observability sandbox event receiver lagged");
-                }
-                Err(broadcast::error::TryRecvError::Closed) => {
-                    debug!("observability sandbox event channel closed");
-                    break;
-                }
-            }
+    async fn wait_or_shutdown(duration: Duration, shutdown: &mut watch::Receiver<bool>) -> bool {
+        tokio::select! {
+            _ = sleep(duration) => false,
+            changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
         }
-
-        Some(events)
     }
 
     async fn send_sandbox_events(
@@ -338,18 +380,26 @@ impl ObservabilityReporter {
         service: &ObservabilityService,
         scheduler_channel: &Channel,
         events: Vec<SandboxLifecycleEvent>,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         if events.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
 
         let event_count = events.len();
+        let last_sequence = events.last().map_or(0, |event| event.sequence);
         let mut request = Request::new(Self::build_sandbox_event_request(service, events));
         request.set_timeout(GRPC_CALL_TIMEOUT);
-        SchedulerClient::new(scheduler_channel.clone())
+        let response = SchedulerClient::new(scheduler_channel.clone())
             .report_sandbox_event(request)
             .await
-            .context("sandbox event batch report rpc failed")?;
+            .context("sandbox event batch report rpc failed")?
+            .into_inner();
+        if response.acknowledged_sequence < last_sequence {
+            anyhow::bail!(
+                "scheduler acknowledged lifecycle sequence {}, below sent sequence {last_sequence}",
+                response.acknowledged_sequence
+            );
+        }
 
         trace!(
             node_id = %service.node_id(),
@@ -358,7 +408,7 @@ impl ObservabilityReporter {
             "observability sandbox event batch sent"
         );
 
-        Ok(())
+        Ok(response.acknowledged_sequence)
     }
 
     fn build_heartbeat_request(
@@ -417,6 +467,8 @@ impl ObservabilityReporter {
                 backend: endpoint.backend.clone(),
                 address: endpoint.address.clone(),
             }),
+            lifecycle_stream_id: snapshot.lifecycle_stream_id.to_string(),
+            lifecycle_last_sequence: snapshot.lifecycle_last_sequence,
         }
     }
 
@@ -424,6 +476,9 @@ impl ObservabilityReporter {
         service: &ObservabilityService,
         events: Vec<SandboxLifecycleEvent>,
     ) -> scheduler::ReportSandboxEventRequest {
+        let lifecycle_stream_id = events
+            .first()
+            .map_or_else(String::new, |event| event.stream_id.to_string());
         scheduler::ReportSandboxEventRequest {
             node_id: service.node_id().to_string(),
             cluster_id: service.cluster_id().to_string(),
@@ -436,8 +491,12 @@ impl ObservabilityReporter {
                     requested_cpu: event.resources.cpu_count,
                     requested_memory_bytes: u64::from(event.resources.memory_mib) * 1024 * 1024,
                     requested_disk_bytes: u64::from(event.resources.disk_size_mib) * 1024 * 1024,
+                    sequence: event.sequence,
+                    event_id: event.event_id,
+                    occurred_at_unix_ms: event.occurred_at_unix_ms,
                 })
                 .collect(),
+            lifecycle_stream_id,
         }
     }
 
