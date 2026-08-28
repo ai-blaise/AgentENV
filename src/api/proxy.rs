@@ -95,15 +95,39 @@ const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[cfg(test)]
-const PROXY_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_millis(100);
-#[cfg(not(test))]
+/// How long a proxied request may wait for the upstream to send headers.
 const PROXY_RESPONSE_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
-#[cfg(test)]
-const PROXY_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
-#[cfg(not(test))]
+/// How long a proxied upload may make no progress before it is abandoned.
+///
+/// An idle bound rather than a total one: an upload that keeps moving is
+/// allowed to take as long as it takes, and only a stalled one is cut off.
 const PROXY_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What a proxied request waits for, and for how long.
+///
+/// Configuration rather than constants because tests need both sides of the
+/// behaviour: one that proves a stalled upstream is cut off, which has to
+/// happen quickly to be worth running, and many that prove ordinary traffic
+/// gets through, which must not be racing a deadline at all. Compile-time
+/// constants could only serve one of those, and serving the first meant every
+/// throughput test in the suite ran against a 100ms budget it had no reason
+/// to be near — so they failed on a loaded machine, and no test ever
+/// exercised the timeouts production actually ships.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProxyTimeouts {
+    pub(crate) response_header: Duration,
+    pub(crate) request_body_idle: Duration,
+}
+
+impl Default for ProxyTimeouts {
+    fn default() -> Self {
+        Self {
+            response_header: PROXY_RESPONSE_HEADER_TIMEOUT,
+            request_body_idle: PROXY_REQUEST_BODY_IDLE_TIMEOUT,
+        }
+    }
+}
 
 #[cfg(test)]
 const PROXY_AUTO_RESUME_TIMEOUT: Duration = Duration::from_millis(100);
@@ -311,7 +335,13 @@ async fn proxy_request(
         };
 
     if is_websocket_request {
-        return proxy_websocket_request(websocket_upgrade, parts, resolved).await;
+        return proxy_websocket_request(
+            websocket_upgrade,
+            parts,
+            resolved,
+            api_impl.proxy_timeouts(),
+        )
+        .await;
     }
 
     proxy_http_request(api_impl, parts, body, resolved).await
@@ -463,9 +493,11 @@ async fn proxy_http_request(
 
     let (body, activity_rx) = track_request_body_activity(body);
     let upstream_request = Request::from_parts(parts, body);
+    let timeouts = api_impl.proxy_timeouts();
     let upstream_response_result = match wait_for_upstream_response_headers_with_activity_timeout(
         api_impl.proxy_client().request(upstream_request),
         activity_rx,
+        timeouts,
     )
     .await
     {
@@ -475,8 +507,8 @@ async fn proxy_http_request(
                 sandbox_id = %sandbox_id,
                 method = %upstream_method,
                 upstream = %upstream_uri_for_log,
-                request_body_idle_timeout_ms = PROXY_REQUEST_BODY_IDLE_TIMEOUT.as_millis(),
-                response_header_timeout_ms = PROXY_RESPONSE_HEADER_TIMEOUT.as_millis(),
+                request_body_idle_timeout_ms = timeouts.request_body_idle.as_millis(),
+                response_header_timeout_ms = timeouts.response_header.as_millis(),
                 "timed out waiting for upstream response headers or request body progress"
             );
             return StatusCode::GATEWAY_TIMEOUT.into_response();
@@ -532,12 +564,13 @@ fn track_request_body_activity(body: Body) -> (Body, watch::Receiver<()>) {
 async fn wait_for_upstream_response_headers_with_activity_timeout<F>(
     request: F,
     mut activity_rx: watch::Receiver<()>,
+    timeouts: ProxyTimeouts,
 ) -> Result<Result<Response<Incoming>, hyper_util::client::legacy::Error>, ()>
 where
     F: Future<Output = Result<Response<Incoming>, hyper_util::client::legacy::Error>>,
 {
     let mut request = std::pin::pin!(request);
-    let mut timer = std::pin::pin!(tokio::time::sleep(PROXY_REQUEST_BODY_IDLE_TIMEOUT));
+    let mut timer = std::pin::pin!(tokio::time::sleep(timeouts.request_body_idle));
     // The sender lives in the wrapped request body. While it is open, the
     // timer measures upload idle time. Once it closes, the upload phase is
     // over, so the timer switches to waiting for upstream response headers.
@@ -549,10 +582,10 @@ where
             _ = &mut timer => return Err(()),
             changed = activity_rx.changed(), if activity_open => {
                 if changed.is_ok() {
-                    timer.as_mut().reset(tokio::time::Instant::now() + PROXY_REQUEST_BODY_IDLE_TIMEOUT);
+                    timer.as_mut().reset(tokio::time::Instant::now() + timeouts.request_body_idle);
                 } else {
                     activity_open = false;
-                    timer.as_mut().reset(tokio::time::Instant::now() + PROXY_RESPONSE_HEADER_TIMEOUT);
+                    timer.as_mut().reset(tokio::time::Instant::now() + timeouts.response_header);
                 }
             }
         }
@@ -594,6 +627,7 @@ async fn proxy_websocket_request(
     websocket_upgrade: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
     mut parts: http::request::Parts,
     resolved: ResolvedProxyRequest,
+    timeouts: ProxyTimeouts,
 ) -> Response<Body> {
     let websocket_upgrade = match websocket_upgrade {
         Ok(websocket_upgrade) => websocket_upgrade,
@@ -631,7 +665,7 @@ async fn proxy_websocket_request(
     );
 
     let (upstream_websocket, upstream_response) = match timeout(
-        PROXY_RESPONSE_HEADER_TIMEOUT,
+        timeouts.response_header,
         connect_async(upstream_request),
     )
     .await
@@ -650,7 +684,7 @@ async fn proxy_websocket_request(
         Err(_) => {
             warn!(
                 sandbox_id = %sandbox_id,
-                timeout_ms = PROXY_RESPONSE_HEADER_TIMEOUT.as_millis(),
+                timeout_ms = timeouts.response_header.as_millis(),
                 "timed out waiting for upstream websocket handshake"
             );
             return StatusCode::GATEWAY_TIMEOUT.into_response();
@@ -1643,6 +1677,10 @@ mod tests {
     }
 
     async fn build_api_with_auth(domains: Vec<String>, api_key: &str) -> Arc<ApiImpl> {
+        Arc::new(build_api_impl(domains, api_key).await)
+    }
+
+    async fn build_api_impl(domains: Vec<String>, api_key: &str) -> ApiImpl {
         let root = tempfile::tempdir().unwrap();
         let orchestrator = Orchestrator::new(
             crate::orchestrator::InMemoryMetadataStore::new(),
@@ -1654,7 +1692,7 @@ mod tests {
         let snapshot_manager = Arc::new(mock_snapshot_manager());
         let template_builder = Arc::new(TemplateBuilder::new());
         let image_resolver = Arc::new(ImageResolver::new(&AppConfig::default()));
-        Arc::new(ApiImpl::new(
+        ApiImpl::new(
             orchestrator,
             snapshot_manager,
             template_builder,
@@ -1662,7 +1700,7 @@ mod tests {
             None,
             domains,
             ApiKey::new(api_key).unwrap(),
-        ))
+        )
     }
 
     async fn proxy_app_for_sandbox_with_state_and_auto_resume(
@@ -1676,6 +1714,34 @@ mod tests {
             .await;
         api.orchestrator()
             .set_auto_resume_for_test(sandbox_id, auto_resume)
+            .await
+            .unwrap();
+        server::new(api)
+    }
+
+    /// Builds an app whose proxy deadlines are short enough to test.
+    ///
+    /// Only for the two tests that are about the deadlines themselves. Every
+    /// other test wants the shipped values, so that ordinary traffic is not
+    /// racing a clock it has no reason to be near.
+    async fn proxy_app_for_sandbox_with_timeouts(
+        sandbox_id: &SandboxId,
+        timeouts: ProxyTimeouts,
+    ) -> axum::Router {
+        let api = Arc::new(
+            build_api_impl(Vec::new(), TEST_API_KEY)
+                .await
+                .with_proxy_timeouts(timeouts),
+        );
+        api.orchestrator()
+            .set_proxy_target_for_test(
+                *sandbox_id,
+                ProxyTarget::new(Ipv4Addr::LOCALHOST),
+                crate::orchestrator::SandboxState::Running,
+            )
+            .await;
+        api.orchestrator()
+            .set_auto_resume_for_test(sandbox_id, false)
             .await
             .unwrap();
         server::new(api)
@@ -2787,17 +2853,33 @@ mod tests {
     async fn proxy_allows_slow_uploads_while_body_makes_progress() {
         let upstream_addr = start_large_upload_server().await;
         let sandbox_id = SandboxId::new();
-        let app = proxy_app_for_sandbox(&sandbox_id).await;
+        // The upload takes longer in total than the idle budget while never
+        // pausing for that long, so it can only succeed if each chunk resets
+        // the timer. Both margins are wide enough that a loaded machine
+        // cannot turn one into the other: 200ms gaps under a 500ms budget,
+        // reaching 600ms overall.
+        let app = proxy_app_for_sandbox_with_timeouts(
+            &sandbox_id,
+            ProxyTimeouts {
+                response_header: Duration::from_secs(5),
+                request_body_idle: Duration::from_millis(500),
+            },
+        )
+        .await;
         let body_stream = stream::unfold(0, |state| async move {
             match state {
                 0 => Some((Ok::<Bytes, Infallible>(Bytes::from_static(b"first")), 1)),
                 1 => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     Some((Ok::<Bytes, Infallible>(Bytes::from_static(b"second")), 2))
                 }
                 2 => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
                     Some((Ok::<Bytes, Infallible>(Bytes::from_static(b"third")), 3))
+                }
+                3 => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    Some((Ok::<Bytes, Infallible>(Bytes::from_static(b"fourth")), 4))
                 }
                 _ => None,
             }
@@ -2820,14 +2902,25 @@ mod tests {
 
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let payload: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(payload["size"], 16);
+        // first + second + third + fourth
+        assert_eq!(payload["size"], 22);
     }
 
     #[tokio::test]
     async fn proxy_returns_gateway_timeout_when_upstream_headers_are_too_slow() {
         let upstream_addr = start_slow_headers_server().await;
         let sandbox_id = SandboxId::new();
-        let app = proxy_app_for_sandbox(&sandbox_id).await;
+        // The upstream withholds headers for 150ms, so a 50ms budget is past
+        // by the time it answers however the machine is loaded. Only the
+        // deadline being too short can make this pass, which is the point.
+        let app = proxy_app_for_sandbox_with_timeouts(
+            &sandbox_id,
+            ProxyTimeouts {
+                response_header: Duration::from_millis(50),
+                request_body_idle: Duration::from_millis(50),
+            },
+        )
+        .await;
 
         let response = app
             .oneshot(

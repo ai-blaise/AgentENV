@@ -35,6 +35,7 @@ pub struct ApiImpl {
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
     api_key: ApiKey,
+    proxy_timeouts: crate::api::proxy::ProxyTimeouts,
 }
 
 impl ApiImpl {
@@ -56,7 +57,27 @@ impl ApiImpl {
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
             api_key,
+            proxy_timeouts: crate::api::proxy::ProxyTimeouts::default(),
         }
+    }
+
+    /// Replaces how long proxied requests wait on an upstream.
+    ///
+    /// Only tests that are about the waiting itself should need this: the
+    /// shipped values are the ones a sandbox behind a slow upstream depends
+    /// on, and shortening them anywhere else turns ordinary traffic into a
+    /// race.
+    #[cfg(test)]
+    pub(crate) fn with_proxy_timeouts(
+        mut self,
+        proxy_timeouts: crate::api::proxy::ProxyTimeouts,
+    ) -> Self {
+        self.proxy_timeouts = proxy_timeouts;
+        self
+    }
+
+    pub(crate) fn proxy_timeouts(&self) -> crate::api::proxy::ProxyTimeouts {
+        self.proxy_timeouts
     }
 
     pub(crate) fn orchestrator(&self) -> Arc<Orchestrator> {
