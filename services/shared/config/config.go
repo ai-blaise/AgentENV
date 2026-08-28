@@ -74,6 +74,10 @@ type SchedulerConfig struct {
 	// placement. It defaults to enabled; set it to false to restore the
 	// previous behavior of placing on any discovered node.
 	ScheduleHealthGate *bool `json:"schedule_health_gate"`
+	// HeartbeatInterval is the interval nodes are expected to report at. It is
+	// used only to validate that the TTLs above leave room for a node to miss
+	// a heartbeat and retry; zero disables that check.
+	HeartbeatInterval time.Duration `json:"heartbeat_interval"`
 }
 
 // HealthGateEnabled reports whether health-gated placement is on, defaulting
@@ -96,6 +100,7 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		Discovery               *SchedulerDiscoveryConfig `json:"discovery"`
 		NodeResourceLimit       *NodeResourceLimit        `json:"node_resource_limit"`
 		ScheduleHealthGate      *bool                     `json:"schedule_health_gate"`
+		HeartbeatInterval       json.RawMessage           `json:"heartbeat_interval"`
 	}
 
 	parsed := wire{}
@@ -147,6 +152,13 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		s.BindingTTL = d
+	}
+	if len(bytes.TrimSpace(parsed.HeartbeatInterval)) > 0 {
+		d, err := parseSchedulerDuration(parsed.HeartbeatInterval, "scheduler.heartbeat_interval")
+		if err != nil {
+			return err
+		}
+		s.HeartbeatInterval = d
 	}
 
 	return nil
@@ -452,6 +464,9 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		if c.Scheduler.BindingTTL <= 0 {
 			return errors.New("scheduler.binding_ttl must be greater than zero")
 		}
+		if err := validateSchedulerTTLOrdering(c.Scheduler); err != nil {
+			return err
+		}
 		if schedulerQueryOnly {
 			if strings.TrimSpace(c.Scheduler.RedisAddr) == "" {
 				return errors.New("scheduler --query-only requires scheduler.redis_addr")
@@ -499,6 +514,48 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		if c.Gateway.SchedulerAddr == "" {
 			return errors.New("gateway.scheduler_addr is required")
 		}
+	}
+	return nil
+}
+
+// minHeartbeatsBeforeExpiry is how many consecutive heartbeats a node may lose
+// before its state is considered gone.
+//
+// One is not enough: a single dropped packet or a brief scheduler pause would
+// expire a healthy node's bindings and drop its placement eligibility. Two
+// gives the node a retry before anything is torn down.
+const minHeartbeatsBeforeExpiry = 3
+
+// validateSchedulerTTLOrdering checks the timing relations the control plane
+// depends on but never stated.
+//
+// These are the relations that decide whether a transient blip looks like a
+// dead node. They were previously implicit, and the shipped defaults violate
+// them: with a 5s node interval, a 30s TTL leaves only two heartbeats of slack
+// while the node's own retry backoff can exceed 30s, so the second retry lands
+// after expiry. An implicit relation that is already false is worth turning
+// into a startup error rather than an intermittent outage.
+func validateSchedulerTTLOrdering(cfg SchedulerConfig) error {
+	interval := cfg.HeartbeatInterval
+	if interval <= 0 {
+		// Nodes report their interval on every heartbeat; without a configured
+		// expectation there is nothing to check here.
+		return nil
+	}
+	minimum := time.Duration(minHeartbeatsBeforeExpiry) * interval
+	if cfg.ReportTTL < minimum {
+		return fmt.Errorf(
+			"scheduler.report_ttl (%s) must be at least %d heartbeat intervals (%s); "+
+				"a shorter TTL marks a healthy node stale after a single missed heartbeat",
+			cfg.ReportTTL, minHeartbeatsBeforeExpiry, minimum,
+		)
+	}
+	if cfg.BindingTTL < minimum {
+		return fmt.Errorf(
+			"scheduler.binding_ttl (%s) must be at least %d heartbeat intervals (%s); "+
+				"a shorter TTL drops a healthy node's bindings after a single missed heartbeat",
+			cfg.BindingTTL, minHeartbeatsBeforeExpiry, minimum,
+		)
 	}
 	return nil
 }

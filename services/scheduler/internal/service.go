@@ -331,6 +331,16 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 			)
 			return nil, status.Error(codes.InvalidArgument, "node is not in scheduler node list")
 		}
+		if errors.Is(err, ErrStaleIncarnation) {
+			// A live node retrying will send its current incarnation and
+			// succeed; only a report from a replaced process lands here.
+			s.logger.Warn("scheduler rejected heartbeat from a superseded node process",
+				zap.String("node_id", nodeID),
+				zap.String("service_instance_id", serviceInstanceID),
+			)
+			schedulerStaleIncarnationTotal.WithLabelValues(nodeID).Inc()
+			return nil, status.Error(codes.FailedPrecondition, "service instance has been superseded")
+		}
 		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
 	}
 	// The heartbeat is the authoritative count, so anything the ledger was

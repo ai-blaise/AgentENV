@@ -525,3 +525,80 @@ func TestIntersectionRecomputedByFreshRegistry(t *testing.T) {
 		t.Fatalf("restarted registry stopped delivering: %q", again)
 	}
 }
+
+// A node process that has been replaced must not be able to overwrite the live
+// one's state. The usual cause is an RPC delayed behind a restart.
+func TestHeartbeatRejectsSupersededIncarnation(t *testing.T) {
+	registry := NewAtomicNodeRegistry(
+		[]Node{{ID: "node-a", Endpoint: "http://node-a"}},
+		defaultObservedReportTTL,
+	)
+
+	// UUIDv7 sorts in time order, so the second is the later process.
+	older := "0199a000-0000-7000-8000-000000000001"
+	newer := "0199b000-0000-7000-8000-000000000002"
+
+	heartbeatWithConfig(t, registry, "node-a", "cluster-1", newer, "")
+
+	_, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ClusterId:         "cluster-1",
+		ServiceInstanceId: older,
+		Snapshot:          &schedulerv1.NodeSnapshot{SandboxCount: 999},
+	}, time.Now())
+
+	if !errors.Is(err, ErrStaleIncarnation) {
+		t.Fatalf("err = %v, want ErrStaleIncarnation", err)
+	}
+
+	observed, ok := registry.GetObserved("node-a", "cluster-1", time.Now())
+	if !ok {
+		t.Fatal("node should still be observed")
+	}
+	if observed.GetServiceInstanceId() != newer {
+		t.Fatalf("service instance = %q, want the live one %q", observed.GetServiceInstanceId(), newer)
+	}
+	if observed.GetSnapshot().GetSandboxCount() == 999 {
+		t.Fatal("a superseded process overwrote the live snapshot")
+	}
+}
+
+// The live process keeps working, and a genuine restart to a newer incarnation
+// takes over. Locking a node out on restart would be worse than the race.
+func TestHeartbeatAcceptsSameAndNewerIncarnations(t *testing.T) {
+	registry := NewAtomicNodeRegistry(
+		[]Node{{ID: "node-a", Endpoint: "http://node-a"}},
+		defaultObservedReportTTL,
+	)
+	first := "0199a000-0000-7000-8000-000000000001"
+	second := "0199b000-0000-7000-8000-000000000002"
+
+	heartbeatWithConfig(t, registry, "node-a", "cluster-1", first, "")
+	heartbeatWithConfig(t, registry, "node-a", "cluster-1", first, "")
+	heartbeatWithConfig(t, registry, "node-a", "cluster-1", second, "")
+
+	observed, ok := registry.GetObserved("node-a", "cluster-1", time.Now())
+	if !ok || observed.GetServiceInstanceId() != second {
+		t.Fatalf("restart should take over; got %q", observed.GetServiceInstanceId())
+	}
+}
+
+// An empty incarnation means "unknown" and must neither displace a live one nor
+// lock the node out.
+func TestIncarnationSupersedesTreatsEmptyAsUnknown(t *testing.T) {
+	newer := Incarnation("0199b000-0000-7000-8000-000000000002")
+	older := Incarnation("0199a000-0000-7000-8000-000000000001")
+
+	if !newer.Supersedes(older) {
+		t.Fatal("a later UUIDv7 must supersede an earlier one")
+	}
+	if older.Supersedes(newer) {
+		t.Fatal("an earlier UUIDv7 must not supersede a later one")
+	}
+	if newer.Supersedes("") || Incarnation("").Supersedes(newer) {
+		t.Fatal("an unknown incarnation must not order against anything")
+	}
+	if newer.Supersedes(newer) {
+		t.Fatal("an incarnation must not supersede itself")
+	}
+}

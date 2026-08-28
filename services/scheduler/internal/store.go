@@ -43,6 +43,33 @@ type BindingAssignment struct {
 	Node      Node
 }
 
+// Incarnation identifies one run of a node process.
+//
+// Nodes generate a time-ordered UUIDv7 at startup and carry it on Heartbeat,
+// ReportSandboxEvent and UnregisterNode. Comparing incarnations lets the
+// scheduler reject a write from a process that has since been replaced: a
+// restarted node cannot resurrect bindings it lost, and an RPC delayed behind
+// a restart cannot overwrite the live incarnation's view.
+//
+// This is the closest thing to a fencing token available without a resource
+// that validates tokens. It is deliberately *not* the sandbox access token,
+// which is a deterministic non-expiring HMAC identical on every node holding
+// the seed and so incapable of ordering anything.
+type Incarnation string
+
+// Supersedes reports whether i replaces other.
+//
+// UUIDv7 sorts lexicographically in time order, so a plain comparison is
+// enough. An empty incarnation is treated as "unknown" and never supersedes:
+// an older node that does not report one must not be able to displace a newer
+// one, and must not be locked out either.
+func (i Incarnation) Supersedes(other Incarnation) bool {
+	if i == "" || other == "" {
+		return false
+	}
+	return i > other
+}
+
 type BindingStore interface {
 	Get(sandboxID string, now time.Time) (Node, bool, error)
 	Record(sandboxID string, node Node, now time.Time) error

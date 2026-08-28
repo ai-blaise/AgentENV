@@ -159,3 +159,14 @@ func recordSchedulerNodesFiltered(reason string, count int) {
 	}
 	schedulerNodesFilteredTotal.WithLabelValues(reason).Add(float64(count))
 }
+
+// schedulerStaleIncarnationTotal counts reports rejected as coming from a
+// replaced node process. A persistently non-zero rate for one node means its
+// incarnation is pinned or duplicated, which defeats the guard.
+var schedulerStaleIncarnationTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "agentenv_scheduler_stale_incarnation_total",
+		Help: "Heartbeats rejected as originating from a superseded node process.",
+	},
+	[]string{"node_id"},
+)

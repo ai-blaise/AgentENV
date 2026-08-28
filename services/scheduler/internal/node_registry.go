@@ -34,8 +34,11 @@ type NodeRegistry interface {
 
 var (
 	ErrServiceInstanceMismatch = errors.New("service instance mismatch")
-	ErrNodeNotInRegistry       = errors.New("node is not in scheduler node list")
-	defaultObservedReportTTL   = 30 * time.Second
+	// ErrStaleIncarnation rejects a report from a node process that has since
+	// been replaced.
+	ErrStaleIncarnation      = errors.New("node reported a superseded service instance")
+	ErrNodeNotInRegistry     = errors.New("node is not in scheduler node list")
+	defaultObservedReportTTL = 30 * time.Second
 )
 
 type observedNodeRecord struct {
@@ -155,6 +158,19 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 	prevCPU, existed := "", false
 	if prev, ok := r.observed[req.GetNodeId()]; ok {
 		existed = true
+		// A node process that has already been replaced must not be able to
+		// overwrite the live one's state. Incarnations are time-ordered UUIDv7
+		// values minted per process start, so a strictly older one is a report
+		// from a dead process — most often an RPC delayed behind a restart.
+		//
+		// Equal or unknown incarnations pass: a node that does not report one
+		// must not be locked out, and re-reporting the same one is the normal
+		// case.
+		incoming := Incarnation(strings.TrimSpace(req.GetServiceInstanceId()))
+		current := Incarnation(strings.TrimSpace(prev.node.GetServiceInstanceId()))
+		if current.Supersedes(incoming) {
+			return Node{}, "", ErrStaleIncarnation
+		}
 		prevCPU = prev.node.GetMachineInfo().GetCpuConfigJson()
 		if machineInfo != nil && machineInfo.CpuConfigJson == "" {
 			machineInfo.CpuConfigJson = prevCPU

@@ -603,3 +603,64 @@ func TestLoadRejectsIncompleteKubernetesSchedulerDiscoveryConfig(t *testing.T) {
 		t.Fatal("expected load to fail for incomplete kubernetes discovery config")
 	}
 }
+
+func TestValidateSchedulerTTLOrdering(t *testing.T) {
+	cases := []struct {
+		name    string
+		cfg     SchedulerConfig
+		wantErr bool
+	}{
+		{
+			name: "no expected interval disables the check",
+			cfg:  SchedulerConfig{ReportTTL: time.Second, BindingTTL: time.Second},
+		},
+		{
+			name: "ttls leave room for a missed heartbeat and a retry",
+			cfg: SchedulerConfig{
+				HeartbeatInterval: 5 * time.Second,
+				ReportTTL:         30 * time.Second,
+				BindingTTL:        30 * time.Second,
+			},
+		},
+		{
+			// A single missed heartbeat would mark a healthy node stale.
+			name: "report ttl too short for the interval",
+			cfg: SchedulerConfig{
+				HeartbeatInterval: 5 * time.Second,
+				ReportTTL:         6 * time.Second,
+				BindingTTL:        30 * time.Second,
+			},
+			wantErr: true,
+		},
+		{
+			// A single missed heartbeat would drop the node's bindings.
+			name: "binding ttl too short for the interval",
+			cfg: SchedulerConfig{
+				HeartbeatInterval: 5 * time.Second,
+				ReportTTL:         30 * time.Second,
+				BindingTTL:        10 * time.Second,
+			},
+			wantErr: true,
+		},
+		{
+			name: "exactly at the minimum is accepted",
+			cfg: SchedulerConfig{
+				HeartbeatInterval: 5 * time.Second,
+				ReportTTL:         15 * time.Second,
+				BindingTTL:        15 * time.Second,
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateSchedulerTTLOrdering(tc.cfg)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected a validation error")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
