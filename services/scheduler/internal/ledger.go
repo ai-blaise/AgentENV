@@ -98,6 +98,23 @@ func (l *ReservationLedger) Reset(nodeID string) {
 // Forget drops all state for a node that has left the cluster.
 func (l *ReservationLedger) Forget(nodeID string) { l.Reset(nodeID) }
 
+// Retain drops every node's delta that `keep` no longer recognises.
+//
+// Forget() covers the graceful path only; a node removed from discovery never
+// calls it.
+func (l *ReservationLedger) Retain(keep func(nodeID string) bool) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	dropped := 0
+	for nodeID := range l.byNodeID {
+		if !keep(nodeID) {
+			delete(l.byNodeID, nodeID)
+			dropped++
+		}
+	}
+	return dropped
+}
+
 // ApplyTo returns a copy of snapshot with the node's in-flight delta folded in.
 //
 // The snapshot is copied rather than mutated: it is shared with everything else

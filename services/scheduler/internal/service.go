@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
@@ -41,6 +42,9 @@ type Service struct {
 	rosters *rosterCache
 	// eventLoss turns silently dropped lifecycle event batches into a number.
 	eventLoss *eventLossTracker
+	// sweepMu guards lastSweep, which paces the departed-node sweep.
+	sweepMu   sync.Mutex
+	lastSweep time.Time
 	// mobility arbitrates paused-sandbox ownership across the fleet. It lives
 	// here rather than on each node because a destination and an origin cannot
 	// agree through a store on one of their disks.
@@ -391,6 +395,8 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 	// carrying for this node is now either included in it or lost.
 	s.ledger.Reset(nodeID)
 
+	s.pruneDepartedNodes()
+
 	if missed := s.eventLoss.observeEmitted(nodeID, req.GetEmittedEventCount()); missed > 0 {
 		s.logger.Warn("scheduler did not receive every sandbox event a node emitted",
 			zap.String("node_id", nodeID),
@@ -468,6 +474,47 @@ func (s *Service) resolveRoster(
 	}
 	schedulerRosterCacheHitTotal.Inc()
 	return cached, false
+}
+
+// departedSweepInterval bounds how often the per-node side maps are swept.
+//
+// The sweep is O(entries) and the entries only change when the fleet does, so
+// doing it on every heartbeat would be pure waste on a busy scheduler.
+const departedSweepInterval = 60 * time.Second
+
+// pruneDepartedNodes drops per-node bookkeeping for nodes the registry no
+// longer recognises.
+//
+// The roster cache, the event-loss counters and the reservation ledger are all
+// keyed by node and are cleared by UnregisterNode — the graceful path. A node
+// that is removed from discovery, renamed, or simply never comes back never
+// calls it, so without this each map grows with fleet churn for the lifetime
+// of the process. The roster cache is the worst of the three: every entry
+// holds a node's full sandbox roster.
+//
+// Membership is the registry's answer, so a node that is still discovered but
+// merely unhealthy keeps its state — this reclaims what has left, not what is
+// struggling.
+func (s *Service) pruneDepartedNodes() {
+	now := time.Now()
+	s.sweepMu.Lock()
+	if now.Sub(s.lastSweep) < departedSweepInterval {
+		s.sweepMu.Unlock()
+		return
+	}
+	s.lastSweep = now
+	s.sweepMu.Unlock()
+
+	known := func(nodeID string) bool {
+		_, ok := s.nodes.Resolve(nodeID)
+		return ok
+	}
+	dropped := s.rosters.retain(known) + s.eventLoss.retain(known) + s.ledger.Retain(known)
+	if dropped > 0 {
+		s.logger.Debug("scheduler dropped bookkeeping for departed nodes",
+			zap.Int("entries", dropped),
+		)
+	}
 }
 
 func (s *Service) ReportSandboxEvent(_ context.Context, req *schedulerv1.ReportSandboxEventRequest) (*schedulerv1.ReportSandboxEventResponse, error) {

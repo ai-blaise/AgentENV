@@ -166,3 +166,56 @@ func nodeIDForIndex(i int) string {
 	const digits = "0123456789"
 	return "node-" + string([]byte{digits[i/100%10], digits[i/10%10], digits[i%10]})
 }
+
+// The roster cache, event-loss counters and reservation ledger are all keyed
+// by node and cleared only by UnregisterNode — the graceful path. A node
+// removed from discovery, renamed, or simply gone never calls it, so each map
+// would grow with fleet churn for the lifetime of the process. The roster
+// cache is the worst: every entry holds a node's full sandbox roster.
+func TestBookkeepingForDepartedNodesIsReclaimed(t *testing.T) {
+	nodes := []Node{
+		{ID: "stays", Endpoint: "http://stays"},
+		{ID: "departs", Endpoint: "http://departs"},
+	}
+	registry := NewAtomicNodeRegistry(nodes, time.Minute)
+	store := NewInMemoryBindingStoreWithGrace(time.Minute, 0)
+	service := NewService(nil, registry, NewStrategy("round_robin"), store)
+
+	for _, id := range []string{"stays", "departs"} {
+		beat := readyHeartbeat(id)
+		beat.SandboxIds = []string{"sandbox-" + id}
+		beat.RosterDigest = RosterDigest(beat.SandboxIds)
+		beat.RosterFull = true
+		beat.EmittedEventCount = 5
+		if _, err := service.Heartbeat(context.Background(), beat); err != nil {
+			t.Fatalf("heartbeat %s: %v", id, err)
+		}
+	}
+	if service.rosters.len() != 2 {
+		t.Fatalf("expected two cached rosters, got %d", service.rosters.len())
+	}
+
+	// Discovery drops one node. Nothing calls UnregisterNode for it.
+	registry.Set([]Node{{ID: "stays", Endpoint: "http://stays"}}, nil)
+
+	// The sweep is paced, so reach past the interval rather than waiting.
+	service.sweepMu.Lock()
+	service.lastSweep = time.Now().Add(-2 * departedSweepInterval)
+	service.sweepMu.Unlock()
+
+	if _, err := service.Heartbeat(context.Background(), readyHeartbeat("stays")); err != nil {
+		t.Fatalf("heartbeat after departure: %v", err)
+	}
+
+	if service.rosters.len() != 1 {
+		t.Fatalf("the departed node's roster should have been reclaimed, %d remain", service.rosters.len())
+	}
+	if _, _, ok := service.rosters.lookup("departs", RosterDigest([]string{"sandbox-departs"})); ok {
+		t.Fatal("the departed node's roster is still cached")
+	}
+	// The node that is still discovered keeps its state: this reclaims what
+	// has left, not what is merely unhealthy.
+	if _, _, ok := service.rosters.lookup("stays", RosterDigest([]string{"sandbox-stays"})); !ok {
+		t.Fatal("a node that is still discovered must keep its cached roster")
+	}
+}

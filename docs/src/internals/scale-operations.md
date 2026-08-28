@@ -169,9 +169,6 @@ does not hold for the delta a snapshot adds, which is every guest write to `/`.
 That is the same data class the memory and attached-drive layers were dropped
 for.
 
-**Per-node maps are unbounded under churn.** `rosterCache`, `eventLossTracker`
-and `ReservationLedger` are pruned only by `UnregisterNode`, the graceful path.
-
 **The scheduler caches a roster under a digest it never verifies**, so a single
 inconsistent heartbeat poisons the cache for every later elided one.
 

@@ -169,9 +169,7 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
         let reason = match committed {
             Ok(true) => None,
             Ok(false) => Some("the claim was lost during the restore".to_string()),
-            Err(error) => Some(format!(
-                "the handover could not be recorded: {error:#}"
-            )),
+            Err(error) => Some(format!("the handover could not be recorded: {error:#}")),
         };
         if let Some(reason) = reason {
             // The guest running here is now the second copy, so it is the one

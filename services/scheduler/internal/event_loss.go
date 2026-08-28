@@ -56,6 +56,23 @@ func (t *eventLossTracker) observeEmitted(nodeID string, emitted uint64) uint64 
 	return emitted - received
 }
 
+// retain drops counters for every node `keep` no longer recognises.
+//
+// forget() covers the graceful path only. A node removed from discovery never
+// calls it, and its counter would otherwise sit here for the process lifetime.
+func (t *eventLossTracker) retain(keep func(nodeID string) bool) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	dropped := 0
+	for nodeID := range t.received {
+		if !keep(nodeID) {
+			delete(t.received, nodeID)
+			dropped++
+		}
+	}
+	return dropped
+}
+
 // forget drops a node's counters, so a node that returns is not credited with
 // the events of the process that left.
 func (t *eventLossTracker) forget(nodeID string) {

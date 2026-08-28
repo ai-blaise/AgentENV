@@ -87,6 +87,25 @@ func (c *rosterCache) len() int {
 	return len(c.entries)
 }
 
+// retain drops every entry whose node `keep` no longer recognises.
+//
+// forget() covers the graceful path, but a node that is removed from
+// discovery, renamed, or simply never comes back never calls it — and each
+// entry holds a full roster. Without this the cache grows with fleet churn for
+// the lifetime of the process.
+func (c *rosterCache) retain(keep func(nodeID string) bool) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	dropped := 0
+	for nodeID := range c.entries {
+		if !keep(nodeID) {
+			delete(c.entries, nodeID)
+			dropped++
+		}
+	}
+	return dropped
+}
+
 // RosterDigest hashes a roster the same way a node does.
 //
 // Order-independent by construction, because the two sides build the list from
