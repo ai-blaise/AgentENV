@@ -1,0 +1,587 @@
+//! Agreeing which node owns a paused sandbox during a handover.
+//!
+//! Two nodes must not run the same sandbox. A destination that restores a
+//! snapshot while the origin resumes the same paused state produces two guests
+//! that believe they are one: both write the same drives, both answer for the
+//! same sandbox id, and the divergence is unrecoverable by the time anyone
+//! notices.
+//!
+//! # What this is
+//!
+//! A renewable lease over a mobility record. A destination claims a sandbox,
+//! renews while it works, and either completes the handover or releases the
+//! claim. The origin refuses to resume locally while a live claim exists.
+//!
+//! # What this is not
+//!
+//! It is not mutual exclusion. AgentENV has no consensus store and no resource
+//! that honours a fencing token, so a claimant that is partitioned — alive,
+//! working, unable to renew — will have its claim expire while it is still
+//! restoring. The lease narrows that window; it cannot close it.
+//!
+//! Two things are done about that rather than pretending otherwise:
+//!
+//! - The claimant renews, so an expired claim means renewal *stopped*, not that
+//!   a fixed budget elapsed. A healthy claimant never expires no matter how
+//!   long the restore takes.
+//! - The origin waits an additional grace period past expiry before it will
+//!   resume locally. A renewal that was in flight when the origin checked lands
+//!   inside the grace period, so the origin loses that race deterministically
+//!   instead of by timing.
+//!
+//! Closing the window entirely needs a fencing token honoured where the state
+//! actually lives — the ublk device or the repository refusing writes from a
+//! superseded generation. That does not exist here, and this module is written
+//! to be the thing that supplies the generation when it does.
+//!
+//! # Clock
+//!
+//! Claim expiry is a wall-clock deadline, because it is compared by two
+//! different machines and a monotonic instant means nothing across a process
+//! boundary. Skew therefore moves the deadline. The grace period is sized to
+//! absorb ordinary NTP-managed skew, and every ambiguous comparison resolves
+//! against the actor that would create a second live copy.
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::Result;
+
+use super::record::{MobilityRecord, MobilityState, MobilityStore, MobilityWrite};
+use crate::types::SandboxId;
+
+/// How long a claim stands without renewal.
+///
+/// Long enough that an ordinary restore never has to renew twice to survive,
+/// short enough that a dead claimant does not park a sandbox for minutes.
+pub const DEFAULT_CLAIM_TTL: Duration = Duration::from_secs(30);
+
+/// Extra time the origin waits past expiry before resuming locally.
+///
+/// This is the whole defence against a renewal that was in flight when the
+/// origin looked: it must exceed plausible clock skew plus one renewal round
+/// trip, and it is only ever paid on a path that is already failing.
+const ORIGIN_RESUME_GRACE: Duration = Duration::from_secs(15);
+
+/// The result of trying to claim a sandbox.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// The claim stands, and this is the record that proves it.
+    Claimed(Box<MobilityRecord>),
+    /// Another node holds a live claim.
+    AlreadyClaimed {
+        by_node_id: String,
+        expires_in: Duration,
+    },
+    /// The sandbox already moved.
+    AlreadyEvacuated { to_node_id: String },
+    /// No record: the sandbox is not paused here, or never was.
+    Unknown,
+    /// The write lost a race with a concurrent one. Re-read and decide again.
+    Superseded,
+}
+
+/// Whether the origin may resume a paused sandbox itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResumeFence {
+    Allowed,
+    /// A destination is mid-handover. Resuming would make two live copies.
+    ClaimedElsewhere {
+        by_node_id: String,
+    },
+    /// The sandbox lives on another node now.
+    Evacuated {
+        to_node_id: String,
+    },
+}
+
+/// Claims and fences paused sandboxes on behalf of one node.
+pub struct MobilityCoordinator<S> {
+    store: S,
+    node_id: String,
+    claim_ttl: Duration,
+}
+
+impl<S: MobilityStore> MobilityCoordinator<S> {
+    pub fn new(store: S, node_id: impl Into<String>) -> Self {
+        Self {
+            store,
+            node_id: node_id.into(),
+            claim_ttl: DEFAULT_CLAIM_TTL,
+        }
+    }
+
+    pub fn with_claim_ttl(mut self, claim_ttl: Duration) -> Self {
+        self.claim_ttl = claim_ttl;
+        self
+    }
+
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
+    pub fn store(&self) -> &S {
+        &self.store
+    }
+
+    /// Claims a sandbox for this node, or renews a claim it already holds.
+    ///
+    /// Renewal is the same call deliberately: a claimant that must distinguish
+    /// "claim" from "renew" has to track whether its own earlier attempt landed,
+    /// and it usually cannot know after a timeout.
+    pub async fn claim(&self, sandbox_id: &SandboxId) -> Result<ClaimOutcome> {
+        self.claim_at(sandbox_id, SystemTime::now()).await
+    }
+
+    async fn claim_at(&self, sandbox_id: &SandboxId, now: SystemTime) -> Result<ClaimOutcome> {
+        let Some(record) = self.store.get(sandbox_id).await? else {
+            return Ok(ClaimOutcome::Unknown);
+        };
+
+        match &record.state {
+            MobilityState::Evacuated { to_node_id, .. } => {
+                return Ok(ClaimOutcome::AlreadyEvacuated {
+                    to_node_id: to_node_id.clone(),
+                })
+            }
+            MobilityState::Claimed {
+                by_node_id,
+                at_unix_ms,
+            } if by_node_id != &self.node_id => {
+                if let Some(expires_in) = self.remaining(*at_unix_ms, now) {
+                    return Ok(ClaimOutcome::AlreadyClaimed {
+                        by_node_id: by_node_id.clone(),
+                        expires_in,
+                    });
+                }
+                // Expired: the previous claimant stopped renewing. Taking over
+                // is the point of expiry, so fall through.
+            }
+            MobilityState::Claimed { .. } | MobilityState::Parked => {}
+        }
+
+        let claimed = record.transitioned_to(MobilityState::Claimed {
+            by_node_id: self.node_id.clone(),
+            at_unix_ms: unix_millis(now),
+        });
+        match self.store.upsert(&claimed).await? {
+            MobilityWrite::Applied => Ok(ClaimOutcome::Claimed(Box::new(claimed))),
+            MobilityWrite::Superseded => Ok(ClaimOutcome::Superseded),
+        }
+    }
+
+    /// Gives a claim back, leaving the sandbox available again.
+    ///
+    /// Only the current claimant may release. A stale actor releasing someone
+    /// else's claim is exactly the resurrection the generation order exists to
+    /// prevent, and it would be worse here: it would invite a second claimant
+    /// in while the first is still working.
+    pub async fn release(&self, sandbox_id: &SandboxId) -> Result<bool> {
+        let Some(record) = self.store.get(sandbox_id).await? else {
+            return Ok(false);
+        };
+        if !self.holds_claim(&record) {
+            return Ok(false);
+        }
+        let released = record.transitioned_to(MobilityState::Parked);
+        Ok(matches!(
+            self.store.upsert(&released).await?,
+            MobilityWrite::Applied
+        ))
+    }
+
+    /// Marks the handover finished, with this node as the new home.
+    pub async fn complete(&self, sandbox_id: &SandboxId) -> Result<bool> {
+        self.complete_at(sandbox_id, SystemTime::now()).await
+    }
+
+    async fn complete_at(&self, sandbox_id: &SandboxId, now: SystemTime) -> Result<bool> {
+        let Some(record) = self.store.get(sandbox_id).await? else {
+            return Ok(false);
+        };
+        if !self.holds_claim(&record) {
+            return Ok(false);
+        }
+        let evacuated = record.transitioned_to(MobilityState::Evacuated {
+            to_node_id: self.node_id.clone(),
+            at_unix_ms: unix_millis(now),
+        });
+        Ok(matches!(
+            self.store.upsert(&evacuated).await?,
+            MobilityWrite::Applied
+        ))
+    }
+
+    /// Whether this node may resume the sandbox itself.
+    ///
+    /// A sandbox with no record resumes freely: mobility is opt-in, and a node
+    /// that has never written a record for a sandbox is not in a handover.
+    pub async fn fence_local_resume(&self, sandbox_id: &SandboxId) -> Result<ResumeFence> {
+        self.fence_local_resume_at(sandbox_id, SystemTime::now())
+            .await
+    }
+
+    async fn fence_local_resume_at(
+        &self,
+        sandbox_id: &SandboxId,
+        now: SystemTime,
+    ) -> Result<ResumeFence> {
+        let Some(record) = self.store.get(sandbox_id).await? else {
+            return Ok(ResumeFence::Allowed);
+        };
+        match &record.state {
+            MobilityState::Parked => Ok(ResumeFence::Allowed),
+            MobilityState::Evacuated { to_node_id, .. } => Ok(ResumeFence::Evacuated {
+                to_node_id: to_node_id.clone(),
+            }),
+            MobilityState::Claimed {
+                by_node_id,
+                at_unix_ms,
+            } => {
+                if by_node_id == &self.node_id {
+                    // This node is both origin and claimant, which is what a
+                    // restore-in-place looks like. Nothing to fence against.
+                    return Ok(ResumeFence::Allowed);
+                }
+                // The grace period, not the TTL, gates the origin. A claimant
+                // whose renewal was in flight when this ran is still inside it.
+                match self.remaining_with_grace(*at_unix_ms, now) {
+                    Some(_) => Ok(ResumeFence::ClaimedElsewhere {
+                        by_node_id: by_node_id.clone(),
+                    }),
+                    None => Ok(ResumeFence::Allowed),
+                }
+            }
+        }
+    }
+
+    fn holds_claim(&self, record: &MobilityRecord) -> bool {
+        matches!(
+            &record.state,
+            MobilityState::Claimed { by_node_id, .. } if by_node_id == &self.node_id
+        )
+    }
+
+    fn remaining(&self, claimed_at_unix_ms: u64, now: SystemTime) -> Option<Duration> {
+        self.remaining_within(claimed_at_unix_ms, now, self.claim_ttl)
+    }
+
+    fn remaining_with_grace(&self, claimed_at_unix_ms: u64, now: SystemTime) -> Option<Duration> {
+        self.remaining_within(
+            claimed_at_unix_ms,
+            now,
+            self.claim_ttl + ORIGIN_RESUME_GRACE,
+        )
+    }
+
+    /// Remaining lifetime of a claim, or `None` once it has lapsed.
+    ///
+    /// A claim stamped in the future — the claimant's clock runs ahead — is
+    /// treated as freshly made rather than as absurd. The alternative is to
+    /// call it expired, which hands the sandbox to a second actor on the
+    /// strength of a clock disagreement.
+    fn remaining_within(
+        &self,
+        claimed_at_unix_ms: u64,
+        now: SystemTime,
+        window: Duration,
+    ) -> Option<Duration> {
+        let now_ms = unix_millis(now);
+        let age = Duration::from_millis(now_ms.saturating_sub(claimed_at_unix_ms));
+        window.checked_sub(age).filter(|left| !left.is_zero())
+    }
+}
+
+fn unix_millis(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map(|since| since.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::orchestrator::mobility::record::LocalMobilityStore;
+    use crate::orchestrator::store::SandboxMetadata;
+    use crate::snapshot::{ArtifactReach, SnapshotRuntimeVersions};
+    use crate::virtualization::VirtualizationMode;
+
+    struct Fixture {
+        _dir: tempfile::TempDir,
+        store: LocalMobilityStore,
+        sandbox_id: SandboxId,
+    }
+
+    async fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalMobilityStore::open(dir.path().join("mobility"))
+            .await
+            .expect("open store");
+        let metadata = SandboxMetadata {
+            runtime_versions: SnapshotRuntimeVersions {
+                kernel_version: "vmlinux-6.1.175".to_string(),
+                firecracker_version: "1.15.1".to_string(),
+                envd_version: "0.5.15".to_string(),
+                tools_drive_version: "0.1.0".to_string(),
+            },
+            virtualization_mode: VirtualizationMode::Kvm,
+            ..SandboxMetadata::default()
+        };
+        let record = MobilityRecord::for_paused(
+            &metadata,
+            "node-a",
+            "x86_64",
+            Some("{}".to_string()),
+            4096,
+            ArtifactReach::ClusterShared,
+            Some("snap-1".to_string()),
+        );
+        store.upsert(&record).await.expect("seed record");
+        Fixture {
+            _dir: dir,
+            store,
+            sandbox_id: metadata.id,
+        }
+    }
+
+    fn coordinator(
+        store: LocalMobilityStore,
+        node: &str,
+    ) -> MobilityCoordinator<LocalMobilityStore> {
+        MobilityCoordinator::new(store, node)
+    }
+
+    fn seconds_ago(seconds: u64) -> SystemTime {
+        SystemTime::now() + Duration::from_secs(seconds)
+    }
+
+    #[tokio::test]
+    async fn a_parked_sandbox_can_be_claimed_and_completed() {
+        let f = fixture().await;
+        let origin = coordinator(f.store.clone(), "node-a");
+        let destination = coordinator(f.store.clone(), "node-b");
+
+        assert!(matches!(
+            destination.claim(&f.sandbox_id).await.expect("claim"),
+            ClaimOutcome::Claimed(_)
+        ));
+        assert_eq!(
+            origin
+                .fence_local_resume(&f.sandbox_id)
+                .await
+                .expect("fence"),
+            ResumeFence::ClaimedElsewhere {
+                by_node_id: "node-b".to_string()
+            },
+            "the origin must not resume under a live claim"
+        );
+
+        assert!(destination.complete(&f.sandbox_id).await.expect("complete"));
+        assert_eq!(
+            origin
+                .fence_local_resume(&f.sandbox_id)
+                .await
+                .expect("fence"),
+            ResumeFence::Evacuated {
+                to_node_id: "node-b".to_string()
+            }
+        );
+    }
+
+    /// A second destination must be told it is racing rather than allowed to
+    /// take over a sandbox someone else is restoring.
+    #[tokio::test]
+    async fn a_live_claim_blocks_another_destination() {
+        let f = fixture().await;
+        coordinator(f.store.clone(), "node-b")
+            .claim(&f.sandbox_id)
+            .await
+            .expect("claim");
+
+        let outcome = coordinator(f.store.clone(), "node-c")
+            .claim(&f.sandbox_id)
+            .await
+            .expect("claim");
+        match outcome {
+            ClaimOutcome::AlreadyClaimed { by_node_id, .. } => assert_eq!(by_node_id, "node-b"),
+            other => panic!("expected a live claim to block, got {other:?}"),
+        }
+    }
+
+    /// Renewal is the same call as claiming, so a claimant that timed out on
+    /// its own earlier attempt does not have to know whether it landed.
+    #[tokio::test]
+    async fn a_claimant_renews_with_the_same_call() {
+        let f = fixture().await;
+        let destination = coordinator(f.store.clone(), "node-b");
+
+        let first = destination.claim(&f.sandbox_id).await.expect("claim");
+        let second = destination.claim(&f.sandbox_id).await.expect("renew");
+        assert!(matches!(first, ClaimOutcome::Claimed(_)));
+        assert!(matches!(second, ClaimOutcome::Claimed(_)));
+
+        let ClaimOutcome::Claimed(second) = second else {
+            unreachable!("asserted above");
+        };
+        let ClaimOutcome::Claimed(first) = first else {
+            unreachable!("asserted above");
+        };
+        assert!(
+            second.generation.supersedes(&first.generation),
+            "a renewal must advance the generation"
+        );
+    }
+
+    /// Expiry means the claimant stopped renewing. Another destination taking
+    /// over then is the entire purpose of the lease.
+    #[tokio::test]
+    async fn an_expired_claim_can_be_taken_over() {
+        let f = fixture().await;
+        let abandoned =
+            coordinator(f.store.clone(), "node-b").with_claim_ttl(Duration::from_secs(1));
+        abandoned.claim(&f.sandbox_id).await.expect("claim");
+
+        let taker = coordinator(f.store.clone(), "node-c").with_claim_ttl(Duration::from_secs(1));
+        let outcome = taker
+            .claim_at(&f.sandbox_id, seconds_ago(5))
+            .await
+            .expect("claim");
+        assert!(
+            matches!(outcome, ClaimOutcome::Claimed(_)),
+            "an abandoned claim must not park a sandbox forever, got {outcome:?}"
+        );
+    }
+
+    /// The window between claim expiry and origin resume is the one place two
+    /// live copies could appear. The grace period must keep the origin out of
+    /// it even after the TTL has passed.
+    #[tokio::test]
+    async fn the_origin_waits_out_the_grace_period_before_resuming() {
+        let f = fixture().await;
+        let ttl = Duration::from_secs(1);
+        coordinator(f.store.clone(), "node-b")
+            .with_claim_ttl(ttl)
+            .claim(&f.sandbox_id)
+            .await
+            .expect("claim");
+        let origin = coordinator(f.store.clone(), "node-a").with_claim_ttl(ttl);
+
+        // Past the TTL but inside the grace period: still fenced.
+        assert!(matches!(
+            origin
+                .fence_local_resume_at(&f.sandbox_id, seconds_ago(ttl.as_secs() + 1))
+                .await
+                .expect("fence"),
+            ResumeFence::ClaimedElsewhere { .. }
+        ));
+
+        // Past both: the claimant has stopped renewing for long enough that a
+        // renewal cannot still be in flight.
+        assert_eq!(
+            origin
+                .fence_local_resume_at(
+                    &f.sandbox_id,
+                    seconds_ago(ttl.as_secs() + ORIGIN_RESUME_GRACE.as_secs() + 1)
+                )
+                .await
+                .expect("fence"),
+            ResumeFence::Allowed
+        );
+    }
+
+    /// A claimant whose clock runs ahead stamps a claim in the future. Reading
+    /// that as expired would hand the sandbox to a second actor purely because
+    /// two machines disagree about the time.
+    #[tokio::test]
+    async fn a_claim_stamped_in_the_future_is_treated_as_fresh() {
+        let f = fixture().await;
+        let destination = coordinator(f.store.clone(), "node-b");
+        destination
+            .claim_at(&f.sandbox_id, SystemTime::now() + Duration::from_secs(600))
+            .await
+            .expect("claim");
+
+        let other = coordinator(f.store.clone(), "node-c");
+        assert!(matches!(
+            other.claim(&f.sandbox_id).await.expect("claim"),
+            ClaimOutcome::AlreadyClaimed { .. }
+        ));
+    }
+
+    /// Releasing someone else's claim would invite a second destination in
+    /// while the first is still restoring.
+    #[tokio::test]
+    async fn only_the_claimant_may_release_or_complete() {
+        let f = fixture().await;
+        coordinator(f.store.clone(), "node-b")
+            .claim(&f.sandbox_id)
+            .await
+            .expect("claim");
+
+        let interloper = coordinator(f.store.clone(), "node-c");
+        assert!(!interloper.release(&f.sandbox_id).await.expect("release"));
+        assert!(!interloper.complete(&f.sandbox_id).await.expect("complete"));
+
+        let claimant = coordinator(f.store.clone(), "node-b");
+        assert!(claimant.release(&f.sandbox_id).await.expect("release"));
+        assert_eq!(
+            coordinator(f.store.clone(), "node-a")
+                .fence_local_resume(&f.sandbox_id)
+                .await
+                .expect("fence"),
+            ResumeFence::Allowed,
+            "a released sandbox is available again"
+        );
+    }
+
+    /// A sandbox that already moved must never be claimed again, expired
+    /// claims or not: the state it refers to is being run elsewhere.
+    #[tokio::test]
+    async fn an_evacuated_sandbox_cannot_be_reclaimed() {
+        let f = fixture().await;
+        let destination = coordinator(f.store.clone(), "node-b");
+        destination.claim(&f.sandbox_id).await.expect("claim");
+        destination.complete(&f.sandbox_id).await.expect("complete");
+
+        assert_eq!(
+            coordinator(f.store.clone(), "node-c")
+                .claim(&f.sandbox_id)
+                .await
+                .expect("claim"),
+            ClaimOutcome::AlreadyEvacuated {
+                to_node_id: "node-b".to_string()
+            }
+        );
+    }
+
+    /// Mobility is opt-in. A sandbox with no record is not in a handover and
+    /// must resume normally rather than being fenced by an absent decision.
+    #[tokio::test]
+    async fn a_sandbox_without_a_record_resumes_freely() {
+        let f = fixture().await;
+        let unknown = SandboxId::new();
+        let origin = coordinator(f.store.clone(), "node-a");
+
+        assert_eq!(
+            origin.fence_local_resume(&unknown).await.expect("fence"),
+            ResumeFence::Allowed
+        );
+        assert_eq!(
+            origin.claim(&unknown).await.expect("claim"),
+            ClaimOutcome::Unknown
+        );
+    }
+
+    /// A node restoring its own paused sandbox holds its own claim. Fencing
+    /// against yourself would deadlock the ordinary local resume path.
+    #[tokio::test]
+    async fn a_node_is_not_fenced_by_its_own_claim() {
+        let f = fixture().await;
+        let node = coordinator(f.store.clone(), "node-a");
+        node.claim(&f.sandbox_id).await.expect("claim");
+
+        assert_eq!(
+            node.fence_local_resume(&f.sandbox_id).await.expect("fence"),
+            ResumeFence::Allowed
+        );
+    }
+}
