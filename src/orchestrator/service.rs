@@ -103,6 +103,15 @@ pub struct Orchestrator<
     sandbox_event_tx: broadcast::Sender<SandboxLifecycleEvent>,
     default_sandbox_timeout: Duration,
     is_shutting_down: std::sync::atomic::AtomicBool,
+    /// Set once startup recovery has finished restoring persisted paused
+    /// sandboxes into the store.
+    ///
+    /// Until then this node's sandbox roster is incomplete, and reporting it as
+    /// authoritative would let the scheduler read an empty roster as "this node
+    /// owns nothing" and delete every binding it holds. Today `load_all` is
+    /// awaited before the reporter exists, so the window is not reachable; this
+    /// makes that an invariant of the code rather than of construction order.
+    roster_complete: std::sync::atomic::AtomicBool,
     shutdown_tx: watch::Sender<bool>,
     shutdown_outcome: OnceCell<ShutdownOutcome>,
     image_refs: Arc<dyn RuntimeImageRefs>,
@@ -193,6 +202,7 @@ where
             sandbox_event_tx,
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
+            roster_complete: std::sync::atomic::AtomicBool::new(false),
             shutdown_tx,
             shutdown_outcome: OnceCell::new(),
             image_refs,
@@ -226,7 +236,15 @@ where
             }
         }
 
+        orchestrator.roster_complete.store(true, Ordering::Release);
+
         Ok(orchestrator)
+    }
+
+    /// Whether this node's reported sandbox roster is complete, i.e. startup
+    /// recovery has finished. See [`Orchestrator::roster_complete`].
+    pub fn is_roster_complete(&self) -> bool {
+        self.roster_complete.load(Ordering::Acquire)
     }
 
     async fn run_cancellation_safe<T>(
@@ -2516,7 +2534,7 @@ where
         Ok(())
     }
 
-    fn is_shutting_down(&self) -> bool {
+    pub fn is_shutting_down(&self) -> bool {
         self.is_shutting_down.load(Ordering::Acquire)
     }
 

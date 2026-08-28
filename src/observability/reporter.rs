@@ -264,7 +264,7 @@ impl ObservabilityReporter {
         snapshot.machine_info.cpu_config_json = cpu_config_json.clone();
         let node_id = snapshot.node_id.clone();
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let req = Self::build_heartbeat_request(snapshot, now_ms, p2p_endpoint);
+        let req = Self::build_heartbeat_request(snapshot, now_ms, p2p_endpoint, config.interval);
 
         let mut request = Request::new(req);
         request.set_timeout(GRPC_CALL_TIMEOUT);
@@ -365,6 +365,7 @@ impl ObservabilityReporter {
         snapshot: super::NodeSnapshot,
         now_ms: i64,
         p2p_endpoint: Option<&P2pEndpoint>,
+        interval: Duration,
     ) -> scheduler::HeartbeatRequest {
         scheduler::HeartbeatRequest {
             node_id: snapshot.node_id,
@@ -380,7 +381,14 @@ impl ObservabilityReporter {
                 cpu_config_json: snapshot.machine_info.cpu_config_json.unwrap_or_default(),
             }),
             snapshot: Some(scheduler::NodeSnapshot {
-                status: scheduler::NodeStatus::Ready.into(),
+                // Report the node's real disposition. A draining node that
+                // claims Ready keeps attracting placements it is trying to
+                // shed, so the scheduler's drain never converges.
+                status: if snapshot.draining {
+                    scheduler::NodeStatus::Lingering.into()
+                } else {
+                    scheduler::NodeStatus::Ready.into()
+                },
                 allocated_cpu: snapshot.metrics.allocated_cpu,
                 allocated_memory_bytes: snapshot.metrics.allocated_memory_bytes,
                 cpu_percent: snapshot.metrics.cpu_percent,
@@ -417,6 +425,8 @@ impl ObservabilityReporter {
                 backend: endpoint.backend.clone(),
                 address: endpoint.address.clone(),
             }),
+            roster_complete: snapshot.roster_complete,
+            heartbeat_interval_ms: interval.as_millis().try_into().unwrap_or(u64::MAX),
         }
     }
 

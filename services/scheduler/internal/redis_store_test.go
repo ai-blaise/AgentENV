@@ -142,11 +142,20 @@ func TestRedisBindingStoreReconcileCases(t *testing.T) {
 
 func newRedisBindingStoreForTest(t *testing.T, ttl time.Duration) *RedisBindingStore {
 	t.Helper()
+	// Reconcile-semantics tests write a binding and immediately reconcile it
+	// away, which the grace window is designed to prevent. Disable it here and
+	// cover it explicitly in TestRedisReconcileGraceAndRosterCompleteness.
+	return newRedisBindingStoreForTestWithGrace(t, ttl, 0)
+}
+
+func newRedisBindingStoreForTestWithGrace(t *testing.T, ttl time.Duration, grace time.Duration) *RedisBindingStore {
+	t.Helper()
 	addr := startRedisServerForTest(t)
 	store, err := NewRedisBindingStore(addr, ttl)
 	if err != nil {
 		t.Fatalf("create redis binding store failed: %v", err)
 	}
+	store.reconcileGrace = grace
 	t.Cleanup(func() {
 		_ = store.Close()
 	})
@@ -224,7 +233,7 @@ func startRedisServerForTest(t *testing.T) string {
 
 func writeRawRedisBinding(t *testing.T, store *RedisBindingStore, sandboxID string, node Node) {
 	t.Helper()
-	value, err := marshalRedisBindingRecord(node)
+	value, err := json.Marshal(redisBindingRecord{Node: node})
 	if err != nil {
 		t.Fatalf("marshal binding record failed: %v", err)
 	}
@@ -300,4 +309,56 @@ func redisExists(t *testing.T, store *RedisBindingStore, key string) bool {
 		t.Fatalf("check redis key %s exists failed: %v", key, err)
 	}
 	return exists > 0
+}
+
+// TestRedisReconcileGraceAndRosterCompleteness mirrors the in-memory coverage
+// against a real Redis so the two stores cannot drift. The stamps and the
+// comparison both happen inside Lua via redis.call("TIME"), so this also
+// exercises that the write and the reconcile agree on one clock.
+func TestRedisReconcileGraceAndRosterCompleteness(t *testing.T) {
+	store := newRedisBindingStoreForTestWithGrace(t, time.Minute, time.Hour)
+	node := Node{ID: "node-a", Endpoint: "http://node-a"}
+
+	store.Record("sbx-established", node, time.Now())
+	store.Record("sbx-inflight", node, time.Now())
+
+	// A roster that omits a binding written inside the grace window cannot have
+	// seen it, so the binding survives.
+	if err := store.ReconcileNode(node, []string{"sbx-established"}, time.Now()); err != nil {
+		t.Fatalf("ReconcileNode: %v", err)
+	}
+	assertRedisBinding(t, store, "sbx-inflight", node)
+
+	// With no grace, the same omission is authoritative.
+	store.reconcileGrace = 0
+	if err := store.ReconcileNode(node, []string{"sbx-established"}, time.Now()); err != nil {
+		t.Fatalf("ReconcileNode: %v", err)
+	}
+	assertRedisMissing(t, store, "sbx-inflight")
+
+	// An empty roster from a node still in startup recovery is not grounds for
+	// deleting anything.
+	if err := store.ReconcileNodeRoster(node, nil, RosterIncomplete, time.Now()); err != nil {
+		t.Fatalf("ReconcileNodeRoster incomplete: %v", err)
+	}
+	assertRedisBinding(t, store, "sbx-established", node)
+
+	// The same empty roster, once authoritative, clears the node.
+	if err := store.ReconcileNodeRoster(node, nil, RosterComplete, time.Now()); err != nil {
+		t.Fatalf("ReconcileNodeRoster complete: %v", err)
+	}
+	assertRedisMissing(t, store, "sbx-established")
+}
+
+// TestRedisReconcileFinalIgnoresGrace covers explicit unregister: the node is
+// gone, so a freshly written binding pointing at it must not be retained.
+func TestRedisReconcileFinalIgnoresGrace(t *testing.T) {
+	store := newRedisBindingStoreForTestWithGrace(t, time.Minute, time.Hour)
+	node := Node{ID: "node-a", Endpoint: "http://node-a"}
+
+	store.Record("sbx-fresh", node, time.Now())
+	if err := store.ReconcileNodeRoster(node, nil, RosterFinal, time.Now()); err != nil {
+		t.Fatalf("ReconcileNodeRoster final: %v", err)
+	}
+	assertRedisMissing(t, store, "sbx-fresh")
 }

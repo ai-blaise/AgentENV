@@ -95,6 +95,8 @@ impl ObservabilityService {
             create_fails: runtime.create_fails,
             sandbox_starting_count: runtime.starting_sandbox_count,
             paused_sandbox_count: runtime.paused_sandbox_count,
+            roster_complete: self.orchestrator.is_roster_complete(),
+            draining: self.orchestrator.is_shutting_down(),
         })
     }
 

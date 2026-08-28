@@ -321,7 +321,11 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 		}
 		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
 	}
-	if err := s.store.ReconcileNode(node, req.GetSandboxIds(), now); err != nil {
+	completeness := RosterIncomplete
+	if req.GetRosterComplete() {
+		completeness = RosterComplete
+	}
+	if err := s.store.ReconcileNodeRoster(node, req.GetSandboxIds(), completeness, now); err != nil {
 		s.logger.Warn("scheduler heartbeat binding reconcile failed",
 			zap.String("node_id", nodeID),
 			zap.Error(err),
@@ -458,7 +462,7 @@ func (s *Service) UnregisterNode(_ context.Context, req *schedulerv1.UnregisterN
 	}
 
 	now := time.Now()
-	if err := s.store.ReconcileNode(Node{ID: nodeID}, nil, now); err != nil {
+	if err := s.store.ReconcileNodeRoster(Node{ID: nodeID}, nil, RosterFinal, now); err != nil {
 		s.logger.Warn("scheduler unregister binding reconcile failed",
 			zap.String("node_id", nodeID),
 			zap.Error(err),

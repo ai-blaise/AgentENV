@@ -35,6 +35,10 @@ func (failingBindingStore) ReconcileNode(Node, []string, time.Time) error {
 	return errors.New("binding store failed")
 }
 
+func (failingBindingStore) ReconcileNodeRoster(Node, []string, RosterCompleteness, time.Time) error {
+	return errors.New("binding store failed")
+}
+
 func registerObservedNodeForTest(t *testing.T, service *Service, nodeID string, serviceInstanceID string) {
 	t.Helper()
 	_, err := service.Heartbeat(context.Background(), &schedulerv1.HeartbeatRequest{
@@ -333,7 +337,9 @@ func TestHeartbeatRemovesBindingsMissingFromRoster(t *testing.T) {
 		zap.NewNop(),
 		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
 		NewStrategy("round_robin"),
-		NewInMemoryBindingStore(defaultObservedReportTTL),
+		// Heartbeat stamps its own time, so disable the reconcile grace to keep
+		// this assertion about roster reconciliation rather than about timing.
+		NewInMemoryBindingStoreWithGrace(defaultObservedReportTTL, 0),
 	)
 
 	_, err := service.RecordAssignment(context.Background(), &schedulerv1.RecordAssignmentRequest{
@@ -356,6 +362,7 @@ func TestHeartbeatRemovesBindingsMissingFromRoster(t *testing.T) {
 		ClusterId:         "cluster-1",
 		ServiceInstanceId: "svc-a",
 		SandboxIds:        []string{"sbx-1"},
+		RosterComplete:    true,
 		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
 	})
 	if err != nil {

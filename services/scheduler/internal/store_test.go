@@ -24,7 +24,7 @@ func TestBindingStoreExpiresBindingsOnLookup(t *testing.T) {
 }
 
 func TestBindingStoreReconcileNodeRefreshesAndRemovesBindings(t *testing.T) {
-	store := NewInMemoryBindingStore(10 * time.Second)
+	store := NewInMemoryBindingStoreWithGrace(10*time.Second, 0)
 	node := Node{ID: "node-a", Endpoint: "http://node-a"}
 	base := time.Unix(200, 0)
 
@@ -293,5 +293,103 @@ func TestInMemoryBindingStoreRecordBatchMovesNode(t *testing.T) {
 	}
 	if _, ok, _ := store.Get("sbx-1", now); !ok {
 		t.Fatal("binding owned by node-b was deleted by node-a reconcile")
+	}
+}
+
+// TestReconcileKeepsBindingRecordedAfterRoster covers the race between a
+// binding being written and the heartbeat that omits it. Building a node
+// snapshot walks every sandbox twice and reads /proc, so a sandbox created
+// after the roster was collected but before the heartbeat lands is bound and
+// absent from the roster at the same time. Deleting it there hands the client
+// an id the scheduler has already forgotten.
+func TestReconcileKeepsBindingRecordedAfterRoster(t *testing.T) {
+	store := NewInMemoryBindingStore(time.Minute)
+	node := Node{ID: "node-a", Endpoint: "http://node-a"}
+	base := time.Unix(400, 0)
+
+	store.Record("sbx-established", node, base)
+	// Recorded while the reporting node was already building its roster.
+	store.Record("sbx-inflight", node, base.Add(defaultReconcileGracePeriod))
+
+	store.ReconcileNode(node, []string{"sbx-established"}, base.Add(defaultReconcileGracePeriod+time.Second))
+
+	if _, ok, _ := store.Get("sbx-inflight", base.Add(defaultReconcileGracePeriod+time.Second)); !ok {
+		t.Fatal("binding recorded inside the grace window was deleted by a roster that could not have seen it")
+	}
+
+	// Once the grace has elapsed the same omission is authoritative.
+	store.ReconcileNode(node, []string{"sbx-established"}, base.Add(3*defaultReconcileGracePeriod))
+	if _, ok, _ := store.Get("sbx-inflight", base.Add(3*defaultReconcileGracePeriod)); ok {
+		t.Fatal("binding omitted from an authoritative roster past the grace window was not deleted")
+	}
+}
+
+// TestReconcileGraceDoesNotRestampOnRefresh pins that recordedAt marks when a
+// binding was established, not when it was last refreshed. Restamping on every
+// heartbeat would extend the grace to every deletion, indefinitely.
+func TestReconcileGraceDoesNotRestampOnRefresh(t *testing.T) {
+	store := NewInMemoryBindingStore(time.Minute)
+	node := Node{ID: "node-a", Endpoint: "http://node-a"}
+	base := time.Unix(500, 0)
+
+	store.Record("sbx-1", node, base)
+	// Repeated heartbeats keep the binding alive and in the roster.
+	for i := 1; i <= 5; i++ {
+		store.ReconcileNode(node, []string{"sbx-1"}, base.Add(time.Duration(i)*time.Second))
+	}
+
+	// The binding was established well outside the grace window, so the first
+	// roster that omits it is authoritative even though it was just refreshed.
+	store.ReconcileNode(node, nil, base.Add(defaultReconcileGracePeriod+6*time.Second))
+	if _, ok, _ := store.Get("sbx-1", base.Add(defaultReconcileGracePeriod+6*time.Second)); ok {
+		t.Fatal("refresh restamped recordedAt, so the grace window never expires")
+	}
+}
+
+func TestReconcileIncompleteRosterNeverWipesNodeBindings(t *testing.T) {
+	store := NewInMemoryBindingStore(time.Minute)
+	node := Node{ID: "node-a", Endpoint: "http://node-a"}
+	base := time.Unix(600, 0)
+
+	store.Record("sbx-1", node, base)
+	store.Record("sbx-2", node, base)
+
+	// A node still restoring persisted paused sandboxes reports an empty
+	// roster it does not consider authoritative.
+	if err := store.ReconcileNodeRoster(node, nil, RosterIncomplete, base.Add(time.Hour)); err != nil {
+		t.Fatalf("ReconcileNodeRoster: %v", err)
+	}
+	for _, sandboxID := range []string{"sbx-1", "sbx-2"} {
+		if _, ok, _ := store.Get(sandboxID, base.Add(time.Second)); !ok {
+			t.Fatalf("%s was wiped by an incomplete empty roster", sandboxID)
+		}
+	}
+
+	// The same empty roster from a node that has finished recovery is
+	// authoritative and clears them.
+	if err := store.ReconcileNodeRoster(node, nil, RosterComplete, base.Add(time.Hour)); err != nil {
+		t.Fatalf("ReconcileNodeRoster: %v", err)
+	}
+	for _, sandboxID := range []string{"sbx-1", "sbx-2"} {
+		if _, ok, _ := store.Get(sandboxID, base.Add(time.Second)); ok {
+			t.Fatalf("%s survived an authoritative empty roster", sandboxID)
+		}
+	}
+}
+
+// TestReconcileFinalRosterIgnoresGrace covers explicit unregister: the node is
+// gone, so there is no live node left to observe a binding it never saw.
+func TestReconcileFinalRosterIgnoresGrace(t *testing.T) {
+	store := NewInMemoryBindingStore(time.Minute)
+	node := Node{ID: "node-a", Endpoint: "http://node-a"}
+	base := time.Unix(700, 0)
+
+	store.Record("sbx-fresh", node, base)
+
+	if err := store.ReconcileNodeRoster(node, nil, RosterFinal, base); err != nil {
+		t.Fatalf("ReconcileNodeRoster: %v", err)
+	}
+	if _, ok, _ := store.Get("sbx-fresh", base); ok {
+		t.Fatal("unregister left a freshly recorded binding pointing at a departed node")
 	}
 }

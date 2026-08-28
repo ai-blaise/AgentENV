@@ -114,6 +114,9 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         sandbox_event_tx,
         default_sandbox_timeout: Duration::from_secs(15),
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
+        // Test orchestrators skip startup recovery, so their roster is
+        // complete from the moment they exist.
+        roster_complete: std::sync::atomic::AtomicBool::new(true),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         shutdown_outcome: tokio::sync::OnceCell::new(),
         image_refs: test_runtime_image_refs(),

@@ -48,4 +48,9 @@ pub struct NodeSnapshot {
     pub sandbox_starting_count: u32,
     /// Number of sandboxes currently in the Paused state on this node.
     pub paused_sandbox_count: u32,
+    /// Whether `sandbox_ids` is this node's complete roster. False while
+    /// startup recovery is still restoring persisted paused sandboxes.
+    pub roster_complete: bool,
+    /// Whether the node is draining and should stop receiving new sandboxes.
+    pub draining: bool,
 }
