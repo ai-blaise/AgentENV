@@ -905,15 +905,17 @@ fn load_docker_credential_helper_binary(
     binary: &str,
     server_url: &str,
 ) -> Result<Option<DockerRegistryCredentials>, AcrClientError> {
-    let mut child = Command::new(binary)
-        .arg("get")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| AcrClientError::Registry {
-            message: format!("run Docker credential helper '{binary} get': {e}"),
-        })?;
+    let mut child = crate::spawn_retry::spawn_retrying_busy_text(binary, || {
+        Command::new(binary)
+            .arg("get")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+    .map_err(|e| AcrClientError::Registry {
+        message: format!("run Docker credential helper '{binary} get': {e}"),
+    })?;
 
     if let Some(mut stdin) = child.stdin.take() {
         stdin

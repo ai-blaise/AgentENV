@@ -18,6 +18,7 @@ mod proto;
 pub mod sandbox;
 pub mod setup;
 pub mod snapshot;
+mod spawn_retry;
 pub mod template;
 pub mod types;
 pub mod virtualization;

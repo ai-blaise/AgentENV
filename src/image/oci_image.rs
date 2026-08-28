@@ -783,23 +783,15 @@ pub(crate) fn regctl_command(binary: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
-/// Attempts to spawn `regctl` before giving up on `ETXTBSY`.
-const REGCTL_SPAWN_RETRY_ATTEMPTS: usize = 5;
-/// Pause between spawn retries. The window is one `fork`-to-`exec` gap wide.
-const REGCTL_SPAWN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
-
 /// Runs a prepared `regctl` command, retrying a spawn that lost a race with a
 /// concurrent fork.
 ///
-/// `regctl` is staged and renamed into place by the dependency installer. If
-/// any thread in this process is holding a write handle to a file at the
-/// moment another thread forks, the child inherits that handle until it execs
-/// — and an `exec` of a file some process holds open for writing is refused
-/// with `ETXTBSY`. The window is microseconds wide and the failure is
-/// transient by construction: the writer closes, and the next attempt works.
-///
-/// Without this, image resolution fails outright on a host doing several
-/// things at once, which is the only kind of host it runs on.
+/// `regctl` is staged and renamed into place by the dependency installer, so
+/// it is one of the binaries most exposed to the race described in
+/// [`crate::spawn_retry`]. Without this, image resolution fails outright on a
+/// host doing several things at once, which is the only kind of host it runs
+/// on. Async, and so its own loop rather than the shared one: the wait must
+/// not block the runtime thread.
 pub(crate) async fn regctl_output(
     binary: &Path,
     build: impl Fn(&mut Command),
@@ -810,11 +802,11 @@ pub(crate) async fn regctl_output(
         build(&mut command);
         match command.output().await {
             Err(error)
-                if error.raw_os_error() == Some(nix::libc::ETXTBSY)
-                    && attempt < REGCTL_SPAWN_RETRY_ATTEMPTS =>
+                if crate::spawn_retry::is_text_file_busy(&error)
+                    && attempt < crate::spawn_retry::SPAWN_RETRY_ATTEMPTS =>
             {
                 tracing::debug!(attempt, "regctl was busy being written; retrying the spawn");
-                tokio::time::sleep(REGCTL_SPAWN_RETRY_DELAY).await;
+                tokio::time::sleep(crate::spawn_retry::SPAWN_RETRY_DELAY).await;
                 attempt += 1;
             }
             other => return other,
