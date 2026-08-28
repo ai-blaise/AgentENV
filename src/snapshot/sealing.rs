@@ -270,7 +270,12 @@ pub fn open(
     let cipher = new_cipher(key, scope, &salt);
     let chunk_count = chunk_count(plaintext_len, chunk_size);
 
-    let mut buffer = vec![0_u8; chunk_size as usize + TAG_LEN];
+    // Sized by what this artifact actually needs, not by what its chunk size
+    // permits. The MAX_CHUNK_SIZE guard bounds the worst case, but a small
+    // artifact declaring a large chunk size should not allocate for a chunk it
+    // will never read — and the header is still unauthenticated here.
+    let widest_chunk = plaintext_len.min(chunk_size as u64) as usize;
+    let mut buffer = vec![0_u8; widest_chunk + TAG_LEN];
     let mut produced = 0_u64;
     for index in 0..chunk_count {
         let remaining = plaintext_len - produced;
@@ -421,9 +426,26 @@ pub fn open_path(
 ) -> Result<u64> {
     let mut sealed = fs::File::open(source)
         .with_context(|| format!("open sealed artifact {}", source.display()))?;
-    let mut plaintext = fs::File::create(destination)
-        .with_context(|| format!("create artifact {}", destination.display()))?;
-    open(key, scope, &mut sealed, &mut plaintext)
+
+    // Staged and renamed, never written in place. `open` streams verified
+    // chunks as it goes, so writing straight to the destination would leave a
+    // byte-exact prefix of the plaintext there on every failure — a truncated
+    // memory image at the path an artifact cache treats as a hit, served to
+    // every later reader as if it were whole.
+    let directory = destination.parent().unwrap_or_else(|| Path::new("."));
+    let staged = tempfile::NamedTempFile::new_in(directory)
+        .with_context(|| format!("stage artifact in {}", directory.display()))?;
+
+    let written = {
+        let mut plaintext = staged.as_file();
+        open(key, scope, &mut sealed, &mut plaintext)?
+    };
+
+    staged
+        .persist(destination)
+        .map_err(|error| error.error)
+        .with_context(|| format!("publish artifact {}", destination.display()))?;
+    Ok(written)
 }
 
 /// Seals a small in-memory artifact.
@@ -699,10 +721,14 @@ mod tests {
         );
     }
 
-    /// A hostile header must not make the reader allocate before it has
-    /// verified anything.
+    /// A hostile chunk size must be refused by the bound rather than acted on.
+    ///
+    /// Deliberately not named for "no allocation before verification": the
+    /// reader does allocate before any tag is checked, for every size the
+    /// guard admits. What the guard provides is a ceiling on that allocation,
+    /// which is a weaker and more honest claim.
     #[test]
-    fn an_absurd_chunk_size_is_refused_before_allocating() {
+    fn a_chunk_size_outside_the_accepted_range_is_refused() {
         let mut sealed = seal_bytes(&key(), &scope(), b"guest memory");
         sealed[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
         let error = open_bytes(&key(), &scope(), &sealed).expect_err("absurd chunk size");
@@ -1021,6 +1047,76 @@ mod construction_tests {
         assert!(
             error.to_string().contains("limit"),
             "one byte past the maximum must be refused by the bound: {error}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    fn key() -> ArtifactSealingKey {
+        ArtifactSealingKey::from_bytes(vec![7_u8; KEY_LEN]).expect("key")
+    }
+
+    fn scope() -> SealScope<'static> {
+        SealScope::new("snap-1", "vm_state.bin")
+    }
+
+    /// A failed open must leave nothing at the destination. `open` streams
+    /// verified chunks as it goes, so writing in place left a byte-exact
+    /// prefix of the plaintext on every failure — and the artifact cache
+    /// treats any file at that path as a hit, so a truncated memory image
+    /// would be served to every later reader as if it were whole.
+    #[test]
+    fn a_failed_open_leaves_no_file_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plain = dir.path().join("vm_state.bin");
+        let sealed = dir.path().join("vm_state.sealed");
+        let destination = dir.path().join("vm_state.out");
+
+        // Two chunks, so the first verifies and lands in the stream before the
+        // second fails — the case that actually produced a partial file.
+        let contents = vec![4_u8; DEFAULT_CHUNK_SIZE as usize * 2];
+        std::fs::write(&plain, &contents).expect("write");
+        seal_path(&key(), &scope(), &plain, &sealed).expect("seal");
+
+        let mut bytes = std::fs::read(&sealed).expect("read");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&sealed, &bytes).expect("rewrite");
+
+        open_path(&key(), &scope(), &sealed, &destination)
+            .expect_err("a corrupted final chunk must fail the open");
+        assert!(
+            !destination.exists(),
+            "a failed open must leave nothing at the destination, found {} bytes",
+            std::fs::metadata(&destination)
+                .map(|m| m.len())
+                .unwrap_or(0)
+        );
+
+        // And the staging file must not be left lying beside it either.
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with("vm_state."))
+            .collect();
+        assert!(strays.is_empty(), "staging left behind: {strays:?}");
+    }
+
+    /// A small artifact must not allocate for a chunk size it will never read,
+    /// even though the header is still unauthenticated at that point.
+    #[test]
+    fn a_small_artifact_does_not_allocate_for_its_declared_chunk_size() {
+        let plaintext = b"small";
+        let sealed = seal_slice(&key(), &scope(), plaintext).expect("seal");
+        // The header declares the full default chunk size; the artifact is
+        // five bytes. Opening must succeed without depending on that size.
+        assert_eq!(
+            open_slice(&key(), &scope(), &sealed).expect("open"),
+            plaintext
         );
     }
 }

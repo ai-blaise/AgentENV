@@ -145,6 +145,62 @@ attached to the change it explains. Re-run the conformance harness and the
 version-skew matrix after every rebase: both exist to catch a behaviour that
 was quietly restored.
 
+## Known findings not yet fixed
+
+A verification campaign — supply-chain scanning, fuzzing, mutation testing,
+Miri, TLA+ model checking and adversarial review — ran over this branch. Most
+of what it found is fixed and covered by tests. These are the ones that are
+not, recorded with enough detail to act on rather than rediscover.
+
+**The pre-authentication memory bound for P2P artifacts is not where the code
+says it is.** `sealing::MAX_CHUNK_SIZE` bounds the parser's buffer, but the
+transport has already materialised the whole peer-supplied blob before the
+parser sees it: `src/p2p/iroh/transport.rs` `download_blob` is bounded only by
+`fetch_timeout_ms`, and `read_local_blob_bytes` then reads it into memory. A
+byte cap belongs there, checked against the blob's stored size before the
+read. Only reachable with P2P enabled, which is off by default.
+
+**A store error while committing a handover leaves the guest live with no
+rollback.** `MigrationSaga` handles `complete()` returning `Ok(false)` but
+propagates `Err` with `?`, after the destination's guest is already running.
+
+**A lease renewal that hangs never times out.** The guardian's abandon
+deadline is only evaluated after `renew()` returns, so a renewal that never
+completes means the holder is never told it lost the lease. It needs a
+`tokio::time::timeout` around the renewal, not only a deadline after it.
+
+**`forget` is an unconditional delete.** It erases an `Evacuated` tombstone and
+can drop a claim another node was just granted. It needs the same
+compare-and-set as the rest of the protocol.
+
+**The resume fence takes a claim that only the success path returns.** Every
+failure between taking it and launching leaves the record `Claimed` until the
+lease expires.
+
+**The drain's per-move timeout cancels the saga from outside**, bypassing the
+compensation paths it is careful to run itself.
+
+**The snapshot rootfs delta is still published to the mesh unsealed.** The
+rationale for keeping rootfs layers — that they are registry-shaped content —
+does not hold for the delta a snapshot adds, which is every guest write to `/`.
+That is the same data class the memory and attached-drive layers were dropped
+for.
+
+**Per-node maps are unbounded under churn.** `rosterCache`, `eventLossTracker`
+and `ReservationLedger` are pruned only by `UnregisterNode`, the graceful path.
+
+**The scheduler caches a roster under a digest it never verifies**, so a single
+inconsistent heartbeat poisons the cache for every later elided one.
+
+**The elision safety rule is weaker than documented.** The claim that a node
+keeps sending its full roster until a scheduler says it understands digests is
+not quite what the code implements; TLC found a trace where a node keeps
+eliding to a scheduler that never acknowledged. Liveness itself holds.
+
+**`resolveRoster`'s safety argument cites a TTL/heartbeat-interval validation
+that does not exist.** The comment claims the registry validates the ordering
+against the node's reported interval; nothing does.
+
 ## What is not covered
 
 Deliberate gaps, so nobody plans around them:
