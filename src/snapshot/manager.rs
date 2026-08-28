@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -15,22 +14,10 @@ use crate::snapshot::repository::backends::build_snapshot_backend;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 use crate::snapshot::repository::{RepositoryError, SnapshotListFilter};
 use crate::snapshot::sealing::{global_snapshot_sealing, SnapshotSealing};
-use crate::snapshot::{
-    OverlaybdLayerRef, RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
-};
+use crate::snapshot::{RunnableSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord};
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
 const SNAPSHOT_P2P_PUBLISH_CONCURRENCY: usize = 8;
-
-fn managed_layer_uuids(layers: &[OverlaybdLayerRef]) -> HashSet<String> {
-    layers
-        .iter()
-        .filter_map(|layer| match layer {
-            OverlaybdLayerRef::Managed(managed) => managed.uuid.clone(),
-            OverlaybdLayerRef::External(_) => None,
-        })
-        .collect()
-}
 
 #[derive(Clone)]
 /// Coordinates committed snapshot lifecycle operations over repository-backed state.
@@ -134,9 +121,11 @@ impl SnapshotManager {
             return;
         };
         let snapshot_id = &record.id;
-        let Some(committed) = record.committed.as_ref() else {
+        // Nothing is advertised for a snapshot that never committed: the
+        // layers it names may still be moving underneath it.
+        if record.committed.is_none() {
             return;
-        };
+        }
 
         let mut artifacts = Vec::new();
 
@@ -165,21 +154,20 @@ impl SnapshotManager {
             );
         }
 
-        // Rootfs layers are the only layers with a P2P consumer: the overlaybd
-        // facade resolves them by registry origin, so what it serves is content
-        // that is also a registry blob.
+        // Registry-origin rootfs layers are the only layers with a P2P
+        // consumer: the overlaybd facade resolves them by registry origin, so
+        // what it serves is content that is also a registry blob.
         //
-        // Memory layers and attached-drive layers are deliberately not
-        // advertised. They are guest RAM and guest disk writes, they are
+        // Everything else the snapshot is made of stays on the node — the
+        // memory layers, the attached-drive layers, and the rootfs delta the
+        // guest itself wrote. All three are guest data, all three are
         // materialized from the repository rather than from P2P, and the
-        // facade never looks them up — so publishing them exposed the most
-        // sensitive bytes on the node to anyone in the mesh in exchange for
-        // nothing. Advertising them again requires a fetch path that opens a
-        // sealed envelope, which the range-read facade does not have.
-        let rootfs_uuids = managed_layer_uuids(&committed.rootfs_layers);
+        // facade never looks any of them up, so advertising them exposed the
+        // most sensitive bytes on the node to anyone in the mesh in exchange
+        // for nothing. Advertising them again requires a fetch path that opens
+        // a sealed envelope, which the range-read facade does not have.
         artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
             &manifest.rootfs.image_config_path,
-            &rootfs_uuids,
         ));
 
         if artifacts.is_empty() {

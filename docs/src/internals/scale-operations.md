@@ -72,6 +72,13 @@ manifest naming every layer it is built from — are not advertised to peers.
 Resolution falls back to the repository, which costs bandwidth and nothing
 else.
 
+Sealed or not, the only snapshot layers that reach the mesh are the ones that
+came from a registry, identified by the digest of the same bytes any peer
+could already pull. The guest's own data never does: not the memory layers,
+not the attached drives, and not the rootfs delta — every write the guest made
+to `/`. All three are served from the repository, and none of them has a read
+path that would consume a peer copy.
+
 Turning it on means provisioning **the same** 32-byte secret on every node
 that may resolve a snapshot:
 
@@ -176,12 +183,6 @@ read. Only reachable with P2P enabled, which is off by default.
 
 **The drain's per-move timeout cancels the saga from outside**, bypassing the
 compensation paths it is careful to run itself.
-
-**The snapshot rootfs delta is still published to the mesh unsealed.** The
-rationale for keeping rootfs layers — that they are registry-shaped content —
-does not hold for the delta a snapshot adds, which is every guest write to `/`.
-That is the same data class the memory and attached-drive layers were dropped
-for.
 
 **The scheduler caches a roster under a digest it never verifies**, so a single
 inconsistent heartbeat poisons the cache for every later elided one.

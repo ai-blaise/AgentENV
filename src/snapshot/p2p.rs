@@ -1,17 +1,14 @@
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use overlaybd::config::load_image_config as load_overlaybd_image_config;
-use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
 use tracing::{debug, warn};
-use uuid::Uuid;
 
 use bytes::Bytes;
 use tempfile::NamedTempFile;
 
-use crate::overlaybd::{layer_key_from_digest, layer_key_from_uuid, LayerMetadata};
+use crate::overlaybd::{layer_key_from_digest, LayerMetadata};
 use crate::p2p::{
     P2pArtifactKey, P2pPublishMode, P2pPublishRequest, P2pPublishSource, P2pTransport,
 };
@@ -102,22 +99,21 @@ impl SnapshotP2pArtifact {
         }
     }
 
-    pub(crate) fn uuid_overlaybd_layer(source: impl Into<PathBuf>, uuid: Uuid, size: u64) -> Self {
-        let key = layer_key_from_uuid(&uuid);
-        let metadata = LayerMetadata::from_uuid(uuid, Some(size)).to_value();
-        Self {
-            key,
-            source: P2pPublishSource::Path(source.into()),
-            publish_mode: P2pPublishMode::Copy,
-            metadata,
-            seal_scope: None,
-        }
-    }
-
-    pub(crate) fn local_overlaybd_layers(
-        image_config_path: &Path,
-        committed_uuids: &HashSet<String>,
-    ) -> Vec<Self> {
+    /// The layers of a snapshot's rootfs that may be advertised to peers.
+    ///
+    /// Only the content-addressed ones. A layer with a digest and a size came
+    /// from a registry, so the mesh is serving a copy of a blob any peer could
+    /// already pull, keyed by the digest of that same plaintext.
+    ///
+    /// The snapshot's own layer is a different thing wearing the same shape.
+    /// It is the delta the guest wrote to `/`, keyed by a local uuid because
+    /// no registry ever saw it, and it cannot be read back by anything: the
+    /// facade does have a uuid route, but only its registry-origin address is
+    /// patched into a generated overlaybd config, so no read ever arrives
+    /// there. Advertising it put the guest's filesystem in front of the whole
+    /// mesh, unsealed, in exchange for a lookup that cannot happen — the same
+    /// trade that memory and attached-drive layers are already kept out of.
+    pub(crate) fn local_overlaybd_layers(image_config_path: &Path) -> Vec<Self> {
         let image_config = match load_overlaybd_image_config(image_config_path) {
             Ok(image_config) => image_config,
             Err(error) => {
@@ -146,50 +142,6 @@ impl SnapshotP2pArtifact {
                         layer.size,
                     ));
                 }
-                if committed_uuids.is_empty() {
-                    return artifacts;
-                }
-                let path = PathBuf::from(&layer.file);
-                let uuid = match read_overlaybd_layer_uuid(&path) {
-                    Ok(uuid) if !uuid.is_nil() => uuid,
-                    Ok(_) => {
-                        warn!(
-                            path = %path.display(),
-                            "skipping snapshot P2P layer publication because overlaybd layer uuid is nil"
-                        );
-                        return artifacts;
-                    }
-                    Err(error) => {
-                        warn!(
-                            path = %path.display(),
-                            error = %error,
-                            "skipping snapshot P2P layer publication because overlaybd layer uuid could not be read"
-                        );
-                        return artifacts;
-                    }
-                };
-                if !committed_uuids.contains(&uuid.to_string()) {
-                    return artifacts;
-                }
-                let size = match std::fs::metadata(&path) {
-                    Ok(metadata) if metadata.is_file() => metadata.len(),
-                    Ok(_) => {
-                        warn!(
-                            path = %path.display(),
-                            "skipping snapshot P2P layer publication because path is not a regular file"
-                        );
-                        return artifacts;
-                    }
-                    Err(error) => {
-                        warn!(
-                            path = %path.display(),
-                            error = %error,
-                            "skipping snapshot P2P layer publication because layer size could not be read"
-                        );
-                        return artifacts;
-                    }
-                };
-                artifacts.push(Self::uuid_overlaybd_layer(path, uuid, size));
                 artifacts
             })
             .collect()
@@ -393,6 +345,7 @@ mod tests {
     use overlaybd::index_file::{create_file_rw, LayerInfo};
     use overlaybd::virtual_file::VirtualFile;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     async fn write_sealed_layer(path: &Path, uuid: Uuid) {
         let index_path = path.with_extension("index");
@@ -407,7 +360,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_overlaybd_layers_publish_only_digest_layers_without_committed_uuid() {
+    async fn local_overlaybd_layers_publish_only_digest_layers() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let descriptorless = temp.path().join("snapshot.commit");
         let described = temp.path().join("described.commit");
@@ -439,8 +392,7 @@ mod tests {
         )
         .expect("write image config");
 
-        let artifacts =
-            SnapshotP2pArtifact::local_overlaybd_layers(&image_config_path, &HashSet::new());
+        let artifacts = SnapshotP2pArtifact::local_overlaybd_layers(&image_config_path);
 
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].publish_mode, P2pPublishMode::Copy);
@@ -450,28 +402,33 @@ mod tests {
         );
     }
 
+    /// The snapshot's own layer is the guest's writes to `/`, and it is not
+    /// advertised however it is reached: no digest to key it by, no consumer
+    /// that would look it up, and no envelope on the wire if one did.
     #[tokio::test]
-    async fn local_overlaybd_layers_publishes_uuid_alongside_digest_layers() {
+    async fn local_overlaybd_layers_never_advertise_the_snapshot_delta() {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let committed_layer_path = temp.path().join("snapshot.commit");
-        let skipped_layer_path = temp.path().join("skipped.commit");
-        let committed_uuid = Uuid::parse_str("22222222-3333-4444-5555-666666666666").unwrap();
-        let skipped_uuid = Uuid::parse_str("33333333-4444-5555-6666-777777777777").unwrap();
-        write_sealed_layer(&committed_layer_path, committed_uuid).await;
-        write_sealed_layer(&skipped_layer_path, skipped_uuid).await;
-        let committed_descriptor = crate::digest::FileDigest::describe(&committed_layer_path)
+        let registry_layer_path = temp.path().join("registry.commit");
+        let delta_layer_path = temp.path().join("snapshot.commit");
+        let registry_uuid = Uuid::parse_str("22222222-3333-4444-5555-666666666666").unwrap();
+        let delta_uuid = Uuid::parse_str("33333333-4444-5555-6666-777777777777").unwrap();
+        write_sealed_layer(&registry_layer_path, registry_uuid).await;
+        write_sealed_layer(&delta_layer_path, delta_uuid).await;
+        let registry_descriptor = crate::digest::FileDigest::describe(&registry_layer_path)
             .await
-            .expect("describe committed layer");
+            .expect("describe registry layer");
         let image_config = ImageConfig {
             lowers: vec![
                 LayerConfig {
-                    file: committed_layer_path.display().to_string(),
-                    digest: committed_descriptor.sha256.clone(),
-                    size: committed_descriptor.size,
+                    file: registry_layer_path.display().to_string(),
+                    digest: registry_descriptor.sha256.clone(),
+                    size: registry_descriptor.size,
                     ..Default::default()
                 },
+                // The snapshot's own commit: a real layer on disk, with no
+                // digest because nothing published it anywhere.
                 LayerConfig {
-                    file: skipped_layer_path.display().to_string(),
+                    file: delta_layer_path.display().to_string(),
                     ..Default::default()
                 },
             ],
@@ -483,16 +440,24 @@ mod tests {
             serde_json::to_vec(&image_config).expect("serialize image config"),
         )
         .expect("write image config");
-        let committed_uuids = HashSet::from([committed_uuid.to_string()]);
 
-        let artifacts =
-            SnapshotP2pArtifact::local_overlaybd_layers(&image_config_path, &committed_uuids);
+        let artifacts = SnapshotP2pArtifact::local_overlaybd_layers(&image_config_path);
 
-        assert_eq!(artifacts.len(), 2);
-        assert!(artifacts
-            .iter()
-            .any(|artifact| artifact.key == layer_key_from_digest(&committed_descriptor.sha256)));
-        assert!(artifacts.iter().any(|artifact| artifact.key
-            == "overlaybd-layer/v1/uuid/22222222-3333-4444-5555-666666666666"));
+        assert_eq!(
+            artifacts.len(),
+            1,
+            "only the registry-origin layer may be advertised, got {:?}",
+            artifacts.iter().map(|a| &a.key).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            artifacts[0].key,
+            layer_key_from_digest(&registry_descriptor.sha256)
+        );
+        assert!(
+            !artifacts
+                .iter()
+                .any(|artifact| artifact.key.contains("/uuid/")),
+            "a layer keyed by a local uuid is the guest's own delta and must not leave the node"
+        );
     }
 }

@@ -9,7 +9,7 @@ use tracing::{info, warn};
 use crate::{
     cfg::AppConfig, image::cache::local_image_services_from_app_config, p2p::P2pTransport,
 };
-pub(crate) use artifact::{layer_key_from_digest, layer_key_from_uuid, LayerMetadata};
+pub(crate) use artifact::{layer_key_from_digest, LayerMetadata};
 use facade::{start_http_facade_with_config, P2pHttpFacadeConfig, P2pHttpFacadeHandle};
 pub(crate) use publish_sink::global_layer_publish_sink;
 use publish_sink::{set_global_layer_publish_sink, TransportLayerPublishSink};

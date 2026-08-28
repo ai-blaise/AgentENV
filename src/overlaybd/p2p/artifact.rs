@@ -127,10 +127,6 @@ pub(crate) fn layer_key_from_digest(digest: &str) -> P2pArtifactKey {
     layer_artifact_key(&CanonicalBlobIdentity::from_digest(digest))
 }
 
-pub(crate) fn layer_key_from_uuid(uuid: &Uuid) -> P2pArtifactKey {
-    layer_artifact_key(&CanonicalBlobIdentity::from_uuid(uuid))
-}
-
 pub(super) fn layer_artifact_key(canonical: &CanonicalBlobIdentity) -> P2pArtifactKey {
     if let Some(uuid) = canonical.key.strip_prefix("uuid/") {
         return format!("{KEY_PREFIX}/uuid/{uuid}");
@@ -209,7 +205,7 @@ mod tests {
     fn uuid_key_does_not_overlap_digest_key() {
         let uuid = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
         assert_eq!(
-            layer_key_from_uuid(&uuid),
+            layer_artifact_key(&CanonicalBlobIdentity::from_uuid(&uuid)),
             "overlaybd-layer/v1/uuid/11111111-2222-3333-4444-555555555555"
         );
         assert_eq!(
