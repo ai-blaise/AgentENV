@@ -1,0 +1,95 @@
+# Supply-chain policy.
+#
+# There was none before this: no deny.toml, no audit config, no dependabot or
+# renovate, and no CI job running any advisory check across thirteen
+# workflows. An 847-crate graph with one git dependency and no gate means a
+# new advisory lands silently and stays.
+#
+# Run locally with:
+#   cargo deny check
+#   cargo audit
+
+[graph]
+all-features = false
+
+[advisories]
+version = 2
+yanked = "warn"
+# An unmaintained crate is a maintenance risk, not a vulnerability, and this
+# graph carries several unmaintained build-time proc-macro crates that no
+# amount of local effort can move. Flag the ones this workspace depends on
+# directly, where a swap is actually within reach; ignore the transitive ones
+# rather than pretend a permanently red gate is a gate.
+unmaintained = "workspace"
+ignore = [
+  # Every entry needs a reachability finding, not just an id. "Unreachable" is
+  # not "harmless": re-check each on every rebase, and delete the entry the
+  # moment the dependency can move.
+
+  { id = "RUSTSEC-2026-0190", reason = "anyhow Error::downcast_mut unsoundness. `downcast_mut` has zero occurrences anywhere in the workspace, so the unsound API is never called" },
+
+  { id = "RUSTSEC-2025-0111", reason = "tokio-tar PAX header smuggling. Archived crate, no fixed version exists. Enters only via testcontainers -> agentenv-test-support, a dev-dependency that is never linked into a shipped binary" },
+
+  # The object-storage stack pins older majors of hyper/rustls/quick-xml. All
+  # three need a semver-major bump of opendal (0.55 -> 0.58) or the AWS SDK,
+  # which changes API surface on the snapshot repository path and cannot be
+  # validated without a live object store. Tracked as debt rather than
+  # silently dropped.
+  { id = "RUSTSEC-2026-0194", reason = "quick-xml quadratic duplicate-attribute check. DoS on parsing hostile XML. Reachable only through opendal's S3 ListObjects/error parsing, i.e. responses from the configured object store, which is trusted infrastructure rather than user input. Fix requires opendal >= 0.58" },
+  { id = "RUSTSEC-2026-0195", reason = "quick-xml unbounded namespace-declaration allocation. Same reachability and same fix as RUSTSEC-2026-0194" },
+  { id = "RUSTSEC-2026-0258", reason = "h2 unbounded empty DATA frames. The affected 0.3.27 comes in under hyper 0.14 via aws-smithy-http-client; the version this code's own servers and clients use is 0.4.19, which is patched. Reachable only as an HTTP/2 *client* against the object store, never on an inbound listener" },
+  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki name constraints for URI names. Affected 0.101.7 arrives under rustls 0.21 via the AWS SDK; the version this code's own TLS uses is 0.103.15, which is patched" },
+  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki name constraints on non-CA certificates. Same provenance and same reasoning as RUSTSEC-2026-0098" },
+  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki reachable panic parsing a CRL. Same provenance as RUSTSEC-2026-0098, and no CRL is configured anywhere in this workspace, so the parsing path is never entered" },
+]
+
+[licenses]
+version = 2
+# The project is MIT. These are the licences its dependency graph actually
+# uses; anything new has to be added deliberately rather than discovered.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+  "CC0-1.0",
+  "CDLA-Permissive-2.0",
+  "MPL-2.0",
+]
+confidence-threshold = 0.9
+
+# The generated crates carry the project licence like everything else. If a
+# regeneration drops the field, this check is what notices — that is the point
+# of having it rather than an ignore.
+#
+# MPL-2.0 is file-level copyleft: it obliges anyone distributing a modified
+# version of those files to publish those files, and does not reach the rest of
+# the binary. Recorded here so the obligation is a decision rather than a
+# surprise found during a licence review.
+[[licenses.clarify]]
+crate = "attohttpc"
+expression = "MPL-2.0"
+license-files = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Path dependencies inside this workspace have no version requirement, which
+# cargo reads as a wildcard. That is how a workspace is meant to look; the
+# check is here for wildcards on published crates, which are a real hazard.
+allow-wildcard-paths = true
+# Duplicated majors are ordinary in a graph this size; the warning is there to
+# be read at rebase time, not to block a build.
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# The one non-crates.io source. A git dependency carries no crates.io checksum,
+# so the pinned commit is its only integrity anchor — which is why the rev in
+# Cargo.toml must stay pinned and must never become a branch.
+allow-git = ["https://github.com/ublk-org/libublk-rs.git"]

@@ -1,0 +1,78 @@
+name: Supply chain
+
+# Dependency advisories, licences and sources, for both languages.
+#
+# There was no such gate before: thirteen workflows and not one of them ran an
+# advisory check, so a new CVE in an 847-crate graph landed silently and
+# stayed. This runs on every change to a manifest or lockfile, and on a
+# schedule — because the interesting case is not "someone changed a
+# dependency", it is "an advisory was published against one we already have".
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "services/go.mod"
+      - "services/go.sum"
+      - ".github/workflows/supply-chain.yml"
+  push:
+    branches: [main, comp]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "services/go.mod"
+      - "services/go.sum"
+      - ".github/workflows/supply-chain.yml"
+  schedule:
+    # Weekly, so an advisory published against an unchanged dependency is
+    # still noticed.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+      - name: Licences, sources and bans
+        # deny.toml records which licences the graph may use and which sources
+        # it may come from. An addition has to be a deliberate edit.
+        run: cargo deny check licenses sources bans
+      - name: Advisories
+        # Separate step so an advisory failure is distinguishable at a glance
+        # from a licence or source failure — they need different responses.
+        #
+        # cargo-audit is deliberately not also run here. It reads the same
+        # RustSec database but not deny.toml, so it would report the advisories
+        # this policy has already assessed and recorded a reason for, and CI
+        # would be permanently red. One policy file, one gate.
+        run: cargo deny check advisories
+
+  go:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: services
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: services/go.mod
+          cache-dependency-path: |
+            services/go.sum
+            services/go.mod
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Reachable vulnerabilities
+        # Symbol-level: it reports only what this code actually calls, which
+        # is why its output is worth failing a build over.
+        run: govulncheck ./...

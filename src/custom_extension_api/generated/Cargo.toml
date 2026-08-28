@@ -6,6 +6,7 @@ description = "HTTP API implemented by the custom extension service configured v
 # Override this license by providing a License Object in the OpenAPI.
 license = "Unlicense"
 edition = "2021"
+publish = false
 
 [dependencies]
 serde = { version = "^1.0", features = ["derive"] }
