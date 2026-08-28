@@ -12,6 +12,7 @@ type Node struct {
 type RichNode struct {
 	Node
 	Snapshot *schedulerv1.NodeSnapshot // nil if no heartbeat received yet
+	Health   ObservedHealth
 }
 
 func (n Node) ToProto() *schedulerv1.Node {

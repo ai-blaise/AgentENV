@@ -23,6 +23,13 @@ type Service struct {
 	store         BindingStore
 	artifacts     ArtifactStore
 	resourceLimit *config.NodeResourceLimit
+	// reportTTL bounds how stale a node's last heartbeat may be before it stops
+	// being a placement candidate.
+	reportTTL time.Duration
+	// healthGateEnabled is the killswitch for health-gated placement. It
+	// defaults to on; disabling it restores the previous behavior of placing on
+	// any discovered node regardless of heartbeat age.
+	healthGateEnabled bool
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -33,11 +40,13 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		nodes = NewAtomicNodeRegistry(nil, defaultObservedReportTTL)
 	}
 	s := &Service{
-		logger:    logger,
-		nodes:     nodes,
-		strategy:  strategy,
-		store:     store,
-		artifacts: NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
+		logger:            logger,
+		nodes:             nodes,
+		strategy:          strategy,
+		reportTTL:         defaultObservedReportTTL,
+		healthGateEnabled: true,
+		store:             store,
+		artifacts:         NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -58,6 +67,25 @@ func WithNodeResourceLimit(limit *config.NodeResourceLimit) ServiceOption {
 func WithArtifactStore(store ArtifactStore) ServiceOption {
 	return func(s *Service) {
 		s.artifacts = store
+	}
+}
+
+// WithReportTTL sets how stale a node's last heartbeat may be before it stops
+// being a placement candidate. It should match the registry's observed TTL.
+func WithReportTTL(ttl time.Duration) ServiceOption {
+	return func(s *Service) {
+		if ttl > 0 {
+			s.reportTTL = ttl
+		}
+	}
+}
+
+// WithHealthGate toggles health-gated placement. Disabling it reproduces the
+// previous behavior exactly: every discovered node is a candidate, however
+// long ago it last heartbeated.
+func WithHealthGate(enabled bool) ServiceOption {
+	return func(s *Service) {
+		s.healthGateEnabled = enabled
 	}
 }
 
@@ -87,13 +115,25 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	discovered := s.nodes.Snapshot( /* allowLingering */ false)
 	rich := make([]RichNode, 0, len(discovered))
 	for _, n := range discovered {
+		snapshot, health := s.nodes.PeekObservedHealth(n.ID)
 		rich = append(rich, RichNode{
 			Node:     n,
-			Snapshot: s.nodes.PeekObserved(n.ID),
+			Snapshot: snapshot,
+			Health:   health,
 		})
 	}
 
-	eligible := FilterByResourceLimit(rich, s.resourceLimit)
+	// Health before resources: a node that is not heartbeating has no
+	// trustworthy resource numbers to evaluate in the first place.
+	eligible := rich
+	if s.healthGateEnabled {
+		var dropped map[HealthFilterReason]int
+		eligible, dropped = FilterByHealth(rich, s.reportTTL, time.Now())
+		for reason, count := range dropped {
+			recordSchedulerNodesFiltered(string(reason), count)
+		}
+	}
+	eligible = FilterByResourceLimit(eligible, s.resourceLimit)
 
 	node, selectErr := s.strategy.Select(eligible, req.GetHint())
 	if selectErr != nil {

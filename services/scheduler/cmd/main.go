@@ -76,6 +76,8 @@ func main() {
 				cfg.Scheduler.ArtifactLookupNodeLimit,
 			)),
 			scheduler.WithNodeResourceLimit(cfg.Scheduler.NodeResourceLimit),
+			scheduler.WithReportTTL(cfg.Scheduler.ReportTTL),
+			scheduler.WithHealthGate(cfg.Scheduler.HealthGateEnabled()),
 		)
 		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
 		schedulerv1.RegisterSchedulerServer(g, svc)

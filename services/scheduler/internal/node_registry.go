@@ -26,6 +26,9 @@ type NodeRegistry interface {
 	// and returns only the raw snapshot suitable for scheduling decisions.
 	// Returns nil if the node has never sent a heartbeat.
 	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
+	// PeekObservedHealth returns the same snapshot alongside the liveness facts
+	// scheduling needs to decide whether the node should receive new work.
+	PeekObservedHealth(nodeID string) (*schedulerv1.NodeSnapshot, ObservedHealth)
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
 }
 
@@ -194,8 +197,16 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 		}
 	}
 
-	if intersection, ok := r.cpuIntersection[clusterID]; ok && !r.intersectionSent[req.GetNodeId()] {
-		r.intersectionSent[req.GetNodeId()] = true
+	// Return the intersection on every heartbeat once it is computed, not only
+	// the first time. The scheduler holds the intersection in memory, so after
+	// a restart it can only be rebuilt from what nodes keep reporting; sending
+	// it once per node per scheduler process left a restarted scheduler unable
+	// to deliver it at all, and new sandboxes then booted with node-local CPU
+	// features. intersectionSent survives only to suppress repeat logging.
+	if intersection, ok := r.cpuIntersection[clusterID]; ok {
+		if !r.intersectionSent[req.GetNodeId()] {
+			r.intersectionSent[req.GetNodeId()] = true
+		}
 		return node, intersection, nil
 	}
 	return node, "", nil
@@ -332,17 +343,48 @@ func (r *AtomicNodeRegistry) GetObserved(nodeID string, clusterID string, now ti
 }
 
 func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapshot {
+	snapshot, _ := r.PeekObservedHealth(nodeID)
+	return snapshot
+}
+
+// ObservedHealth is what scheduling needs to know about a node's liveness, as
+// distinct from the capacity numbers in its snapshot.
+//
+// PeekObserved deliberately reports the last snapshot verbatim without applying
+// the report TTL, so a caller that only reads the snapshot cannot tell a node
+// that heartbeated a second ago from one that stopped hours ago. Placement must
+// be able to tell those apart.
+type ObservedHealth struct {
+	// Seen is false when the node has never heartbeated.
+	Seen bool
+	// LastSeenUnixMs is the scheduler's arrival timestamp for the most recent
+	// heartbeat. It is stamped by the scheduler, never by the node, so it is
+	// comparable against the scheduler's own clock.
+	LastSeenUnixMs int64
+	// Status is the node's self-reported status from that heartbeat.
+	Status schedulerv1.NodeStatus
+}
+
+// PeekObservedHealth returns the node's last snapshot together with the
+// liveness facts scheduling needs. The snapshot is nil when the node has never
+// heartbeated or reported no snapshot.
+func (r *AtomicNodeRegistry) PeekObservedHealth(nodeID string) (*schedulerv1.NodeSnapshot, ObservedHealth) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	record, ok := r.observed[nodeID]
 	if !ok || record.node == nil {
-		return nil
+		return nil, ObservedHealth{}
+	}
+	health := ObservedHealth{
+		Seen:           true,
+		LastSeenUnixMs: record.node.GetLastSeenUnixMs(),
+		Status:         record.node.GetSnapshot().GetStatus(),
 	}
 	snapshot := record.node.GetSnapshot()
 	if snapshot == nil {
-		return nil
+		return nil, health
 	}
-	return cloneSnapshot(snapshot)
+	return cloneSnapshot(snapshot), health
 }
 
 func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID string) error {

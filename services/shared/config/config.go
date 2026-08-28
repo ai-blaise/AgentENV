@@ -69,6 +69,17 @@ type SchedulerConfig struct {
 	Nodes                   []Node                   `json:"nodes"`
 	Discovery               SchedulerDiscoveryConfig `json:"discovery"`
 	NodeResourceLimit       *NodeResourceLimit       `json:"node_resource_limit"`
+	// ScheduleHealthGate excludes nodes whose last heartbeat is older than
+	// ReportTTL, or that report themselves unhealthy or draining, from
+	// placement. It defaults to enabled; set it to false to restore the
+	// previous behavior of placing on any discovered node.
+	ScheduleHealthGate *bool `json:"schedule_health_gate"`
+}
+
+// HealthGateEnabled reports whether health-gated placement is on, defaulting
+// to true when the key is absent.
+func (s *SchedulerConfig) HealthGateEnabled() bool {
+	return s.ScheduleHealthGate == nil || *s.ScheduleHealthGate
 }
 
 func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
@@ -84,6 +95,7 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		Nodes                   *[]Node                   `json:"nodes"`
 		Discovery               *SchedulerDiscoveryConfig `json:"discovery"`
 		NodeResourceLimit       *NodeResourceLimit        `json:"node_resource_limit"`
+		ScheduleHealthGate      *bool                     `json:"schedule_health_gate"`
 	}
 
 	parsed := wire{}
@@ -105,6 +117,9 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.Discovery != nil {
 		s.Discovery = *parsed.Discovery
+	}
+	if parsed.ScheduleHealthGate != nil {
+		s.ScheduleHealthGate = parsed.ScheduleHealthGate
 	}
 	if parsed.NodeResourceLimit != nil {
 		s.NodeResourceLimit = parsed.NodeResourceLimit

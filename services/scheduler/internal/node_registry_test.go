@@ -391,13 +391,14 @@ func TestHeartbeatDeliversIntersectionExactlyOncePerNode(t *testing.T) {
 		t.Fatal("node-a 2nd heartbeat: expected intersection, got empty")
 	}
 
-	// node-a third heartbeat: already delivered, must be empty.
-	if r := heartbeatWithConfig(t, registry, "node-a", "cluster-1", "svc-a", ""); r != "" {
-		t.Errorf("node-a 3rd heartbeat: intersection already sent, expected empty, got non-empty")
+	// Once computed, the intersection is returned on every heartbeat, not just
+	// the first. The scheduler holds it only in memory, so a restarted
+	// scheduler can rebuild and redeliver it from what nodes keep reporting.
+	if r := heartbeatWithConfig(t, registry, "node-a", "cluster-1", "svc-a", ""); r != resultA2 {
+		t.Errorf("node-a 3rd heartbeat: intersection must be redelivered, got %q", r)
 	}
-	// node-b second heartbeat: already delivered, must be empty.
-	if r := heartbeatWithConfig(t, registry, "node-b", "cluster-1", "svc-b", ""); r != "" {
-		t.Errorf("node-b 2nd heartbeat: intersection already sent, expected empty, got non-empty")
+	if r := heartbeatWithConfig(t, registry, "node-b", "cluster-1", "svc-b", ""); r != resultA2 {
+		t.Errorf("node-b 2nd heartbeat: intersection must be redelivered, got %q", r)
 	}
 
 	// Verify the intersection value is the bitwise AND of both configs.
@@ -474,16 +475,53 @@ func TestMultiClusterCpuIntersectionsAreIndependent(t *testing.T) {
 		t.Errorf("cluster-y eax: want %s, got %s", want, got)
 	}
 
-	// cluster-x nodes must not receive cluster-y's intersection and vice versa:
-	// subsequent heartbeats with no pending intersection must return empty.
-	if r := heartbeatWithConfig(t, registry, "x2", "cluster-x", "svc-x2", ""); r != "" {
-		var c cpuConfig
-		_ = json.Unmarshal([]byte(r), &c)
-		t.Errorf("cluster-x x2: got unexpected intersection %v", c)
+	// Redelivery stays scoped to the node's own cluster: cluster-x nodes keep
+	// receiving cluster-x's intersection and never cluster-y's.
+	if r := heartbeatWithConfig(t, registry, "x2", "cluster-x", "svc-x2", ""); r != resultX {
+		t.Errorf("cluster-x x2: want cluster-x intersection redelivered, got %q", r)
 	}
-	if r := heartbeatWithConfig(t, registry, "y1", "cluster-y", "svc-y1", ""); r != "" {
-		var c cpuConfig
-		_ = json.Unmarshal([]byte(r), &c)
-		t.Errorf("cluster-y y1: got unexpected second delivery %v", c)
+	if r := heartbeatWithConfig(t, registry, "y1", "cluster-y", "svc-y1", ""); r != resultY {
+		t.Errorf("cluster-y y1: want cluster-y intersection redelivered, got %q", r)
+	}
+}
+
+// TestIntersectionRecomputedByFreshRegistry is the scheduler-restart case. The
+// registry is in-memory, so a restarted scheduler starts with no observed
+// nodes and no intersection. It must be able to rebuild and deliver one from
+// the heartbeats that keep arriving; previously delivery was gated to once per
+// node per process, so a restarted scheduler could never deliver again and new
+// sandboxes booted with node-local CPU features.
+func TestIntersectionRecomputedByFreshRegistry(t *testing.T) {
+	nodes := []Node{
+		{ID: "node-a", Endpoint: "http://node-a"},
+		{ID: "node-b", Endpoint: "http://node-b"},
+	}
+	cfgA := buildConfig(nil, []cpuidModifier{{
+		Leaf: "0x1", Subleaf: "0x0", Flags: 0,
+		Modifiers: []registerMod{{Register: "eax", Bitmap: bm32(0xFF)}},
+	}}, nil)
+	cfgB := buildConfig(nil, []cpuidModifier{{
+		Leaf: "0x1", Subleaf: "0x0", Flags: 0,
+		Modifiers: []registerMod{{Register: "eax", Bitmap: bm32(0x0F)}},
+	}}, nil)
+
+	original := NewAtomicNodeRegistry(nodes, defaultObservedReportTTL)
+	heartbeatWithConfig(t, original, "node-a", "cluster-1", "svc-a", cfgA)
+	want := heartbeatWithConfig(t, original, "node-b", "cluster-1", "svc-b", cfgB)
+	if want == "" {
+		t.Fatal("original registry produced no intersection")
+	}
+
+	// A fresh registry stands in for a restarted scheduler process.
+	restarted := NewAtomicNodeRegistry(nodes, defaultObservedReportTTL)
+	heartbeatWithConfig(t, restarted, "node-a", "cluster-1", "svc-a", cfgA)
+	got := heartbeatWithConfig(t, restarted, "node-b", "cluster-1", "svc-b", cfgB)
+	if got != want {
+		t.Fatalf("restarted registry intersection = %q, want %q", got, want)
+	}
+
+	// And it keeps delivering on later heartbeats.
+	if again := heartbeatWithConfig(t, restarted, "node-a", "cluster-1", "svc-a", cfgA); again != want {
+		t.Fatalf("restarted registry stopped delivering: %q", again)
 	}
 }

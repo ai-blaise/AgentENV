@@ -1,6 +1,73 @@
 package scheduler
 
-import "agentenv/services/shared/config"
+import (
+	"time"
+
+	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/config"
+)
+
+// HealthFilterReason explains why FilterByHealth dropped a node. It is a closed
+// set so it is safe to use as a metric label.
+type HealthFilterReason string
+
+const (
+	HealthFilterReasonNeverSeen   HealthFilterReason = "never_seen"
+	HealthFilterReasonStale       HealthFilterReason = "stale"
+	HealthFilterReasonUnhealthy   HealthFilterReason = "unhealthy"
+	HealthFilterReasonTerminating HealthFilterReason = "terminating"
+)
+
+// FilterByHealth removes nodes that are not currently fit to receive new
+// sandboxes: never heartbeated, heartbeat older than reportTTL, or
+// self-reported as unhealthy or draining.
+//
+// Placement previously read the last snapshot verbatim and kept nodes with no
+// snapshot at all, so under static discovery a node that had been dead for
+// hours still took its share of every create.
+//
+// The filter fails *open* when it would otherwise reject every candidate. A
+// cluster-wide heartbeat stall — a scheduler restart, a network partition on
+// the scheduler side — is far more likely than every node in the fleet dying
+// at once, and refusing all placement in that case turns a recoverable blip
+// into a total outage. Partial staleness still fails closed, which is the case
+// this filter exists for. The returned reasons describe the dropped nodes even
+// when the fail-open path returns them all, so the decision is observable.
+func FilterByHealth(nodes []RichNode, reportTTL time.Duration, now time.Time) ([]RichNode, map[HealthFilterReason]int) {
+	if len(nodes) == 0 {
+		return nodes, nil
+	}
+
+	healthy := make([]RichNode, 0, len(nodes))
+	var dropped map[HealthFilterReason]int
+	drop := func(reason HealthFilterReason) {
+		if dropped == nil {
+			dropped = make(map[HealthFilterReason]int, 4)
+		}
+		dropped[reason]++
+	}
+
+	nowMs := now.UTC().UnixMilli()
+	for _, n := range nodes {
+		switch {
+		case !n.Health.Seen:
+			drop(HealthFilterReasonNeverSeen)
+		case reportTTL > 0 && nowMs-n.Health.LastSeenUnixMs > reportTTL.Milliseconds():
+			drop(HealthFilterReasonStale)
+		case n.Health.Status == schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY:
+			drop(HealthFilterReasonUnhealthy)
+		case n.Health.Status == schedulerv1.NodeStatus_NODE_STATUS_LINGERING:
+			drop(HealthFilterReasonTerminating)
+		default:
+			healthy = append(healthy, n)
+		}
+	}
+
+	if len(healthy) == 0 {
+		return nodes, dropped
+	}
+	return healthy, dropped
+}
 
 // FilterByResourceLimit removes nodes that exceed any configured resource
 // threshold. Nodes without a heartbeat snapshot are always kept (they have no

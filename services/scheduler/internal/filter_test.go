@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"testing"
+	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
 	"agentenv/services/shared/config"
@@ -209,4 +210,103 @@ func TestFilterIncludingPausedExcludesNodeWithinActiveLimits(t *testing.T) {
 	if len(result) != 1 || result[0].ID != "ok" {
 		t.Fatalf("expected [ok], got %v", result)
 	}
+}
+
+func healthyNode(id string, lastSeen time.Time) RichNode {
+	return RichNode{
+		Node: Node{ID: id, Endpoint: "http://" + id},
+		Health: ObservedHealth{
+			Seen:           true,
+			LastSeenUnixMs: lastSeen.UTC().UnixMilli(),
+			Status:         schedulerv1.NodeStatus_NODE_STATUS_READY,
+		},
+	}
+}
+
+func TestFilterByHealthDropsStaleNode(t *testing.T) {
+	now := time.Now()
+	fresh := healthyNode("fresh", now)
+	stale := healthyNode("stale", now.Add(-5*time.Minute))
+
+	got, dropped := FilterByHealth([]RichNode{fresh, stale}, 30*time.Second, now)
+
+	if len(got) != 1 || got[0].ID != "fresh" {
+		t.Fatalf("FilterByHealth kept %v, want only the fresh node", nodeIDsOf(got))
+	}
+	if dropped[HealthFilterReasonStale] != 1 {
+		t.Fatalf("dropped = %v, want one stale", dropped)
+	}
+}
+
+func TestFilterByHealthDropsNeverSeenAndUnhealthyAndDraining(t *testing.T) {
+	now := time.Now()
+	fresh := healthyNode("fresh", now)
+
+	neverSeen := RichNode{Node: Node{ID: "never", Endpoint: "http://never"}}
+
+	unhealthy := healthyNode("unhealthy", now)
+	unhealthy.Health.Status = schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY
+
+	draining := healthyNode("draining", now)
+	draining.Health.Status = schedulerv1.NodeStatus_NODE_STATUS_LINGERING
+
+	got, dropped := FilterByHealth([]RichNode{fresh, neverSeen, unhealthy, draining}, 30*time.Second, now)
+
+	if len(got) != 1 || got[0].ID != "fresh" {
+		t.Fatalf("FilterByHealth kept %v, want only the fresh node", nodeIDsOf(got))
+	}
+	for _, reason := range []HealthFilterReason{
+		HealthFilterReasonNeverSeen,
+		HealthFilterReasonUnhealthy,
+		HealthFilterReasonTerminating,
+	} {
+		if dropped[reason] != 1 {
+			t.Fatalf("dropped[%s] = %d, want 1 (all: %v)", reason, dropped[reason], dropped)
+		}
+	}
+}
+
+// TestFilterByHealthFailsOpenWhenEveryNodeIsStale pins the deliberate
+// asymmetry: a fleet-wide heartbeat stall is far more likely to be a scheduler
+// problem than every node dying at once, so refusing all placement would turn
+// a recoverable blip into a total outage. Partial staleness still fails closed.
+func TestFilterByHealthFailsOpenWhenEveryNodeIsStale(t *testing.T) {
+	now := time.Now()
+	nodes := []RichNode{
+		healthyNode("a", now.Add(-5*time.Minute)),
+		healthyNode("b", now.Add(-6*time.Minute)),
+	}
+
+	got, dropped := FilterByHealth(nodes, 30*time.Second, now)
+
+	if len(got) != 2 {
+		t.Fatalf("FilterByHealth kept %v, want fail-open with both nodes", nodeIDsOf(got))
+	}
+	// The drop reasons are still reported so the fail-open path is observable
+	// rather than looking identical to a healthy fleet.
+	if dropped[HealthFilterReasonStale] != 2 {
+		t.Fatalf("dropped = %v, want both reported stale", dropped)
+	}
+}
+
+func TestFilterByHealthDisabledTTLKeepsEverything(t *testing.T) {
+	now := time.Now()
+	nodes := []RichNode{healthyNode("a", now.Add(-time.Hour))}
+
+	got, dropped := FilterByHealth(nodes, 0, now)
+
+	if len(got) != 1 {
+		t.Fatalf("FilterByHealth kept %v, want the node when TTL is disabled", nodeIDsOf(got))
+	}
+	if len(dropped) != 0 {
+		t.Fatalf("dropped = %v, want none", dropped)
+	}
+}
+
+func nodeIDsOf(nodes []RichNode) []string {
+	ids := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		ids = append(ids, n.ID)
+	}
+	return ids
 }

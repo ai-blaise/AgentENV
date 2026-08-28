@@ -22,6 +22,13 @@ var (
 		},
 		[]string{"rpc", "status"},
 	)
+	schedulerNodesFilteredTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_nodes_filtered_total",
+			Help: "Placement candidates dropped by the health gate, by reason.",
+		},
+		[]string{"reason"},
+	)
 	schedulerScheduleDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "agentenv_scheduler_schedule_duration_seconds",
@@ -138,4 +145,15 @@ func schedulerNodeStatusLabel(status schedulerv1.NodeStatus) string {
 	default:
 		return "unspecified"
 	}
+}
+
+// recordSchedulerNodesFiltered counts placement candidates dropped by the
+// health gate, by reason. Without this the fail-open path is invisible: a
+// cluster-wide stall and a healthy fleet both look like "everything was
+// eligible".
+func recordSchedulerNodesFiltered(reason string, count int) {
+	if count <= 0 {
+		return
+	}
+	schedulerNodesFilteredTotal.WithLabelValues(reason).Add(float64(count))
 }
