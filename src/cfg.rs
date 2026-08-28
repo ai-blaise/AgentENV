@@ -195,6 +195,34 @@ pub struct PoolTomlConfig {
     pub firecracker: FirecrackerProcessPoolConfig,
 }
 
+/// Node-local admission thresholds.
+///
+/// Every limit defaults to unset, so the gate ships inert: enabling it is an
+/// explicit operator decision, and a mis-tuned limit turns available capacity
+/// into rejections. Field names mirror the scheduler's NodeResourceLimit where
+/// the two express the same ceiling, so one operator number can set both sides.
+#[derive(Debug, Config, Clone)]
+pub struct AdmissionConfig {
+    #[config(default = false)]
+    pub enabled: bool,
+    pub max_sandbox_count: Option<u32>,
+    pub max_sandbox_starting_count: Option<u32>,
+    pub max_allocated_cpu: Option<u32>,
+    pub max_allocated_memory_bytes: Option<u64>,
+    pub max_sandbox_count_including_paused: Option<u32>,
+    /// Refuse a create when fewer than this many network slots would remain.
+    pub min_free_network_slots: Option<u32>,
+    /// Retry-After seconds returned with a rejection.
+    #[config(default = 2u64)]
+    pub retry_after_secs: u64,
+    /// How long a node-metrics reading may be reused across admission
+    /// decisions. Collecting metrics walks every sandbox under the store's read
+    /// lock, so re-reading per decision would make the gate the bottleneck
+    /// under exactly the burst it exists to survive.
+    #[config(default = 200u64)]
+    pub snapshot_max_age_ms: u64,
+}
+
 #[derive(Debug, Config, Clone)]
 pub struct PoolComponentConfig {
     #[config(default = true)]
@@ -569,6 +597,8 @@ pub struct OrchestratorConfig {
         parse_env = parse_required_path
     )]
     pub persisted_sandbox_store_path: PathBuf,
+    #[config(nested)]
+    pub admission: AdmissionConfig,
 }
 
 /// Custom extension service integration.

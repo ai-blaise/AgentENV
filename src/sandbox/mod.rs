@@ -40,6 +40,21 @@ pub use network::{
     ALL_INTERNET_TRAFFIC_CIDR,
 };
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
+
+/// Current network slot capacity, as admission control reads it.
+///
+/// Returns zeroed capacity when networking has not been initialized, so
+/// querying it never forces the global manager into existence as a side effect
+/// of an admission decision.
+pub(crate) fn network_slot_capacity() -> network::NetworkSlotCapacity {
+    network::NetworkManager::global_if_initialized()
+        .map(|manager| manager.slot_capacity())
+        .unwrap_or(network::NetworkSlotCapacity {
+            total: 0,
+            allocated: 0,
+            pooled: 0,
+        })
+}
 pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
 
 #[derive(Clone, Debug)]

@@ -114,6 +114,19 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         sandbox_event_tx,
         default_sandbox_timeout: Duration::from_secs(15),
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
+        // Test orchestrators run with admission disabled; the controller has
+        // its own unit tests and gating here would only add setup noise.
+        admission: crate::orchestrator::AdmissionController::new(crate::cfg::AdmissionConfig {
+            enabled: false,
+            max_sandbox_count: None,
+            max_sandbox_starting_count: None,
+            max_allocated_cpu: None,
+            max_allocated_memory_bytes: None,
+            max_sandbox_count_including_paused: None,
+            min_free_network_slots: None,
+            retry_after_secs: 2,
+            snapshot_max_age_ms: 200,
+        }),
         // Test orchestrators skip startup recovery, so their roster is
         // complete from the moment they exist.
         roster_complete: std::sync::atomic::AtomicBool::new(true),

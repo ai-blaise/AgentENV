@@ -1,3 +1,4 @@
+mod admission;
 mod launch_plan;
 mod metrics;
 mod persistence;
@@ -9,6 +10,9 @@ mod types;
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
+pub use admission::{
+    AdmissionController, AdmissionGuard, AdmissionRejectReason, NodeCapacityInputs,
+};
 pub use metrics::OrchestratorMetrics;
 pub use persistence::{
     DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
@@ -58,6 +62,17 @@ pub enum OrchestratorError {
 
     #[error("orchestrator is shutting down")]
     ShuttingDown,
+
+    /// The node refused to start the sandbox from its own view of capacity.
+    ///
+    /// Placement is advisory and necessarily stale; this is the authoritative
+    /// answer. It is a retryable condition, not a fault: the caller should try
+    /// another node rather than surface a failure.
+    #[error("node at capacity: {reason}")]
+    AdmissionRejected {
+        reason: AdmissionRejectReason,
+        retry_after: std::time::Duration,
+    },
 
     #[error("sandbox {0} not found")]
     SandboxNotFound(SandboxId),

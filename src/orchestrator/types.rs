@@ -38,6 +38,21 @@ pub struct CreateSandboxRequest {
     pub custom_extension_params: Option<CustomExtensionParams>,
 }
 
+impl CreateSandboxRequest {
+    /// Resources this request will consume if admitted.
+    ///
+    /// Admission has to know this before any side effect, and both variants
+    /// can answer without I/O.
+    pub fn requested_resources(&self) -> crate::types::SandboxResources {
+        match &self.source {
+            SandboxLaunchSource::Snapshot(snapshot) => snapshot.record().resources,
+            SandboxLaunchSource::Image { resources, .. } => {
+                resources.unwrap_or_else(super::service::default_fresh_sandbox_resources)
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SandboxLifecycleEventType {
     Create,

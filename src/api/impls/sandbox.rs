@@ -52,6 +52,21 @@ impl From<OrchestratorError> for models::Error {
             OrchestratorError::ShuttingDown => {
                 Self::new(503, "orchestrator is shutting down".to_string())
             }
+            // A capacity rejection is a routing signal, not a fault: the
+            // sandbox can start elsewhere. The reason is a closed set, so a
+            // caller can distinguish "this node is full" from "the fleet is
+            // full" and retry accordingly instead of giving up or looping.
+            OrchestratorError::AdmissionRejected {
+                reason,
+                retry_after,
+            } => Self::new(
+                503,
+                format!(
+                    "node at capacity ({}); retry after {}s",
+                    reason,
+                    retry_after.as_secs()
+                ),
+            ),
             OrchestratorError::SandboxNotFound(id) => sandbox_not_found(id),
             OrchestratorError::InvalidSandboxState { .. } => Self::new(400, err.to_string()),
             OrchestratorError::SandboxOperationFailed {

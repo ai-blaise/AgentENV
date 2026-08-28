@@ -23,6 +23,7 @@ use crate::sandbox::{
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
 
+use super::admission::{AdmissionController, AdmissionGuard, NodeCapacityInputs};
 use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
@@ -103,6 +104,7 @@ pub struct Orchestrator<
     sandbox_event_tx: broadcast::Sender<SandboxLifecycleEvent>,
     default_sandbox_timeout: Duration,
     is_shutting_down: std::sync::atomic::AtomicBool,
+    admission: AdmissionController,
     /// Set once startup recovery has finished restoring persisted paused
     /// sandboxes into the store.
     ///
@@ -202,6 +204,7 @@ where
             sandbox_event_tx,
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
+            admission: AdmissionController::new(app_config.orchestrator.admission.clone()),
             roster_complete: std::sync::atomic::AtomicBool::new(false),
             shutdown_tx,
             shutdown_outcome: OnceCell::new(),
@@ -349,12 +352,62 @@ where
         self: &Arc<Self>,
         request: CreateSandboxRequest,
     ) -> Result<SandboxMetadata> {
+        // Admission runs before the task spawn and before any side effect, so
+        // a rejection costs nothing and leaves no state behind. That is what
+        // makes it safe for the caller to place the sandbox elsewhere.
+        let admission = self.admit(1, request.requested_resources()).await?;
+
         let sandbox_id = SandboxId::new();
         let this = Arc::clone(self);
-        self.run_cancellation_safe("create", sandbox_id, async move {
-            this.create_sandbox_inner(sandbox_id, request).await
-        })
-        .await
+        let result = self
+            .run_cancellation_safe("create", sandbox_id, async move {
+                this.create_sandbox_inner(sandbox_id, request).await
+            })
+            .await;
+
+        // Hand accounting to the metadata store only once the sandbox is in
+        // it. Until then the reservation is what bounds the node, and on any
+        // failure path the guard's Drop returns the capacity.
+        //
+        // The store starts counting the sandbox slightly before this point, so
+        // the two overlap briefly. That double-counts, which errs toward
+        // rejecting early; under-counting would let a burst through.
+        if result.is_ok() {
+            admission.commit();
+        }
+        result
+    }
+
+    /// Reserves node capacity for `count` sandboxes, or reports why not.
+    async fn admit(
+        self: &Arc<Self>,
+        count: u32,
+        resources: SandboxResources,
+    ) -> Result<AdmissionGuard> {
+        let capacity = NodeCapacityInputs {
+            available_network_slots: crate::sandbox::network_slot_capacity().available(),
+        };
+        let this = Arc::clone(self);
+        match self
+            .admission
+            .try_admit(count, resources, capacity, || async move {
+                this.metrics_snapshot().await.ok()
+            })
+            .await
+        {
+            Ok(guard) => Ok(guard),
+            Err(reason) => {
+                metrics::counter!(
+                    "agentenv_admission_rejected_total",
+                    "reason" => reason.as_str()
+                )
+                .increment(1);
+                Err(OrchestratorError::AdmissionRejected {
+                    reason,
+                    retry_after: self.admission.retry_after(),
+                })
+            }
+        }
     }
 
     #[tracing::instrument(
@@ -564,6 +617,18 @@ where
         }
         .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?;
 
+        // Admit the whole fan-out before the Running -> Forking transition, so
+        // a rejection never strands the source in Forking. Children inherit the
+        // source's resources.
+        let source_resources = self
+            .store
+            .get(&source_sandbox_id)
+            .await
+            .map_err(OrchestratorError::from)?
+            .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?
+            .resources;
+        let admission = self.admit(count, source_resources).await?;
+
         let source_metadata = self
             .store
             .update_if_state(&source_sandbox_id, &[SandboxState::Running], |metadata| {
@@ -696,10 +761,17 @@ where
                 metadata.id,
                 metadata.resources,
             );
+            // This child is now counted by the store; release its share of the
+            // bulk reservation incrementally rather than all at once at the
+            // end, so a slow fan-out does not hold capacity for children that
+            // are already accounted for.
+            admission.commit_one(metadata.resources);
             successes += 1;
             outcomes.push(Ok(metadata));
         }
 
+        // Children that failed to start never reached the store, so their share
+        // of the reservation is returned when the guard drops.
         self.counters.record_create_success(successes);
         self.counters
             .record_create_fail(u64::from(count) - successes);
@@ -2648,7 +2720,7 @@ where
     }
 }
 
-fn default_fresh_sandbox_resources() -> SandboxResources {
+pub(super) fn default_fresh_sandbox_resources() -> SandboxResources {
     let config = ConfigManager::global_config();
     SandboxResources {
         cpu_count: config.machine.vcpu_count,
