@@ -16,7 +16,7 @@ use iroh::endpoint::presets;
 use iroh::protocol::Router;
 use iroh::{Endpoint, EndpointAddr, Watcher};
 use iroh_blobs::api::blobs::{AddPathOptions, ImportMode};
-use iroh_blobs::api::downloader::Downloader;
+use iroh_blobs::api::downloader::{DownloadProgressItem, Downloader};
 use iroh_blobs::api::proto::ExportRangesItem;
 use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
 use iroh_blobs::store::fs::{options::Options as FsStoreOptions, FsStore};
@@ -85,6 +85,14 @@ pub struct IrohBlobsP2pTransport {
     fetch_timeout: Duration,
     pending_gc: Arc<AtomicBool>,
 }
+
+/// Slack allowed on top of a requested byte range before a transfer is refused.
+///
+/// A range download carries more than the bytes asked for: the range is
+/// widened to chunk boundaries, and bao verification hashes travel with the
+/// payload. Both are proportional to the request, so the budget is a multiple
+/// of it plus this, which covers a small range whose overhead dominates.
+const RANGE_VERIFICATION_ALLOWANCE: u64 = 1 << 20;
 
 impl IrohBlobsP2pTransport {
     pub async fn new(
@@ -358,7 +366,28 @@ impl IrohBlobsP2pTransport {
         Ok(Box::pin(stream))
     }
 
-    async fn read_local_blob_bytes(&self, blob_hash: iroh_blobs::Hash) -> Result<Bytes> {
+    /// Reads a blob this node already holds, refusing one larger than the
+    /// caller's bound.
+    ///
+    /// A local hit is a blob this node imported or previously fetched, so it
+    /// is not peer-controlled in the way a download is. The bound still
+    /// applies: the caller asked for something it can hold in memory, and a
+    /// local artifact that has since grown past that is no more holdable for
+    /// having come from here.
+    async fn read_local_blob_bytes(
+        &self,
+        blob_hash: iroh_blobs::Hash,
+        max_bytes: u64,
+    ) -> Result<Bytes> {
+        let size = self
+            .store
+            .observe(blob_hash)
+            .await
+            .map_err(|err| Error::internal_message("size local P2P blob", err))?
+            .size();
+        if size > max_bytes {
+            return Err(Error::ArtifactTooLarge { limit: max_bytes });
+        }
         self.store
             .get_bytes(blob_hash)
             .await
@@ -412,13 +441,61 @@ impl IrohBlobsP2pTransport {
         &self,
         request: GetRequest,
         providers: Vec<iroh::EndpointId>,
+        max_bytes: u64,
     ) -> Result<()> {
         let operation = "download P2P artifact blob";
-        let download = self.downloader.download(request, providers);
-        tokio::time::timeout(self.fetch_timeout, download)
+        tokio::time::timeout(
+            self.fetch_timeout,
+            self.download_blob_bounded(operation, request, providers, max_bytes),
+        )
+        .await
+        .map_err(|_| Error::Timeout { operation })?
+    }
+
+    /// Downloads a blob, giving up once it has taken more than `max_bytes`.
+    ///
+    /// The bound is applied to the bytes as they arrive rather than to a size
+    /// the peer declared, because at this point nothing the peer has said has
+    /// been authenticated — the sealing check runs on the result of this call,
+    /// not before it. A wall-clock timeout is not a substitute: it bounds how
+    /// long a peer may spend filling this node's memory or disk, not how much
+    /// it may fill.
+    ///
+    /// Abandoning the stream cancels the transfer. Whatever partial data
+    /// reached the store is untagged — the tag is only written once the fetch
+    /// has succeeded — so it is collectable rather than retained.
+    async fn download_blob_bounded(
+        &self,
+        operation: &'static str,
+        request: GetRequest,
+        providers: Vec<iroh::EndpointId>,
+        max_bytes: u64,
+    ) -> Result<()> {
+        let mut progress = self
+            .downloader
+            .download(request, providers)
+            .stream()
             .await
-            .map_err(|_| Error::Timeout { operation })?
             .map_err(|err| Error::internal_message(operation, err))?;
+
+        while let Some(item) = progress.next().await {
+            match item {
+                DownloadProgressItem::Error(err) => {
+                    return Err(Error::internal_message(operation, err));
+                }
+                DownloadProgressItem::DownloadError => {
+                    return Err(Error::internal_message(operation, "download failed"));
+                }
+                DownloadProgressItem::Progress(received) if received > max_bytes => {
+                    warn!(
+                        received,
+                        max_bytes, "abandoning a P2P artifact that exceeded its size limit"
+                    );
+                    return Err(Error::ArtifactTooLarge { limit: max_bytes });
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -504,7 +581,12 @@ impl P2pTransport for IrohBlobsP2pTransport {
         skip(self, descriptor),
         fields(key = %descriptor.key, destination = %destination.display())
     )]
-    async fn fetch(&self, descriptor: &P2pArtifactDescriptor, destination: &Path) -> Result<u64> {
+    async fn fetch(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        destination: &Path,
+        max_bytes: u64,
+    ) -> Result<u64> {
         if let Some(parent) = destination.parent() {
             tokio::fs::create_dir_all(parent).await.with_context(|| {
                 format!("create P2P fetch destination dir {}", parent.display())
@@ -527,7 +609,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
         let providers_count = providers.len();
 
         // Download into the local FsStore first, then export to the caller's destination.
-        self.download_blob(GetRequest::blob(blob_hash), providers)
+        self.download_blob(GetRequest::blob(blob_hash), providers, max_bytes)
             .await?;
         self.try_advertise_fetched_blob(descriptor, blob_hash).await;
         let size = self.export_local_blob(blob_hash, destination).await?;
@@ -536,10 +618,14 @@ impl P2pTransport for IrohBlobsP2pTransport {
     }
 
     #[instrument(skip(self, descriptor), fields(key = %descriptor.key))]
-    async fn fetch_bytes(&self, descriptor: &P2pArtifactDescriptor) -> Result<Bytes> {
+    async fn fetch_bytes(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        max_bytes: u64,
+    ) -> Result<Bytes> {
         let (blob_hash, providers) = match self.resolve_fetch_source(descriptor)? {
             BlobFetchSource::Local { blob_hash } => {
-                let bytes = self.read_local_blob_bytes(blob_hash).await?;
+                let bytes = self.read_local_blob_bytes(blob_hash, max_bytes).await?;
                 debug!(
                     size = bytes.len(),
                     "fetched artifact bytes from local P2P store"
@@ -556,10 +642,10 @@ impl P2pTransport for IrohBlobsP2pTransport {
         // Full in-memory fetches download the complete blob into the local store
         // first, matching file fetch semantics and allowing this node to serve
         // the artifact to later peers.
-        self.download_blob(GetRequest::blob(blob_hash), providers)
+        self.download_blob(GetRequest::blob(blob_hash), providers, max_bytes)
             .await?;
         self.try_advertise_fetched_blob(descriptor, blob_hash).await;
-        let bytes = self.read_local_blob_bytes(blob_hash).await?;
+        let bytes = self.read_local_blob_bytes(blob_hash, max_bytes).await?;
         debug!(
             providers_count,
             size = bytes.len(),
@@ -608,8 +694,19 @@ impl P2pTransport for IrohBlobsP2pTransport {
         // reclaim them unless the full layer is later published by background
         // download.
         let ranges = ChunkRanges::bytes(range.clone());
-        self.download_blob(GetRequest::blob_ranges(blob_hash, ranges), providers)
-            .await?;
+        // A range request asks for a bounded slice, but what arrives is still
+        // the peer's choice, so the bound is enforced rather than assumed. The
+        // allowance covers chunk alignment either side of the range and the
+        // bao verification hashes interleaved with the payload.
+        let range_budget = (end - offset)
+            .saturating_add(RANGE_VERIFICATION_ALLOWANCE)
+            .saturating_mul(2);
+        self.download_blob(
+            GetRequest::blob_ranges(blob_hash, ranges),
+            providers,
+            range_budget,
+        )
+        .await?;
         let stream = self.export_local_blob_range(blob_hash, range).await?;
         debug!(providers_count, "fetched artifact range from P2P provider");
         Ok(stream)
@@ -1128,6 +1225,94 @@ mod tests {
         assert_eq!(descriptor.providers, vec![P2pArtifactProvider::from(peer)]);
     }
 
+    /// Nothing about an artifact is known to be true until it has been
+    /// opened, and by then the bytes are already here. So the limit has to
+    /// stop the transfer, not judge it afterwards — and it has to hold against
+    /// a peer whose blob is simply bigger than the caller can take, which is
+    /// indistinguishable from a hostile one at this point.
+    #[tokio::test]
+    async fn a_fetch_refuses_an_artifact_bigger_than_the_caller_allows() -> Result<()> {
+        crate::logging::init_for_tests();
+
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            let temp = tempfile::tempdir().context("create temp test dir")?;
+            let (provider, consumer) = test_provider_consumer(&temp).await?;
+
+            let key = "test/p2p/iroh/oversized".to_string();
+            let bytes = vec![7u8; 512 * 1024];
+            provider
+                .publish(&P2pPublishRequest::bytes(key.clone(), bytes.clone()))
+                .await
+                .context("publish oversized artifact")?;
+
+            let descriptor = consumer
+                .lookup(&key)
+                .await?
+                .context("expected descriptor from provider")?;
+
+            let limit = 64 * 1024;
+            let destination = temp.path().join("refused.bin");
+            let error = consumer
+                .fetch(&descriptor, &destination, limit)
+                .await
+                .expect_err("a blob past the limit must not be written");
+            assert!(
+                matches!(error, Error::ArtifactTooLarge { limit: reported } if reported == limit),
+                "expected a size refusal, got {error:?}"
+            );
+
+            // Refused, and not left behind for a later caller to trip over.
+            assert!(
+                !destination.exists(),
+                "a refused fetch must leave no artifact at the destination"
+            );
+            assert!(
+                consumer.get_local(&key).await.is_none(),
+                "a refused artifact must not be advertised onward"
+            );
+
+            // The same artifact within a limit that allows it still arrives,
+            // so the bound is a bound and not a broken transfer.
+            let allowed = temp.path().join("allowed.bin");
+            let size = consumer
+                .fetch(&descriptor, &allowed, bytes.len() as u64 * 2)
+                .await
+                .context("fetch the same artifact under a sufficient limit")?;
+            assert_eq!(size, bytes.len() as u64);
+
+            // The consumer now holds the blob, so the same request resolves
+            // locally and never reaches the downloader. A local hit is not
+            // peer-controlled, but the caller's bound is about what it can
+            // hold in memory, and that does not change with where the bytes
+            // came from — so this path has to refuse too, and it is the only
+            // way to reach the check that makes it.
+            let local = consumer
+                .get_local(&key)
+                .await
+                .context("the fetched artifact should be advertised locally")?;
+            let error = consumer
+                .fetch_bytes(&local, limit)
+                .await
+                .expect_err("a local blob past the limit must not be read into memory");
+            assert!(
+                matches!(error, Error::ArtifactTooLarge { limit: reported } if reported == limit),
+                "expected a size refusal from the local path, got {error:?}"
+            );
+
+            let held = consumer
+                .fetch_bytes(&local, bytes.len() as u64 * 2)
+                .await
+                .context("read the local artifact under a sufficient limit")?;
+            assert_eq!(held.len(), bytes.len());
+
+            consumer.shutdown().await.context("shutdown consumer P2P")?;
+            provider.shutdown().await.context("shutdown provider P2P")?;
+            Ok(())
+        })
+        .await
+        .context("oversized fetch test timed out")?
+    }
+
     #[tokio::test]
     async fn transport_looks_up_and_fetches_from_peer_over_loopback() -> Result<()> {
         crate::logging::init_for_tests();
@@ -1180,7 +1365,7 @@ mod tests {
 
             let destination = temp.path().join("downloaded").join("artifact.bin");
             let fetched_size = consumer
-                .fetch(&descriptor, &destination)
+                .fetch(&descriptor, &destination, u64::MAX)
                 .await
                 .context("fetch provider blob over P2P")?;
             assert_eq!(fetched_size, bytes.len() as u64);
@@ -1231,7 +1416,7 @@ mod tests {
 
             let relay_destination = temp.path().join("relay-download.bin");
             let relay_fetched_size = relay
-                .fetch(&relay_descriptor, &relay_destination)
+                .fetch(&relay_descriptor, &relay_destination, u64::MAX)
                 .await
                 .context("relay fetch blob from consumer")?;
             assert_eq!(relay_fetched_size, bytes.len() as u64);
@@ -1305,7 +1490,7 @@ mod tests {
             .await?
             .context("expected descriptor from provider")?;
         let fetched = consumer
-            .fetch_bytes(&descriptor)
+            .fetch_bytes(&descriptor, u64::MAX)
             .await
             .context("fetch full blob bytes from provider")?;
         assert_eq!(fetched.as_ref(), bytes.as_slice());
@@ -1349,7 +1534,7 @@ mod tests {
         };
 
         let err = consumer
-            .fetch(&descriptor, &temp.path().join("downloaded.bin"))
+            .fetch(&descriptor, &temp.path().join("downloaded.bin"), u64::MAX)
             .await
             .expect_err("fetch should fail");
 
@@ -1397,7 +1582,7 @@ mod tests {
 
         let destination = temp.path().join("downloaded-after-restart.bin");
         let fetched_size = restarted
-            .fetch(&descriptor, &destination)
+            .fetch(&descriptor, &destination, u64::MAX)
             .await
             .context("fetch persisted local artifact")?;
         assert_eq!(fetched_size, bytes.len() as u64);
@@ -1579,7 +1764,7 @@ mod tests {
         };
 
         let err = consumer
-            .fetch(&descriptor, &temp.path().join("downloaded.bin"))
+            .fetch(&descriptor, &temp.path().join("downloaded.bin"), u64::MAX)
             .await
             .expect_err("fetch should fail");
 

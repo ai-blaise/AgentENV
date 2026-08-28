@@ -59,6 +59,7 @@ impl P2pTransport for MockTransport {
         &self,
         descriptor: &P2pArtifactDescriptor,
         destination: &Path,
+        max_bytes: u64,
     ) -> P2pResult<u64> {
         debug!(key = ?descriptor.key, dest = %destination.display(), "fetching");
         self.fetch_count.fetch_add(1, Ordering::Relaxed);
@@ -68,6 +69,11 @@ impl P2pTransport for MockTransport {
             .ok_or_else(|| P2pError::InvalidDescriptor {
                 reason: "missing test blob".to_string(),
             })?;
+        // Enforced here too, so a caller's cap is exercised by the tests that
+        // use this rather than only by the one transport that ships.
+        if bytes.len() as u64 > max_bytes {
+            return Err(P2pError::ArtifactTooLarge { limit: max_bytes });
+        }
         tokio::fs::write(destination, bytes)
             .await
             .map_err(|err| P2pError::Internal(anyhow!("write mock fetch: {err}")))?;
@@ -75,16 +81,25 @@ impl P2pTransport for MockTransport {
         Ok(bytes.len() as u64)
     }
 
-    async fn fetch_bytes(&self, descriptor: &P2pArtifactDescriptor) -> P2pResult<Bytes> {
+    async fn fetch_bytes(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        max_bytes: u64,
+    ) -> P2pResult<Bytes> {
         debug!(key = ?descriptor.key, "fetch bytes");
         self.fetch_bytes_count.fetch_add(1, Ordering::Relaxed);
         let blobs = self.blobs.read().await;
-        blobs
-            .get(&descriptor.key)
-            .cloned()
-            .ok_or_else(|| P2pError::InvalidDescriptor {
-                reason: "missing test blob".to_string(),
-            })
+        let bytes =
+            blobs
+                .get(&descriptor.key)
+                .cloned()
+                .ok_or_else(|| P2pError::InvalidDescriptor {
+                    reason: "missing test blob".to_string(),
+                })?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(P2pError::ArtifactTooLarge { limit: max_bytes });
+        }
+        Ok(bytes)
     }
 
     async fn fetch_byte_range(

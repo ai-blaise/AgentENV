@@ -27,13 +27,30 @@ pub trait P2pTransport: Send + Sync {
     ) -> Result<Option<P2pArtifactDescriptor>>;
 
     /// Download the artifact described by `descriptor` into `destination` and return its size in bytes.
-    async fn fetch(&self, descriptor: &P2pArtifactDescriptor, destination: &Path) -> Result<u64>;
+    ///
+    /// `max_bytes` bounds what the peer can make this node write, and is
+    /// enforced against the bytes as they arrive. A descriptor names an
+    /// artifact that has not been authenticated yet — the sealing check
+    /// happens afterwards, on content this call has already materialised — so
+    /// the peer is free to offer something arbitrarily large, and only the
+    /// caller knows what size the thing it asked for could legitimately be.
+    async fn fetch(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        destination: &Path,
+        max_bytes: u64,
+    ) -> Result<u64>;
 
     /// Download the full artifact described by `descriptor` into memory.
     ///
     /// Callers should prefer [`Self::fetch`] for large artifacts to avoid buffering
-    /// the full artifact in the process.
-    async fn fetch_bytes(&self, descriptor: &P2pArtifactDescriptor) -> Result<Bytes>;
+    /// the full artifact in the process. `max_bytes` bounds it either way, and
+    /// here it bounds resident memory rather than disk.
+    async fn fetch_bytes(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        max_bytes: u64,
+    ) -> Result<Bytes>;
 
     /// Stream an exact byte range from the artifact described by `descriptor`.
     ///
@@ -82,11 +99,20 @@ impl P2pTransport for DisabledP2pTransport {
         Ok(None)
     }
 
-    async fn fetch(&self, _descriptor: &P2pArtifactDescriptor, _destination: &Path) -> Result<u64> {
+    async fn fetch(
+        &self,
+        _descriptor: &P2pArtifactDescriptor,
+        _destination: &Path,
+        _max_bytes: u64,
+    ) -> Result<u64> {
         Err(Error::TransportDisabled)
     }
 
-    async fn fetch_bytes(&self, _descriptor: &P2pArtifactDescriptor) -> Result<Bytes> {
+    async fn fetch_bytes(
+        &self,
+        _descriptor: &P2pArtifactDescriptor,
+        _max_bytes: u64,
+    ) -> Result<Bytes> {
         Err(Error::TransportDisabled)
     }
 

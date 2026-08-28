@@ -296,6 +296,23 @@ pub(crate) fn fixed_artifact_key(
     )
 }
 
+/// Largest `vm_state` a peer may hand this node.
+///
+/// Firecracker's state file holds vCPU and device state, not guest memory, so
+/// it is well under a megabyte for any machine this runs. The limit is set far
+/// above that rather than close to it: it exists to stop an unbounded transfer
+/// from an unauthenticated peer, not to validate the artifact, which the
+/// sealing check does afterwards on content of a size this has already agreed
+/// to hold.
+pub(crate) const MAX_VM_STATE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Largest Firecracker manifest a peer may hand this node.
+///
+/// A manifest names the layers a snapshot is built from — kilobytes, even for
+/// a deep stack — and unlike `vm_state` it is read into memory rather than
+/// staged on disk.
+pub(crate) const MAX_FIRECRACKER_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Fetches and opens a sealed fixed artifact into `destination`.
 ///
 /// A peer running a build that published this artifact in the clear fails the
@@ -306,6 +323,7 @@ pub(crate) async fn fetch_artifact(
     transport: &Arc<dyn P2pTransport>,
     scope: &SealScope<'_>,
     destination: &Path,
+    max_bytes: u64,
 ) -> Result<u64> {
     let key = fixed_artifact_key(&scope.snapshot_id, scope.artifact_name);
     let sealing_key = sealing_key_for(&key)?;
@@ -316,7 +334,7 @@ pub(crate) async fn fetch_artifact(
     let staging = NamedTempFile::new_in(destination.parent().unwrap_or_else(|| Path::new(".")))
         .context("create sealed download staging file")?;
     transport
-        .fetch(&descriptor, staging.path())
+        .fetch(&descriptor, staging.path(), max_bytes)
         .await
         .with_context(|| format!("fetch snapshot P2P artifact '{key}'"))?;
 
@@ -344,6 +362,7 @@ pub(crate) async fn fetch_artifact(
 pub(crate) async fn fetch_artifact_bytes(
     transport: &Arc<dyn P2pTransport>,
     scope: &SealScope<'_>,
+    max_bytes: u64,
 ) -> Result<Bytes> {
     let key = fixed_artifact_key(&scope.snapshot_id, scope.artifact_name);
     let sealing_key = sealing_key_for(&key)?;
@@ -351,7 +370,7 @@ pub(crate) async fn fetch_artifact_bytes(
         anyhow::bail!("snapshot P2P artifact '{key}' was not found");
     };
     let sealed = transport
-        .fetch_bytes(&descriptor)
+        .fetch_bytes(&descriptor, max_bytes)
         .await
         .with_context(|| format!("fetch snapshot P2P artifact '{key}'"))?;
     let bytes = Bytes::from(

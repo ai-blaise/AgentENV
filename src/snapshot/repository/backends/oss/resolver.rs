@@ -125,7 +125,9 @@ impl SnapshotRuntimeResolver for OssRuntimeResolver {
                 async move {
                     if let Some(transport) = p2p_transport.as_ref() {
                         let scope = SealScope::new(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
-                        match p2p::fetch_artifact(transport, &scope, &dest).await {
+                        match p2p::fetch_artifact(transport, &scope, &dest, p2p::MAX_VM_STATE_BYTES)
+                            .await
+                        {
                             Ok(size) => return Ok(size),
                             Err(error) => {
                                 debug!(
@@ -379,7 +381,9 @@ impl OssRuntimeResolver {
             SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest,
         );
         if let Some(transport) = self.p2p_transport.as_ref() {
-            match p2p::fetch_artifact_bytes(transport, &scope).await {
+            match p2p::fetch_artifact_bytes(transport, &scope, p2p::MAX_FIRECRACKER_MANIFEST_BYTES)
+                .await
+            {
                 Ok(bytes) => match parse_firecracker_manifest(&bytes, &p2p_key) {
                     Ok(manifest) => return Ok(manifest),
                     Err(error) => {

@@ -545,7 +545,7 @@ mod tests {
             .await
             .expect("lookup")
             .expect("manifest should be advertised");
-        let published = p2p.fetch_bytes(&descriptor).await.expect("fetch");
+        let published = p2p.fetch_bytes(&descriptor, u64::MAX).await.expect("fetch");
 
         assert!(
             crate::snapshot::sealing::has_sealed_magic(&published),

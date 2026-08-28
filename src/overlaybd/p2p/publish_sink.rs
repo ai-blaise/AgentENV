@@ -166,6 +166,7 @@ mod tests {
             &self,
             _descriptor: &P2pArtifactDescriptor,
             _destination: &Path,
+            _max_bytes: u64,
         ) -> P2pResult<u64> {
             unreachable!("publish-only transport")
         }
@@ -173,6 +174,7 @@ mod tests {
         async fn fetch_bytes(
             &self,
             _descriptor: &P2pArtifactDescriptor,
+            _max_bytes: u64,
         ) -> P2pResult<bytes::Bytes> {
             unreachable!("publish-only transport")
         }
