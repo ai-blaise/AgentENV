@@ -6,6 +6,7 @@
 
 mod claim;
 mod evacuation;
+mod lease;
 mod record;
 mod saga;
 
@@ -14,6 +15,7 @@ pub use evacuation::{
     drain, plan_evacuation, DestinationCandidate, DrainBudget, DrainReport, EvacuationPlan,
     MoveExecutor, PlannedMove, SandboxLayers, UnplaceableReason, UnplaceableSandbox,
 };
+pub use lease::{LeaseGuardian, LeaseLost, LeasePacing, LeaseWatch, RenewOutcome};
 pub use record::{
     LocalMobilityStore, MobilityGeneration, MobilityRecord, MobilityState, MobilityStore,
     MobilityWrite,

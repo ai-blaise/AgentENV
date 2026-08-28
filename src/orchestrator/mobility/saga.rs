@@ -41,6 +41,7 @@ use async_trait::async_trait;
 use tracing::{info, warn};
 
 use super::claim::{ClaimOutcome, MobilityCoordinator, DEFAULT_CLAIM_TTL};
+use super::lease::{LeaseGuardian, LeaseLost, LeasePacing, LeaseWatch, RenewOutcome};
 use super::record::{MobilityRecord, MobilityStore};
 use crate::snapshot::{
     DriveForMigration, MigrationFingerprint, MobilityBlocker, OverlaybdLayerRef,
@@ -129,12 +130,27 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
             other => return Ok(MigrationOutcome::NotClaimable(other)),
         };
 
-        let renewal = self.spawn_claim_renewal(*sandbox_id);
-        let restored = self.steps.restore(&claimed).await;
-        renewal.abort();
+        // The restore races its own lease. Losing it has to stop the restore
+        // rather than be discovered at the end: a holder still writing the
+        // sandbox's devices while another node starts restoring the same state
+        // is the exact failure the lease exists to prevent, and finishing work
+        // that will be thrown away is the lesser part of it.
+        let (guardian, mut lease) = self.guard_claim(*sandbox_id);
+        let restored = tokio::select! {
+            biased;
+            lost = lease.lost() => {
+                // Dropping the restore future here cancels it at its next
+                // await point; `discard_restored` cleans up whatever it had
+                // already built.
+                Err(lost.to_string())
+            }
+            result = self.steps.restore(&claimed) => {
+                guardian.release();
+                result.map_err(|error| error.to_string())
+            }
+        };
 
-        if let Err(error) = restored {
-            let reason = error.to_string();
+        if let Err(reason) = restored {
             self.roll_back(&claimed, &reason).await;
             return Ok(MigrationOutcome::RolledBack { reason });
         }
@@ -196,29 +212,31 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
 
     /// Keeps the claim alive for as long as the restore runs.
     ///
-    /// Without this a restore longer than the TTL expires its own claim, which
-    /// is precisely the case migration exists for: large memory images.
-    fn spawn_claim_renewal(&self, sandbox_id: SandboxId) -> tokio::task::JoinHandle<()> {
+    /// Without renewal a restore longer than the TTL expires its own claim,
+    /// which is precisely the case migration exists for: large memory images
+    /// are what make a restore slow.
+    fn guard_claim(&self, sandbox_id: SandboxId) -> (LeaseGuardian, LeaseWatch) {
         let coordinator = Arc::clone(&self.coordinator);
-        // A third of the TTL, so two consecutive renewals can be lost before
-        // the claim lapses.
-        let interval = self.claim_ttl / 3;
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
+        LeaseGuardian::spawn(LeasePacing::new(self.claim_ttl), move || {
+            let coordinator = Arc::clone(&coordinator);
+            Box::pin(async move {
                 match coordinator.claim(&sandbox_id).await {
-                    Ok(ClaimOutcome::Claimed(_)) => {}
-                    Ok(other) => {
-                        // Someone else owns it now. Stop renewing; the restore
-                        // will fail its completion check and roll back.
-                        warn!(%sandbox_id, outcome = ?other, "stopped renewing a lost claim");
-                        return;
+                    Ok(ClaimOutcome::Claimed(_)) => RenewOutcome::Held,
+                    Ok(ClaimOutcome::AlreadyClaimed { by_node_id, .. }) => {
+                        RenewOutcome::Lost(LeaseLost::Taken { by: by_node_id })
                     }
-                    Err(error) => {
-                        warn!(%sandbox_id, error = %error, "claim renewal failed; will retry");
+                    Ok(ClaimOutcome::AlreadyEvacuated { to_node_id }) => {
+                        RenewOutcome::Lost(LeaseLost::Taken { by: to_node_id })
                     }
+                    Ok(ClaimOutcome::Unknown) => RenewOutcome::Lost(LeaseLost::Gone),
+                    // Retryable rather than final: the write lost a race, and
+                    // the next attempt re-reads and gets a definitive answer.
+                    Ok(ClaimOutcome::Superseded) => {
+                        RenewOutcome::Failed(anyhow::anyhow!("the mobility record was superseded"))
+                    }
+                    Err(error) => RenewOutcome::Failed(error),
                 }
-            }
+            })
         })
     }
 }
@@ -516,6 +534,105 @@ mod tests {
                 .expect("migrate"),
             MigrationOutcome::Migrated,
             "renewal must keep a slow restore's claim alive"
+        );
+    }
+
+    /// If the claim is taken while the restore is running, the restore must be
+    /// cancelled then and there. Letting it finish means writing the sandbox's
+    /// devices while the new owner is restoring the same state — the exact
+    /// failure the lease exists to prevent.
+    #[tokio::test]
+    async fn losing_the_claim_mid_restore_cancels_the_restore() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct SlowSteps {
+            reached_the_end: Arc<AtomicBool>,
+            discarded: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl MigrationSteps for SlowSteps {
+            async fn restore(&self, _record: &MobilityRecord) -> Result<()> {
+                // Cancellation shows up as this future being dropped at the
+                // sleep, so the flag past it never gets set.
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                self.reached_the_end.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn discard_restored(&self, _record: &MobilityRecord) -> Result<()> {
+                self.discarded.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn release_origin_state(&self, _record: &MobilityRecord) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let f = fixture().await;
+        let reached_the_end = Arc::new(AtomicBool::new(false));
+        let discarded = Arc::new(AtomicBool::new(false));
+        let ttl = Duration::from_millis(300);
+        let saga = {
+            let coordinator =
+                Arc::new(MobilityCoordinator::new(f.store.clone(), "node-b").with_claim_ttl(ttl));
+            MigrationSaga::new(
+                coordinator,
+                Arc::new(SlowSteps {
+                    reached_the_end: Arc::clone(&reached_the_end),
+                    discarded: Arc::clone(&discarded),
+                }),
+            )
+            .with_claim_ttl(ttl)
+        };
+
+        // Steal the claim once the restore is under way.
+        let thief_store = f.store.clone();
+        let sandbox_id = f.sandbox_id;
+        let thief = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            let thief = MobilityCoordinator::new(thief_store, "node-c").with_claim_ttl(ttl);
+            // The claim is node-b's and still live, so force the takeover the
+            // way an expiry would: write a newer generation directly.
+            let record = thief
+                .store()
+                .get(&sandbox_id)
+                .await
+                .expect("get")
+                .expect("record");
+            // Stamped now, not at the epoch: a claim that is already expired
+            // would simply be re-taken by node-b's next renewal, and the test
+            // would prove nothing.
+            let stolen = record.transitioned_to(MobilityState::Claimed {
+                by_node_id: "node-c".to_string(),
+                at_unix_ms: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock after the epoch")
+                    .as_millis() as u64,
+            });
+            thief.store().upsert(&stolen).await.expect("steal");
+        });
+
+        let outcome = saga
+            .migrate(&f.sandbox_id, &f.fingerprint, &[], &[])
+            .await
+            .expect("migrate");
+        thief.await.expect("thief");
+
+        match outcome {
+            MigrationOutcome::RolledBack { reason } => {
+                assert!(reason.contains("node-c"), "unexpected reason: {reason}")
+            }
+            other => panic!("expected a rollback, got {other:?}"),
+        }
+        assert!(
+            !reached_the_end.load(Ordering::SeqCst),
+            "the restore must have been cancelled, not allowed to finish"
+        );
+        assert!(
+            discarded.load(Ordering::SeqCst),
+            "the partial restore must be torn down"
         );
     }
 
