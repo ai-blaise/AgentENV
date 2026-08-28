@@ -402,10 +402,14 @@ func (x *NewSandboxHint) GetMetadata() map[string]string {
 }
 
 type ScheduleRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Hint          *ScheduleRequestHint   `protobuf:"bytes,2,opt,name=hint,proto3" json:"hint,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Hint  *ScheduleRequestHint   `protobuf:"bytes,2,opt,name=hint,proto3" json:"hint,omitempty"`
+	// Nodes that already refused this sandbox. A node's own admission decision
+	// is authoritative over the scheduler's stale capacity view, so a rejection
+	// must steer the retry rather than be retried into the same node.
+	ExcludeNodeIds []string `protobuf:"bytes,3,rep,name=exclude_node_ids,json=excludeNodeIds,proto3" json:"exclude_node_ids,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ScheduleRequest) Reset() {
@@ -441,6 +445,13 @@ func (*ScheduleRequest) Descriptor() ([]byte, []int) {
 func (x *ScheduleRequest) GetHint() *ScheduleRequestHint {
 	if x != nil {
 		return x.Hint
+	}
+	return nil
+}
+
+func (x *ScheduleRequest) GetExcludeNodeIds() []string {
+	if x != nil {
+		return x.ExcludeNodeIds
 	}
 	return nil
 }
@@ -2517,9 +2528,10 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\bmetadata\x18\x01 \x03(\v2*.scheduler.v1.NewSandboxHint.MetadataEntryR\bmetadata\x1a;\n" +
 	"\rMetadataEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"N\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"x\n" +
 	"\x0fScheduleRequest\x125\n" +
-	"\x04hint\x18\x02 \x01(\v2!.scheduler.v1.ScheduleRequestHintR\x04hintJ\x04\b\x01\x10\x02\":\n" +
+	"\x04hint\x18\x02 \x01(\v2!.scheduler.v1.ScheduleRequestHintR\x04hint\x12(\n" +
+	"\x10exclude_node_ids\x18\x03 \x03(\tR\x0eexcludeNodeIdsJ\x04\b\x01\x10\x02\":\n" +
 	"\x10ScheduleResponse\x12&\n" +
 	"\x04node\x18\x01 \x01(\v2\x12.scheduler.v1.NodeR\x04node\"\x12\n" +
 	"\x10ListNodesRequest\"=\n" +

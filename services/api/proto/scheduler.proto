@@ -57,6 +57,10 @@ message NewSandboxHint {
 message ScheduleRequest {
   reserved 1;  // formerly: string hint = 1
   ScheduleRequestHint hint = 2;
+  // Nodes that already refused this sandbox. A node's own admission decision
+  // is authoritative over the scheduler's stale capacity view, so a rejection
+  // must steer the retry rather than be retried into the same node.
+  repeated string exclude_node_ids = 3;
 }
 
 message ScheduleResponse {

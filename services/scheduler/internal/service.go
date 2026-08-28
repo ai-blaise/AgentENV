@@ -134,6 +134,10 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		}
 	}
 	eligible = FilterByResourceLimit(eligible, s.resourceLimit)
+	// A node that already refused this sandbox is authoritative about its own
+	// capacity, so retrying into it would loop. Excluding every candidate is
+	// treated as an exhausted fleet, not as "try them all again".
+	eligible = FilterExcludedNodes(eligible, req.GetExcludeNodeIds())
 
 	node, selectErr := s.strategy.Select(eligible, req.GetHint())
 	if selectErr != nil {

@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"strings"
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
@@ -152,4 +153,38 @@ func withinLimit(n RichNode, limit *config.NodeResourceLimit) bool {
 		}
 	}
 	return true
+}
+
+
+// FilterExcludedNodes removes nodes the caller has already tried.
+//
+// Unlike FilterByHealth this does not fail open: the exclusions are facts
+// reported by the nodes themselves ("I refused this sandbox"), not inferences
+// from stale state, so returning an excluded node would put the caller into a
+// retry loop against a node that has already said no.
+func FilterExcludedNodes(nodes []RichNode, excludeNodeIDs []string) []RichNode {
+	if len(excludeNodeIDs) == 0 || len(nodes) == 0 {
+		return nodes
+	}
+
+	excluded := make(map[string]struct{}, len(excludeNodeIDs))
+	for _, nodeID := range excludeNodeIDs {
+		nodeID = strings.TrimSpace(nodeID)
+		if nodeID == "" {
+			continue
+		}
+		excluded[nodeID] = struct{}{}
+	}
+	if len(excluded) == 0 {
+		return nodes
+	}
+
+	result := make([]RichNode, 0, len(nodes))
+	for _, n := range nodes {
+		if _, skip := excluded[n.ID]; skip {
+			continue
+		}
+		result = append(result, n)
+	}
+	return result
 }

@@ -16,6 +16,13 @@ import (
 )
 
 var (
+	gatewayScheduleRetriesTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_gateway_schedule_retries_total",
+			Help: "Creates re-placed after a node refused them, by refusing node.",
+		},
+		[]string{"node_id"},
+	)
 	gatewayHTTPDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
 			Name:    "agentenv_gateway_http_request_duration_seconds",
@@ -235,4 +242,11 @@ func gatewayRouteLabel(path string) string {
 		return "/proxy/*"
 	}
 	return "unmatched"
+}
+
+// recordGatewayScheduleRetry counts creates a node refused and the gateway
+// re-placed. A non-zero rate is the admission gate working; a rate close to
+// the create rate means the fleet is saturated rather than merely unbalanced.
+func recordGatewayScheduleRetry(nodeID string) {
+	gatewayScheduleRetriesTotal.WithLabelValues(nodeID).Inc()
 }

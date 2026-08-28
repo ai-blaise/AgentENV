@@ -240,16 +240,13 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "failed to read request body", http.StatusBadRequest)
 			return
 		}
-		rpcStart := time.Now()
-		resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{
-			Hint: hint,
-		})
-		recordGatewaySchedulerRPC("Schedule", rpcStart, err)
-		if err != nil {
-			s.writeSchedulerError(w, err)
-			return
-		}
-		node = resp.GetNode()
+		// A create can be offered to more than one node: the node's own
+		// admission decision is authoritative over the scheduler's stale
+		// capacity view, so a rejection must steer the placement rather than
+		// surface as a failure. Everything from here to the upstream call is
+		// therefore run in a loop, bounded by maxScheduleAttempts.
+		s.proxyScheduledCreate(w, r, routingCtx, hint, routeSource, hostRoute, longLived)
+		return
 	}
 
 	s.logger.Debug("gateway routed request",
@@ -284,6 +281,85 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			flushImmediately: longLived,
 		},
 	)
+}
+
+// proxyScheduledCreate places a create, retrying on another node when the
+// chosen one refuses it.
+//
+// The response is buffered so a retryable rejection can be discarded before it
+// reaches the client. Creates are small non-streaming responses; streaming and
+// long-lived requests never reach this path.
+func (s *Server) proxyScheduledCreate(
+	w http.ResponseWriter,
+	r *http.Request,
+	routingCtx context.Context,
+	hint *schedulerv1.ScheduleRequestHint,
+	routeSource routeSource,
+	hostRoute *hostRoute,
+	longLived bool,
+) {
+	// captureRequestBody leaves a replayable body only when it fitted the hint
+	// budget. A larger body is a one-shot stream, so it gets a single attempt
+	// rather than a silently truncated retry.
+	replayableBody, bodyIsReplayable := replayableRequestBody(r)
+
+	var excluded []string
+	for attempt := 0; ; attempt++ {
+		rpcStart := time.Now()
+		resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{
+			Hint:           hint,
+			ExcludeNodeIds: excluded,
+		})
+		recordGatewaySchedulerRPC("Schedule", rpcStart, err)
+		if err != nil {
+			s.writeSchedulerError(w, err)
+			return
+		}
+		node := resp.GetNode()
+
+		decodedPath := upstreamTargetPath(routeSource, r.URL.Path)
+		escapedPath := upstreamTargetEscapedPath(routeSource, requestEscapedPath(r))
+		upstreamURL, joinErr := joinUpstream(node.GetEndpoint(), decodedPath, escapedPath, r.URL.RawQuery)
+		if joinErr != nil {
+			http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+			return
+		}
+
+		lastAttempt := attempt+1 >= maxScheduleAttempts || !bodyIsReplayable
+		upstreamCtx, cancelUpstream := requestContextForProxy(r, routingCtx, longLived)
+		proxyReq := r.Clone(upstreamCtx)
+		if bodyIsReplayable {
+			setReplayableBody(proxyReq, replayableBody)
+		}
+
+		options := proxyRequestOptions{
+			recordAssignment: shouldRecordAssignment(r, routeSource, false),
+			hostRoute:        hostRoute,
+			flushImmediately: longLived,
+		}
+
+		if lastAttempt {
+			s.proxyRequest(w, proxyReq, r.Context(), upstreamURL, node, options)
+			cancelUpstream()
+			return
+		}
+
+		buffered := newBufferedResponse()
+		s.proxyRequest(buffered, proxyReq, r.Context(), upstreamURL, node, options)
+		cancelUpstream()
+
+		if !retryableRejection(buffered.status) {
+			buffered.replay(w)
+			return
+		}
+
+		recordGatewayScheduleRetry(node.GetNodeId())
+		s.logger.Debug("node refused create; rescheduling",
+			zap.String("node_id", node.GetNodeId()),
+			zap.Int("attempt", attempt+1),
+		)
+		excluded = append(excluded, node.GetNodeId())
+	}
 }
 
 func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
