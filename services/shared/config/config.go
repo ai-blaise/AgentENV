@@ -193,6 +193,13 @@ type GatewayConfig struct {
 	// DebugMode enables debug-only behaviors in the gateway such as exposing
 	// the backend node id on proxied responses. It is off by default.
 	DebugMode bool `json:"debug_mode"`
+	// MaxIdleConnsPerHost bounds pooled idle upstream connections per node.
+	// Zero uses the gateway default.
+	MaxIdleConnsPerHost int `json:"max_idle_conns_per_host"`
+	// BindingCacheTTL bounds how long a sandbox-to-node lookup is reused before
+	// being re-resolved. Zero uses the gateway default; it must stay well below
+	// scheduler.binding_ttl.
+	BindingCacheTTL time.Duration `json:"binding_cache_ttl"`
 }
 
 func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
@@ -205,6 +212,8 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		ForwardResponseSize    *int64          `json:"forward_response_size"`
 		SandboxProxyDomains    *[]string       `json:"sandbox_proxy_domains"`
 		DebugMode              *bool           `json:"debug_mode"`
+		MaxIdleConnsPerHost    *int            `json:"max_idle_conns_per_host"`
+		BindingCacheTTL        json.RawMessage `json:"binding_cache_ttl"`
 	}
 
 	parsed := wire{}
@@ -240,6 +249,16 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		g.RequestTimeout = d
+	}
+	if parsed.MaxIdleConnsPerHost != nil {
+		g.MaxIdleConnsPerHost = *parsed.MaxIdleConnsPerHost
+	}
+	if len(bytes.TrimSpace(parsed.BindingCacheTTL)) > 0 {
+		d, err := parseSchedulerDuration(parsed.BindingCacheTTL, "gateway.binding_cache_ttl")
+		if err != nil {
+			return err
+		}
+		g.BindingCacheTTL = d
 	}
 
 	return nil

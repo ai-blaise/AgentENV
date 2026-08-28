@@ -51,6 +51,30 @@ type ServerOptions struct {
 	DebugMode                bool
 	SandboxProxyDomains      []string
 	QueryOnlySchedulerClient schedulerv1.SchedulerClient
+	// MaxIdleConnsPerHost bounds pooled idle connections per node. Zero uses
+	// defaultMaxIdleConnsPerHost.
+	MaxIdleConnsPerHost int
+	// BindingCacheTTL bounds how long a sandbox-to-node lookup is reused. Zero
+	// uses defaultBindingCacheTTL.
+	BindingCacheTTL time.Duration
+}
+
+// defaultMaxIdleConnsPerHost is sized for a gateway fronting a handful of nodes
+// with many concurrent sandboxes each, rather than Go's default of 2, which is
+// tuned for a client talking to many distinct hosts.
+const defaultMaxIdleConnsPerHost = 256
+
+func newUpstreamTransport(maxIdleConnsPerHost int) *http.Transport {
+	if maxIdleConnsPerHost <= 0 {
+		maxIdleConnsPerHost = defaultMaxIdleConnsPerHost
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = maxIdleConnsPerHost
+	// The pool is per-node, so the global cap has to allow for several nodes'
+	// worth of idle connections or it silently undoes the per-host budget.
+	transport.MaxIdleConns = maxIdleConnsPerHost * 8
+	transport.IdleConnTimeout = 90 * time.Second
+	return transport
 }
 
 type Server struct {
@@ -58,9 +82,15 @@ type Server struct {
 	scheduler          schedulerv1.SchedulerClient
 	queryOnlyScheduler schedulerv1.SchedulerClient
 	httpClient         *http.Client
-	apiKey             []byte
-	requestTimeout     time.Duration
-	maxRespSize        int64
+	// upstreamTransport is shared by every proxied request so connections to a
+	// node are pooled rather than re-established per request.
+	upstreamTransport *http.Transport
+	// bindingCache is the same object as queryOnlyScheduler, kept typed so the
+	// proxy can invalidate an entry the upstream has just contradicted.
+	bindingCache   *CachingSchedulerClient
+	apiKey         []byte
+	requestTimeout time.Duration
+	maxRespSize    int64
 	// debugMode, when true, enables debug-only behaviors such as exposing
 	// the backend node id on proxied responses via the x-agentenv-node-id
 	// header. Off by default; toggled via GatewayConfig.DebugMode.
@@ -81,12 +111,22 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 	if queryOnlyScheduler == nil {
 		queryOnlyScheduler = schedulerClient
 	}
+	// Wrap the data-plane lookup path only. Scheduling and assignment writes
+	// keep talking to the scheduler directly; caching those would cache
+	// decisions rather than facts.
+	bindingCache := NewCachingSchedulerClient(queryOnlyScheduler, options.BindingCacheTTL)
+	queryOnlyScheduler = bindingCache
+
+	upstreamTransport := newUpstreamTransport(options.MaxIdleConnsPerHost)
 
 	return &Server{
-		logger:              logger,
-		scheduler:           schedulerClient,
-		queryOnlyScheduler:  queryOnlyScheduler,
-		httpClient:          &http.Client{},
+		logger:             logger,
+		scheduler:          schedulerClient,
+		queryOnlyScheduler: queryOnlyScheduler,
+		httpClient: &http.Client{
+			Transport: upstreamTransport,
+		},
+		upstreamTransport:   upstreamTransport,
 		requestTimeout:      options.RequestTimeout,
 		maxRespSize:         options.MaxResponseSize,
 		apiKey:              []byte(options.APIKey),
@@ -401,6 +441,12 @@ func (s *Server) proxyRequest(
 	}
 
 	proxy := &httputil.ReverseProxy{
+		// Share one transport across requests. The default builds a fresh
+		// ReverseProxy per request with no Transport set, which falls back to
+		// http.DefaultTransport and its MaxIdleConnsPerHost of 2 — so beyond
+		// two concurrent requests to a node, every request paid a fresh TCP
+		// handshake, and the gateway burned ephemeral ports doing it.
+		Transport: s.upstreamTransport,
 		Rewrite: func(req *httputil.ProxyRequest) {
 			req.Out.URL.Scheme = upstreamURL.Scheme
 			req.Out.URL.Host = upstreamURL.Host
@@ -423,6 +469,14 @@ func (s *Server) proxyRequest(
 			if s.debugMode {
 				if nodeID := node.GetNodeId(); nodeID != "" {
 					resp.Header.Set(headerNodeID, nodeID)
+				}
+			}
+			// The owning node disowning a sandbox means the cached binding is
+			// wrong now, not in a second. Re-resolve on the next request
+			// instead of serving the stale node for the rest of the TTL.
+			if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusBadGateway {
+				if sandboxID, ok := sandboxIDFromHeaders(proxyReq.Header); ok {
+					s.bindingCache.Invalidate(sandboxID)
 				}
 			}
 			if !options.recordAssignment || resp.StatusCode < 200 || resp.StatusCode >= 300 {

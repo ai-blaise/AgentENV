@@ -147,6 +147,8 @@ func main() {
 		DebugMode:                cfg.Gateway.DebugMode,
 		SandboxProxyDomains:      cfg.Gateway.SandboxProxyDomains,
 		QueryOnlySchedulerClient: queryOnlySchedulerClient,
+		MaxIdleConnsPerHost:      cfg.Gateway.MaxIdleConnsPerHost,
+		BindingCacheTTL:          cfg.Gateway.BindingCacheTTL,
 	})
 	if err != nil {
 		logger.Fatal("init gateway server failed", zap.Error(err))
