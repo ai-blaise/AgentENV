@@ -1524,8 +1524,7 @@ mod tests {
 
         for concurrency in [1usize, 2, 4, 8] {
             let manager = NetworkManager::new(
-                /* maintenance_enabled */ false,
-                /* low_watermark */ 0,
+                /* maintenance_enabled */ false, /* low_watermark */ 0,
                 /* high_watermark */ 0,
             );
 
@@ -1543,9 +1542,9 @@ mod tests {
                     handles
                         .into_iter()
                         .map(|handle| {
-                            handle.join().unwrap_or_else(|_| {
-                                Err(anyhow!("slot allocation thread panicked"))
-                            })
+                            handle
+                                .join()
+                                .unwrap_or_else(|_| Err(anyhow!("slot allocation thread panicked")))
                         })
                         .collect()
                 });
