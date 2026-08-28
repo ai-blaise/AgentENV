@@ -145,6 +145,67 @@ func (SandboxEventType) EnumDescriptor() ([]byte, []int) {
 	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{1}
 }
 
+// Where a paused sandbox is in the process of being handed over.
+type MobilityState int32
+
+const (
+	MobilityState_MOBILITY_STATE_UNSPECIFIED MobilityState = 0
+	// Held by its origin and available to move.
+	MobilityState_MOBILITY_STATE_PARKED MobilityState = 1
+	// A destination has announced it intends to take this sandbox. A claim is
+	// an announcement, not a grant: it exists so the origin refuses a local
+	// resume while a handover is in flight, and so a second destination can see
+	// it is racing.
+	MobilityState_MOBILITY_STATE_CLAIMED MobilityState = 2
+	// The sandbox runs on another node now. Kept rather than deleted so a late
+	// claim can be answered with "already gone, and to whom" instead of
+	// "unknown sandbox", which is indistinguishable from a lost record.
+	MobilityState_MOBILITY_STATE_EVACUATED MobilityState = 3
+)
+
+// Enum value maps for MobilityState.
+var (
+	MobilityState_name = map[int32]string{
+		0: "MOBILITY_STATE_UNSPECIFIED",
+		1: "MOBILITY_STATE_PARKED",
+		2: "MOBILITY_STATE_CLAIMED",
+		3: "MOBILITY_STATE_EVACUATED",
+	}
+	MobilityState_value = map[string]int32{
+		"MOBILITY_STATE_UNSPECIFIED": 0,
+		"MOBILITY_STATE_PARKED":      1,
+		"MOBILITY_STATE_CLAIMED":     2,
+		"MOBILITY_STATE_EVACUATED":   3,
+	}
+)
+
+func (x MobilityState) Enum() *MobilityState {
+	p := new(MobilityState)
+	*p = x
+	return p
+}
+
+func (x MobilityState) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MobilityState) Descriptor() protoreflect.EnumDescriptor {
+	return file_api_proto_scheduler_proto_enumTypes[2].Descriptor()
+}
+
+func (MobilityState) Type() protoreflect.EnumType {
+	return &file_api_proto_scheduler_proto_enumTypes[2]
+}
+
+func (x MobilityState) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use MobilityState.Descriptor instead.
+func (MobilityState) EnumDescriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{2}
+}
+
 type Node struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
@@ -2585,6 +2646,541 @@ func (*UnregisterNodeResponse) Descriptor() ([]byte, []int) {
 	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{39}
 }
 
+// What a destination needs to know before it can take a paused sandbox.
+type MobilityRecord struct {
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId    string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	OriginNodeId string                 `protobuf:"bytes,2,opt,name=origin_node_id,json=originNodeId,proto3" json:"origin_node_id,omitempty"`
+	// A total order over versions of this record, as a UUIDv7 in hyphenated
+	// hex. A write with an older or equal generation is discarded rather than
+	// applied, which is what stops a superseded actor resurrecting stale state.
+	//
+	// Sent as text because its string order is its numeric order — the 48-bit
+	// timestamp leads, big-endian, and every value is the same length — so the
+	// comparison can happen inside a Lua script without parsing.
+	Generation string `protobuf:"bytes,3,opt,name=generation,proto3" json:"generation,omitempty"`
+	// The runtime the paused guest was booted against, as opaque JSON.
+	//
+	// The scheduler never interprets or compares this; only a candidate node can
+	// say whether it matches its own. Keeping it opaque means the fingerprint
+	// can gain fields without a scheduler release, and it is the part of this
+	// message most likely to grow.
+	FingerprintJson string `protobuf:"bytes,4,opt,name=fingerprint_json,json=fingerprintJson,proto3" json:"fingerprint_json,omitempty"`
+	// Whether the artifacts backing this sandbox are readable off-node.
+	ArtifactReach string `protobuf:"bytes,5,opt,name=artifact_reach,json=artifactReach,proto3" json:"artifact_reach,omitempty"`
+	CpuCount      uint32 `protobuf:"varint,6,opt,name=cpu_count,json=cpuCount,proto3" json:"cpu_count,omitempty"`
+	MemoryMib     uint32 `protobuf:"varint,7,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
+	// The snapshot the paused state was committed under. Empty means the state
+	// exists only as node-local files, so nothing can take it over yet — which
+	// is the ordinary condition of a freshly paused sandbox.
+	SnapshotId     string        `protobuf:"bytes,8,opt,name=snapshot_id,json=snapshotId,proto3" json:"snapshot_id,omitempty"`
+	PausedAtUnixMs int64         `protobuf:"varint,9,opt,name=paused_at_unix_ms,json=pausedAtUnixMs,proto3" json:"paused_at_unix_ms,omitempty"`
+	State          MobilityState `protobuf:"varint,10,opt,name=state,proto3,enum=scheduler.v1.MobilityState" json:"state,omitempty"`
+	// Set for CLAIMED and EVACUATED: who holds it, or who took it.
+	HolderNodeId  string `protobuf:"bytes,11,opt,name=holder_node_id,json=holderNodeId,proto3" json:"holder_node_id,omitempty"`
+	StateAtUnixMs int64  `protobuf:"varint,12,opt,name=state_at_unix_ms,json=stateAtUnixMs,proto3" json:"state_at_unix_ms,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MobilityRecord) Reset() {
+	*x = MobilityRecord{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MobilityRecord) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MobilityRecord) ProtoMessage() {}
+
+func (x *MobilityRecord) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MobilityRecord.ProtoReflect.Descriptor instead.
+func (*MobilityRecord) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *MobilityRecord) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+func (x *MobilityRecord) GetOriginNodeId() string {
+	if x != nil {
+		return x.OriginNodeId
+	}
+	return ""
+}
+
+func (x *MobilityRecord) GetGeneration() string {
+	if x != nil {
+		return x.Generation
+	}
+	return ""
+}
+
+func (x *MobilityRecord) GetFingerprintJson() string {
+	if x != nil {
+		return x.FingerprintJson
+	}
+	return ""
+}
+
+func (x *MobilityRecord) GetArtifactReach() string {
+	if x != nil {
+		return x.ArtifactReach
+	}
+	return ""
+}
+
+func (x *MobilityRecord) GetCpuCount() uint32 {
+	if x != nil {
+		return x.CpuCount
+	}
+	return 0
+}
+
+func (x *MobilityRecord) GetMemoryMib() uint32 {
+	if x != nil {
+		return x.MemoryMib
+	}
+	return 0
+}
+
+func (x *MobilityRecord) GetSnapshotId() string {
+	if x != nil {
+		return x.SnapshotId
+	}
+	return ""
+}
+
+func (x *MobilityRecord) GetPausedAtUnixMs() int64 {
+	if x != nil {
+		return x.PausedAtUnixMs
+	}
+	return 0
+}
+
+func (x *MobilityRecord) GetState() MobilityState {
+	if x != nil {
+		return x.State
+	}
+	return MobilityState_MOBILITY_STATE_UNSPECIFIED
+}
+
+func (x *MobilityRecord) GetHolderNodeId() string {
+	if x != nil {
+		return x.HolderNodeId
+	}
+	return ""
+}
+
+func (x *MobilityRecord) GetStateAtUnixMs() int64 {
+	if x != nil {
+		return x.StateAtUnixMs
+	}
+	return 0
+}
+
+type UpsertMobilityRecordRequest struct {
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Record *MobilityRecord        `protobuf:"bytes,1,opt,name=record,proto3" json:"record,omitempty"`
+	// Write only if the stored generation is exactly this.
+	//
+	// Empty means an unconditional write, ordered by generation alone — enough
+	// for bookkeeping, not enough to arbitrate a claim. A claimant sends what it
+	// read, so a rival that read the same state finds its expectation stale and
+	// is told it lost. Generation ordering cannot do that on its own, because
+	// the loser's generation is also newer than what it read.
+	ExpectedGeneration string `protobuf:"bytes,2,opt,name=expected_generation,json=expectedGeneration,proto3" json:"expected_generation,omitempty"`
+	// Whether expected_generation means "no record must exist".
+	//
+	// Needed because the empty string cannot distinguish "expect nothing" from
+	// "do not check", and those are opposite instructions.
+	ExpectAbsent  bool `protobuf:"varint,3,opt,name=expect_absent,json=expectAbsent,proto3" json:"expect_absent,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpsertMobilityRecordRequest) Reset() {
+	*x = UpsertMobilityRecordRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpsertMobilityRecordRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpsertMobilityRecordRequest) ProtoMessage() {}
+
+func (x *UpsertMobilityRecordRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpsertMobilityRecordRequest.ProtoReflect.Descriptor instead.
+func (*UpsertMobilityRecordRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *UpsertMobilityRecordRequest) GetRecord() *MobilityRecord {
+	if x != nil {
+		return x.Record
+	}
+	return nil
+}
+
+func (x *UpsertMobilityRecordRequest) GetExpectedGeneration() string {
+	if x != nil {
+		return x.ExpectedGeneration
+	}
+	return ""
+}
+
+func (x *UpsertMobilityRecordRequest) GetExpectAbsent() bool {
+	if x != nil {
+		return x.ExpectAbsent
+	}
+	return false
+}
+
+type UpsertMobilityRecordResponse struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// False means a generation at least as new was already stored, so this
+	// write was discarded. Not an error: a superseded actor writing late is the
+	// ordinary shape of a handover race, and the caller should re-read.
+	Applied       bool `protobuf:"varint,1,opt,name=applied,proto3" json:"applied,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *UpsertMobilityRecordResponse) Reset() {
+	*x = UpsertMobilityRecordResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *UpsertMobilityRecordResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*UpsertMobilityRecordResponse) ProtoMessage() {}
+
+func (x *UpsertMobilityRecordResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use UpsertMobilityRecordResponse.ProtoReflect.Descriptor instead.
+func (*UpsertMobilityRecordResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *UpsertMobilityRecordResponse) GetApplied() bool {
+	if x != nil {
+		return x.Applied
+	}
+	return false
+}
+
+type GetMobilityRecordRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetMobilityRecordRequest) Reset() {
+	*x = GetMobilityRecordRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[43]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetMobilityRecordRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetMobilityRecordRequest) ProtoMessage() {}
+
+func (x *GetMobilityRecordRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[43]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetMobilityRecordRequest.ProtoReflect.Descriptor instead.
+func (*GetMobilityRecordRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{43}
+}
+
+func (x *GetMobilityRecordRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+type GetMobilityRecordResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Record        *MobilityRecord        `protobuf:"bytes,1,opt,name=record,proto3" json:"record,omitempty"`
+	Found         bool                   `protobuf:"varint,2,opt,name=found,proto3" json:"found,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *GetMobilityRecordResponse) Reset() {
+	*x = GetMobilityRecordResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[44]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *GetMobilityRecordResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*GetMobilityRecordResponse) ProtoMessage() {}
+
+func (x *GetMobilityRecordResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[44]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use GetMobilityRecordResponse.ProtoReflect.Descriptor instead.
+func (*GetMobilityRecordResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{44}
+}
+
+func (x *GetMobilityRecordResponse) GetRecord() *MobilityRecord {
+	if x != nil {
+		return x.Record
+	}
+	return nil
+}
+
+func (x *GetMobilityRecordResponse) GetFound() bool {
+	if x != nil {
+		return x.Found
+	}
+	return false
+}
+
+type ListMobilityRecordsRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Records held by this node. A node asks for its own; a drain asks for the
+	// departing node's.
+	OriginNodeId  string `protobuf:"bytes,1,opt,name=origin_node_id,json=originNodeId,proto3" json:"origin_node_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListMobilityRecordsRequest) Reset() {
+	*x = ListMobilityRecordsRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[45]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListMobilityRecordsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListMobilityRecordsRequest) ProtoMessage() {}
+
+func (x *ListMobilityRecordsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[45]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListMobilityRecordsRequest.ProtoReflect.Descriptor instead.
+func (*ListMobilityRecordsRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{45}
+}
+
+func (x *ListMobilityRecordsRequest) GetOriginNodeId() string {
+	if x != nil {
+		return x.OriginNodeId
+	}
+	return ""
+}
+
+type ListMobilityRecordsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Records       []*MobilityRecord      `protobuf:"bytes,1,rep,name=records,proto3" json:"records,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListMobilityRecordsResponse) Reset() {
+	*x = ListMobilityRecordsResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[46]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListMobilityRecordsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListMobilityRecordsResponse) ProtoMessage() {}
+
+func (x *ListMobilityRecordsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[46]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListMobilityRecordsResponse.ProtoReflect.Descriptor instead.
+func (*ListMobilityRecordsResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{46}
+}
+
+func (x *ListMobilityRecordsResponse) GetRecords() []*MobilityRecord {
+	if x != nil {
+		return x.Records
+	}
+	return nil
+}
+
+type RemoveMobilityRecordRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	SandboxId     string                 `protobuf:"bytes,1,opt,name=sandbox_id,json=sandboxId,proto3" json:"sandbox_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveMobilityRecordRequest) Reset() {
+	*x = RemoveMobilityRecordRequest{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[47]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveMobilityRecordRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveMobilityRecordRequest) ProtoMessage() {}
+
+func (x *RemoveMobilityRecordRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[47]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveMobilityRecordRequest.ProtoReflect.Descriptor instead.
+func (*RemoveMobilityRecordRequest) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{47}
+}
+
+func (x *RemoveMobilityRecordRequest) GetSandboxId() string {
+	if x != nil {
+		return x.SandboxId
+	}
+	return ""
+}
+
+type RemoveMobilityRecordResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *RemoveMobilityRecordResponse) Reset() {
+	*x = RemoveMobilityRecordResponse{}
+	mi := &file_api_proto_scheduler_proto_msgTypes[48]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RemoveMobilityRecordResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RemoveMobilityRecordResponse) ProtoMessage() {}
+
+func (x *RemoveMobilityRecordResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_api_proto_scheduler_proto_msgTypes[48]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RemoveMobilityRecordResponse.ProtoReflect.Descriptor instead.
+func (*RemoveMobilityRecordResponse) Descriptor() ([]byte, []int) {
+	return file_api_proto_scheduler_proto_rawDescGZIP(), []int{48}
+}
+
 var File_api_proto_scheduler_proto protoreflect.FileDescriptor
 
 const file_api_proto_scheduler_proto_rawDesc = "" +
@@ -2771,7 +3367,46 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x15UnregisterNodeRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12.\n" +
 	"\x13service_instance_id\x18\x02 \x01(\tR\x11serviceInstanceId\"\x18\n" +
-	"\x16UnregisterNodeResponse*\x92\x01\n" +
+	"\x16UnregisterNodeResponse\"\xd1\x03\n" +
+	"\x0eMobilityRecord\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12$\n" +
+	"\x0eorigin_node_id\x18\x02 \x01(\tR\foriginNodeId\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x03 \x01(\tR\n" +
+	"generation\x12)\n" +
+	"\x10fingerprint_json\x18\x04 \x01(\tR\x0ffingerprintJson\x12%\n" +
+	"\x0eartifact_reach\x18\x05 \x01(\tR\rartifactReach\x12\x1b\n" +
+	"\tcpu_count\x18\x06 \x01(\rR\bcpuCount\x12\x1d\n" +
+	"\n" +
+	"memory_mib\x18\a \x01(\rR\tmemoryMib\x12\x1f\n" +
+	"\vsnapshot_id\x18\b \x01(\tR\n" +
+	"snapshotId\x12)\n" +
+	"\x11paused_at_unix_ms\x18\t \x01(\x03R\x0epausedAtUnixMs\x121\n" +
+	"\x05state\x18\n" +
+	" \x01(\x0e2\x1b.scheduler.v1.MobilityStateR\x05state\x12$\n" +
+	"\x0eholder_node_id\x18\v \x01(\tR\fholderNodeId\x12'\n" +
+	"\x10state_at_unix_ms\x18\f \x01(\x03R\rstateAtUnixMs\"\xa9\x01\n" +
+	"\x1bUpsertMobilityRecordRequest\x124\n" +
+	"\x06record\x18\x01 \x01(\v2\x1c.scheduler.v1.MobilityRecordR\x06record\x12/\n" +
+	"\x13expected_generation\x18\x02 \x01(\tR\x12expectedGeneration\x12#\n" +
+	"\rexpect_absent\x18\x03 \x01(\bR\fexpectAbsent\"8\n" +
+	"\x1cUpsertMobilityRecordResponse\x12\x18\n" +
+	"\aapplied\x18\x01 \x01(\bR\aapplied\"9\n" +
+	"\x18GetMobilityRecordRequest\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"g\n" +
+	"\x19GetMobilityRecordResponse\x124\n" +
+	"\x06record\x18\x01 \x01(\v2\x1c.scheduler.v1.MobilityRecordR\x06record\x12\x14\n" +
+	"\x05found\x18\x02 \x01(\bR\x05found\"B\n" +
+	"\x1aListMobilityRecordsRequest\x12$\n" +
+	"\x0eorigin_node_id\x18\x01 \x01(\tR\foriginNodeId\"U\n" +
+	"\x1bListMobilityRecordsResponse\x126\n" +
+	"\arecords\x18\x01 \x03(\v2\x1c.scheduler.v1.MobilityRecordR\arecords\"<\n" +
+	"\x1bRemoveMobilityRecordRequest\x12\x1d\n" +
+	"\n" +
+	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\"\x1e\n" +
+	"\x1cRemoveMobilityRecordResponse*\x92\x01\n" +
 	"\n" +
 	"NodeStatus\x12\x1b\n" +
 	"\x17NODE_STATUS_UNSPECIFIED\x10\x00\x12\x15\n" +
@@ -2785,8 +3420,12 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x19SANDBOX_EVENT_TYPE_DELETE\x10\x02\x12\x1c\n" +
 	"\x18SANDBOX_EVENT_TYPE_PAUSE\x10\x03\x12\x1d\n" +
 	"\x19SANDBOX_EVENT_TYPE_RESUME\x10\x04\x12\x1b\n" +
-	"\x17SANDBOX_EVENT_TYPE_FORK\x10\x052\x89\n" +
-	"\n" +
+	"\x17SANDBOX_EVENT_TYPE_FORK\x10\x05*\x84\x01\n" +
+	"\rMobilityState\x12\x1e\n" +
+	"\x1aMOBILITY_STATE_UNSPECIFIED\x10\x00\x12\x19\n" +
+	"\x15MOBILITY_STATE_PARKED\x10\x01\x12\x1a\n" +
+	"\x16MOBILITY_STATE_CLAIMED\x10\x02\x12\x1c\n" +
+	"\x18MOBILITY_STATE_EVACUATED\x10\x032\xb9\r\n" +
 	"\tScheduler\x12I\n" +
 	"\bSchedule\x12\x1d.scheduler.v1.ScheduleRequest\x1a\x1e.scheduler.v1.ScheduleResponse\x12L\n" +
 	"\tListNodes\x12\x1e.scheduler.v1.ListNodesRequest\x1a\x1f.scheduler.v1.ListNodesResponse\x12O\n" +
@@ -2802,7 +3441,11 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x11ForgetP2pArtifact\x12&.scheduler.v1.ForgetP2pArtifactRequest\x1a'.scheduler.v1.ForgetP2pArtifactResponse\x12d\n" +
 	"\x11LookupP2pArtifact\x12&.scheduler.v1.LookupP2pArtifactRequest\x1a'.scheduler.v1.LookupP2pArtifactResponse\x12F\n" +
 	"\aGetNode\x12\x1c.scheduler.v1.GetNodeRequest\x1a\x1d.scheduler.v1.GetNodeResponse\x12[\n" +
-	"\x0eUnregisterNode\x12#.scheduler.v1.UnregisterNodeRequest\x1a$.scheduler.v1.UnregisterNodeResponseB)Z'agentenv/services/api/proto;schedulerv1b\x06proto3"
+	"\x0eUnregisterNode\x12#.scheduler.v1.UnregisterNodeRequest\x1a$.scheduler.v1.UnregisterNodeResponse\x12m\n" +
+	"\x14UpsertMobilityRecord\x12).scheduler.v1.UpsertMobilityRecordRequest\x1a*.scheduler.v1.UpsertMobilityRecordResponse\x12d\n" +
+	"\x11GetMobilityRecord\x12&.scheduler.v1.GetMobilityRecordRequest\x1a'.scheduler.v1.GetMobilityRecordResponse\x12j\n" +
+	"\x13ListMobilityRecords\x12(.scheduler.v1.ListMobilityRecordsRequest\x1a).scheduler.v1.ListMobilityRecordsResponse\x12m\n" +
+	"\x14RemoveMobilityRecord\x12).scheduler.v1.RemoveMobilityRecordRequest\x1a*.scheduler.v1.RemoveMobilityRecordResponseB)Z'agentenv/services/api/proto;schedulerv1b\x06proto3"
 
 var (
 	file_api_proto_scheduler_proto_rawDescOnce sync.Once
@@ -2816,113 +3459,135 @@ func file_api_proto_scheduler_proto_rawDescGZIP() []byte {
 	return file_api_proto_scheduler_proto_rawDescData
 }
 
-var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 42)
+var file_api_proto_scheduler_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
+var file_api_proto_scheduler_proto_msgTypes = make([]protoimpl.MessageInfo, 51)
 var file_api_proto_scheduler_proto_goTypes = []any{
-	(NodeStatus)(0),                    // 0: scheduler.v1.NodeStatus
-	(SandboxEventType)(0),              // 1: scheduler.v1.SandboxEventType
-	(*Node)(nil),                       // 2: scheduler.v1.Node
-	(*ScheduleRequestHint)(nil),        // 3: scheduler.v1.ScheduleRequestHint
-	(*NewColdSandboxHint)(nil),         // 4: scheduler.v1.NewColdSandboxHint
-	(*NewSandboxHint)(nil),             // 5: scheduler.v1.NewSandboxHint
-	(*ScheduleRequest)(nil),            // 6: scheduler.v1.ScheduleRequest
-	(*ScheduleResponse)(nil),           // 7: scheduler.v1.ScheduleResponse
-	(*ListNodesRequest)(nil),           // 8: scheduler.v1.ListNodesRequest
-	(*ListNodesResponse)(nil),          // 9: scheduler.v1.ListNodesResponse
-	(*LookupNodeRequest)(nil),          // 10: scheduler.v1.LookupNodeRequest
-	(*LookupNodeResponse)(nil),         // 11: scheduler.v1.LookupNodeResponse
-	(*RecordAssignmentRequest)(nil),    // 12: scheduler.v1.RecordAssignmentRequest
-	(*RecordAssignmentResponse)(nil),   // 13: scheduler.v1.RecordAssignmentResponse
-	(*RecordAssignmentsRequest)(nil),   // 14: scheduler.v1.RecordAssignmentsRequest
-	(*RecordAssignmentsResponse)(nil),  // 15: scheduler.v1.RecordAssignmentsResponse
-	(*RecordAssignmentResult)(nil),     // 16: scheduler.v1.RecordAssignmentResult
-	(*MachineInfo)(nil),                // 17: scheduler.v1.MachineInfo
-	(*DiskMetric)(nil),                 // 18: scheduler.v1.DiskMetric
-	(*NodeSnapshot)(nil),               // 19: scheduler.v1.NodeSnapshot
-	(*P2PEndpoint)(nil),                // 20: scheduler.v1.P2pEndpoint
-	(*ObservedNode)(nil),               // 21: scheduler.v1.ObservedNode
-	(*HeartbeatRequest)(nil),           // 22: scheduler.v1.HeartbeatRequest
-	(*HeartbeatResponse)(nil),          // 23: scheduler.v1.HeartbeatResponse
-	(*SandboxEvent)(nil),               // 24: scheduler.v1.SandboxEvent
-	(*ReportSandboxEventRequest)(nil),  // 25: scheduler.v1.ReportSandboxEventRequest
-	(*ReportSandboxEventResponse)(nil), // 26: scheduler.v1.ReportSandboxEventResponse
-	(*ListObservedNodesRequest)(nil),   // 27: scheduler.v1.ListObservedNodesRequest
-	(*ListObservedNodesResponse)(nil),  // 28: scheduler.v1.ListObservedNodesResponse
-	(*P2PPeer)(nil),                    // 29: scheduler.v1.P2pPeer
-	(*ListP2PPeersRequest)(nil),        // 30: scheduler.v1.ListP2pPeersRequest
-	(*ListP2PPeersResponse)(nil),       // 31: scheduler.v1.ListP2pPeersResponse
-	(*RecordP2PArtifactRequest)(nil),   // 32: scheduler.v1.RecordP2pArtifactRequest
-	(*RecordP2PArtifactResponse)(nil),  // 33: scheduler.v1.RecordP2pArtifactResponse
-	(*ForgetP2PArtifactRequest)(nil),   // 34: scheduler.v1.ForgetP2pArtifactRequest
-	(*ForgetP2PArtifactResponse)(nil),  // 35: scheduler.v1.ForgetP2pArtifactResponse
-	(*LookupP2PArtifactRequest)(nil),   // 36: scheduler.v1.LookupP2pArtifactRequest
-	(*LookupP2PArtifactResponse)(nil),  // 37: scheduler.v1.LookupP2pArtifactResponse
-	(*GetNodeRequest)(nil),             // 38: scheduler.v1.GetNodeRequest
-	(*GetNodeResponse)(nil),            // 39: scheduler.v1.GetNodeResponse
-	(*UnregisterNodeRequest)(nil),      // 40: scheduler.v1.UnregisterNodeRequest
-	(*UnregisterNodeResponse)(nil),     // 41: scheduler.v1.UnregisterNodeResponse
-	nil,                                // 42: scheduler.v1.NewColdSandboxHint.MetadataEntry
-	nil,                                // 43: scheduler.v1.NewSandboxHint.MetadataEntry
+	(NodeStatus)(0),                      // 0: scheduler.v1.NodeStatus
+	(SandboxEventType)(0),                // 1: scheduler.v1.SandboxEventType
+	(MobilityState)(0),                   // 2: scheduler.v1.MobilityState
+	(*Node)(nil),                         // 3: scheduler.v1.Node
+	(*ScheduleRequestHint)(nil),          // 4: scheduler.v1.ScheduleRequestHint
+	(*NewColdSandboxHint)(nil),           // 5: scheduler.v1.NewColdSandboxHint
+	(*NewSandboxHint)(nil),               // 6: scheduler.v1.NewSandboxHint
+	(*ScheduleRequest)(nil),              // 7: scheduler.v1.ScheduleRequest
+	(*ScheduleResponse)(nil),             // 8: scheduler.v1.ScheduleResponse
+	(*ListNodesRequest)(nil),             // 9: scheduler.v1.ListNodesRequest
+	(*ListNodesResponse)(nil),            // 10: scheduler.v1.ListNodesResponse
+	(*LookupNodeRequest)(nil),            // 11: scheduler.v1.LookupNodeRequest
+	(*LookupNodeResponse)(nil),           // 12: scheduler.v1.LookupNodeResponse
+	(*RecordAssignmentRequest)(nil),      // 13: scheduler.v1.RecordAssignmentRequest
+	(*RecordAssignmentResponse)(nil),     // 14: scheduler.v1.RecordAssignmentResponse
+	(*RecordAssignmentsRequest)(nil),     // 15: scheduler.v1.RecordAssignmentsRequest
+	(*RecordAssignmentsResponse)(nil),    // 16: scheduler.v1.RecordAssignmentsResponse
+	(*RecordAssignmentResult)(nil),       // 17: scheduler.v1.RecordAssignmentResult
+	(*MachineInfo)(nil),                  // 18: scheduler.v1.MachineInfo
+	(*DiskMetric)(nil),                   // 19: scheduler.v1.DiskMetric
+	(*NodeSnapshot)(nil),                 // 20: scheduler.v1.NodeSnapshot
+	(*P2PEndpoint)(nil),                  // 21: scheduler.v1.P2pEndpoint
+	(*ObservedNode)(nil),                 // 22: scheduler.v1.ObservedNode
+	(*HeartbeatRequest)(nil),             // 23: scheduler.v1.HeartbeatRequest
+	(*HeartbeatResponse)(nil),            // 24: scheduler.v1.HeartbeatResponse
+	(*SandboxEvent)(nil),                 // 25: scheduler.v1.SandboxEvent
+	(*ReportSandboxEventRequest)(nil),    // 26: scheduler.v1.ReportSandboxEventRequest
+	(*ReportSandboxEventResponse)(nil),   // 27: scheduler.v1.ReportSandboxEventResponse
+	(*ListObservedNodesRequest)(nil),     // 28: scheduler.v1.ListObservedNodesRequest
+	(*ListObservedNodesResponse)(nil),    // 29: scheduler.v1.ListObservedNodesResponse
+	(*P2PPeer)(nil),                      // 30: scheduler.v1.P2pPeer
+	(*ListP2PPeersRequest)(nil),          // 31: scheduler.v1.ListP2pPeersRequest
+	(*ListP2PPeersResponse)(nil),         // 32: scheduler.v1.ListP2pPeersResponse
+	(*RecordP2PArtifactRequest)(nil),     // 33: scheduler.v1.RecordP2pArtifactRequest
+	(*RecordP2PArtifactResponse)(nil),    // 34: scheduler.v1.RecordP2pArtifactResponse
+	(*ForgetP2PArtifactRequest)(nil),     // 35: scheduler.v1.ForgetP2pArtifactRequest
+	(*ForgetP2PArtifactResponse)(nil),    // 36: scheduler.v1.ForgetP2pArtifactResponse
+	(*LookupP2PArtifactRequest)(nil),     // 37: scheduler.v1.LookupP2pArtifactRequest
+	(*LookupP2PArtifactResponse)(nil),    // 38: scheduler.v1.LookupP2pArtifactResponse
+	(*GetNodeRequest)(nil),               // 39: scheduler.v1.GetNodeRequest
+	(*GetNodeResponse)(nil),              // 40: scheduler.v1.GetNodeResponse
+	(*UnregisterNodeRequest)(nil),        // 41: scheduler.v1.UnregisterNodeRequest
+	(*UnregisterNodeResponse)(nil),       // 42: scheduler.v1.UnregisterNodeResponse
+	(*MobilityRecord)(nil),               // 43: scheduler.v1.MobilityRecord
+	(*UpsertMobilityRecordRequest)(nil),  // 44: scheduler.v1.UpsertMobilityRecordRequest
+	(*UpsertMobilityRecordResponse)(nil), // 45: scheduler.v1.UpsertMobilityRecordResponse
+	(*GetMobilityRecordRequest)(nil),     // 46: scheduler.v1.GetMobilityRecordRequest
+	(*GetMobilityRecordResponse)(nil),    // 47: scheduler.v1.GetMobilityRecordResponse
+	(*ListMobilityRecordsRequest)(nil),   // 48: scheduler.v1.ListMobilityRecordsRequest
+	(*ListMobilityRecordsResponse)(nil),  // 49: scheduler.v1.ListMobilityRecordsResponse
+	(*RemoveMobilityRecordRequest)(nil),  // 50: scheduler.v1.RemoveMobilityRecordRequest
+	(*RemoveMobilityRecordResponse)(nil), // 51: scheduler.v1.RemoveMobilityRecordResponse
+	nil,                                  // 52: scheduler.v1.NewColdSandboxHint.MetadataEntry
+	nil,                                  // 53: scheduler.v1.NewSandboxHint.MetadataEntry
 }
 var file_api_proto_scheduler_proto_depIdxs = []int32{
-	4,  // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
-	5,  // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
-	42, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
-	43, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
-	3,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
-	2,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
-	2,  // 6: scheduler.v1.ListNodesResponse.nodes:type_name -> scheduler.v1.Node
-	2,  // 7: scheduler.v1.LookupNodeResponse.node:type_name -> scheduler.v1.Node
-	2,  // 8: scheduler.v1.RecordAssignmentRequest.node:type_name -> scheduler.v1.Node
-	12, // 9: scheduler.v1.RecordAssignmentsRequest.assignments:type_name -> scheduler.v1.RecordAssignmentRequest
-	16, // 10: scheduler.v1.RecordAssignmentsResponse.results:type_name -> scheduler.v1.RecordAssignmentResult
+	5,  // 0: scheduler.v1.ScheduleRequestHint.new_cold_sandbox:type_name -> scheduler.v1.NewColdSandboxHint
+	6,  // 1: scheduler.v1.ScheduleRequestHint.new_sandbox:type_name -> scheduler.v1.NewSandboxHint
+	52, // 2: scheduler.v1.NewColdSandboxHint.metadata:type_name -> scheduler.v1.NewColdSandboxHint.MetadataEntry
+	53, // 3: scheduler.v1.NewSandboxHint.metadata:type_name -> scheduler.v1.NewSandboxHint.MetadataEntry
+	4,  // 4: scheduler.v1.ScheduleRequest.hint:type_name -> scheduler.v1.ScheduleRequestHint
+	3,  // 5: scheduler.v1.ScheduleResponse.node:type_name -> scheduler.v1.Node
+	3,  // 6: scheduler.v1.ListNodesResponse.nodes:type_name -> scheduler.v1.Node
+	3,  // 7: scheduler.v1.LookupNodeResponse.node:type_name -> scheduler.v1.Node
+	3,  // 8: scheduler.v1.RecordAssignmentRequest.node:type_name -> scheduler.v1.Node
+	13, // 9: scheduler.v1.RecordAssignmentsRequest.assignments:type_name -> scheduler.v1.RecordAssignmentRequest
+	17, // 10: scheduler.v1.RecordAssignmentsResponse.results:type_name -> scheduler.v1.RecordAssignmentResult
 	0,  // 11: scheduler.v1.NodeSnapshot.status:type_name -> scheduler.v1.NodeStatus
-	18, // 12: scheduler.v1.NodeSnapshot.disks:type_name -> scheduler.v1.DiskMetric
-	17, // 13: scheduler.v1.ObservedNode.machine_info:type_name -> scheduler.v1.MachineInfo
-	19, // 14: scheduler.v1.ObservedNode.snapshot:type_name -> scheduler.v1.NodeSnapshot
-	17, // 15: scheduler.v1.HeartbeatRequest.machine_info:type_name -> scheduler.v1.MachineInfo
-	19, // 16: scheduler.v1.HeartbeatRequest.snapshot:type_name -> scheduler.v1.NodeSnapshot
-	20, // 17: scheduler.v1.HeartbeatRequest.p2p_endpoint:type_name -> scheduler.v1.P2pEndpoint
+	19, // 12: scheduler.v1.NodeSnapshot.disks:type_name -> scheduler.v1.DiskMetric
+	18, // 13: scheduler.v1.ObservedNode.machine_info:type_name -> scheduler.v1.MachineInfo
+	20, // 14: scheduler.v1.ObservedNode.snapshot:type_name -> scheduler.v1.NodeSnapshot
+	18, // 15: scheduler.v1.HeartbeatRequest.machine_info:type_name -> scheduler.v1.MachineInfo
+	20, // 16: scheduler.v1.HeartbeatRequest.snapshot:type_name -> scheduler.v1.NodeSnapshot
+	21, // 17: scheduler.v1.HeartbeatRequest.p2p_endpoint:type_name -> scheduler.v1.P2pEndpoint
 	1,  // 18: scheduler.v1.SandboxEvent.event_type:type_name -> scheduler.v1.SandboxEventType
-	24, // 19: scheduler.v1.ReportSandboxEventRequest.events:type_name -> scheduler.v1.SandboxEvent
-	21, // 20: scheduler.v1.ListObservedNodesResponse.nodes:type_name -> scheduler.v1.ObservedNode
-	20, // 21: scheduler.v1.P2pPeer.endpoint:type_name -> scheduler.v1.P2pEndpoint
-	29, // 22: scheduler.v1.ListP2pPeersResponse.peers:type_name -> scheduler.v1.P2pPeer
-	29, // 23: scheduler.v1.LookupP2pArtifactResponse.peers:type_name -> scheduler.v1.P2pPeer
-	21, // 24: scheduler.v1.GetNodeResponse.node:type_name -> scheduler.v1.ObservedNode
-	6,  // 25: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
-	8,  // 26: scheduler.v1.Scheduler.ListNodes:input_type -> scheduler.v1.ListNodesRequest
-	10, // 27: scheduler.v1.Scheduler.LookupNode:input_type -> scheduler.v1.LookupNodeRequest
-	12, // 28: scheduler.v1.Scheduler.RecordAssignment:input_type -> scheduler.v1.RecordAssignmentRequest
-	14, // 29: scheduler.v1.Scheduler.RecordAssignments:input_type -> scheduler.v1.RecordAssignmentsRequest
-	22, // 30: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
-	25, // 31: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
-	27, // 32: scheduler.v1.Scheduler.ListObservedNodes:input_type -> scheduler.v1.ListObservedNodesRequest
-	30, // 33: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
-	32, // 34: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
-	34, // 35: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
-	36, // 36: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
-	38, // 37: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
-	40, // 38: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
-	7,  // 39: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
-	9,  // 40: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
-	11, // 41: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
-	13, // 42: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
-	15, // 43: scheduler.v1.Scheduler.RecordAssignments:output_type -> scheduler.v1.RecordAssignmentsResponse
-	23, // 44: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
-	26, // 45: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
-	28, // 46: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
-	31, // 47: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
-	33, // 48: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
-	35, // 49: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
-	37, // 50: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
-	39, // 51: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
-	41, // 52: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
-	39, // [39:53] is the sub-list for method output_type
-	25, // [25:39] is the sub-list for method input_type
-	25, // [25:25] is the sub-list for extension type_name
-	25, // [25:25] is the sub-list for extension extendee
-	0,  // [0:25] is the sub-list for field type_name
+	25, // 19: scheduler.v1.ReportSandboxEventRequest.events:type_name -> scheduler.v1.SandboxEvent
+	22, // 20: scheduler.v1.ListObservedNodesResponse.nodes:type_name -> scheduler.v1.ObservedNode
+	21, // 21: scheduler.v1.P2pPeer.endpoint:type_name -> scheduler.v1.P2pEndpoint
+	30, // 22: scheduler.v1.ListP2pPeersResponse.peers:type_name -> scheduler.v1.P2pPeer
+	30, // 23: scheduler.v1.LookupP2pArtifactResponse.peers:type_name -> scheduler.v1.P2pPeer
+	22, // 24: scheduler.v1.GetNodeResponse.node:type_name -> scheduler.v1.ObservedNode
+	2,  // 25: scheduler.v1.MobilityRecord.state:type_name -> scheduler.v1.MobilityState
+	43, // 26: scheduler.v1.UpsertMobilityRecordRequest.record:type_name -> scheduler.v1.MobilityRecord
+	43, // 27: scheduler.v1.GetMobilityRecordResponse.record:type_name -> scheduler.v1.MobilityRecord
+	43, // 28: scheduler.v1.ListMobilityRecordsResponse.records:type_name -> scheduler.v1.MobilityRecord
+	7,  // 29: scheduler.v1.Scheduler.Schedule:input_type -> scheduler.v1.ScheduleRequest
+	9,  // 30: scheduler.v1.Scheduler.ListNodes:input_type -> scheduler.v1.ListNodesRequest
+	11, // 31: scheduler.v1.Scheduler.LookupNode:input_type -> scheduler.v1.LookupNodeRequest
+	13, // 32: scheduler.v1.Scheduler.RecordAssignment:input_type -> scheduler.v1.RecordAssignmentRequest
+	15, // 33: scheduler.v1.Scheduler.RecordAssignments:input_type -> scheduler.v1.RecordAssignmentsRequest
+	23, // 34: scheduler.v1.Scheduler.Heartbeat:input_type -> scheduler.v1.HeartbeatRequest
+	26, // 35: scheduler.v1.Scheduler.ReportSandboxEvent:input_type -> scheduler.v1.ReportSandboxEventRequest
+	28, // 36: scheduler.v1.Scheduler.ListObservedNodes:input_type -> scheduler.v1.ListObservedNodesRequest
+	31, // 37: scheduler.v1.Scheduler.ListP2pPeers:input_type -> scheduler.v1.ListP2pPeersRequest
+	33, // 38: scheduler.v1.Scheduler.RecordP2pArtifact:input_type -> scheduler.v1.RecordP2pArtifactRequest
+	35, // 39: scheduler.v1.Scheduler.ForgetP2pArtifact:input_type -> scheduler.v1.ForgetP2pArtifactRequest
+	37, // 40: scheduler.v1.Scheduler.LookupP2pArtifact:input_type -> scheduler.v1.LookupP2pArtifactRequest
+	39, // 41: scheduler.v1.Scheduler.GetNode:input_type -> scheduler.v1.GetNodeRequest
+	41, // 42: scheduler.v1.Scheduler.UnregisterNode:input_type -> scheduler.v1.UnregisterNodeRequest
+	44, // 43: scheduler.v1.Scheduler.UpsertMobilityRecord:input_type -> scheduler.v1.UpsertMobilityRecordRequest
+	46, // 44: scheduler.v1.Scheduler.GetMobilityRecord:input_type -> scheduler.v1.GetMobilityRecordRequest
+	48, // 45: scheduler.v1.Scheduler.ListMobilityRecords:input_type -> scheduler.v1.ListMobilityRecordsRequest
+	50, // 46: scheduler.v1.Scheduler.RemoveMobilityRecord:input_type -> scheduler.v1.RemoveMobilityRecordRequest
+	8,  // 47: scheduler.v1.Scheduler.Schedule:output_type -> scheduler.v1.ScheduleResponse
+	10, // 48: scheduler.v1.Scheduler.ListNodes:output_type -> scheduler.v1.ListNodesResponse
+	12, // 49: scheduler.v1.Scheduler.LookupNode:output_type -> scheduler.v1.LookupNodeResponse
+	14, // 50: scheduler.v1.Scheduler.RecordAssignment:output_type -> scheduler.v1.RecordAssignmentResponse
+	16, // 51: scheduler.v1.Scheduler.RecordAssignments:output_type -> scheduler.v1.RecordAssignmentsResponse
+	24, // 52: scheduler.v1.Scheduler.Heartbeat:output_type -> scheduler.v1.HeartbeatResponse
+	27, // 53: scheduler.v1.Scheduler.ReportSandboxEvent:output_type -> scheduler.v1.ReportSandboxEventResponse
+	29, // 54: scheduler.v1.Scheduler.ListObservedNodes:output_type -> scheduler.v1.ListObservedNodesResponse
+	32, // 55: scheduler.v1.Scheduler.ListP2pPeers:output_type -> scheduler.v1.ListP2pPeersResponse
+	34, // 56: scheduler.v1.Scheduler.RecordP2pArtifact:output_type -> scheduler.v1.RecordP2pArtifactResponse
+	36, // 57: scheduler.v1.Scheduler.ForgetP2pArtifact:output_type -> scheduler.v1.ForgetP2pArtifactResponse
+	38, // 58: scheduler.v1.Scheduler.LookupP2pArtifact:output_type -> scheduler.v1.LookupP2pArtifactResponse
+	40, // 59: scheduler.v1.Scheduler.GetNode:output_type -> scheduler.v1.GetNodeResponse
+	42, // 60: scheduler.v1.Scheduler.UnregisterNode:output_type -> scheduler.v1.UnregisterNodeResponse
+	45, // 61: scheduler.v1.Scheduler.UpsertMobilityRecord:output_type -> scheduler.v1.UpsertMobilityRecordResponse
+	47, // 62: scheduler.v1.Scheduler.GetMobilityRecord:output_type -> scheduler.v1.GetMobilityRecordResponse
+	49, // 63: scheduler.v1.Scheduler.ListMobilityRecords:output_type -> scheduler.v1.ListMobilityRecordsResponse
+	51, // 64: scheduler.v1.Scheduler.RemoveMobilityRecord:output_type -> scheduler.v1.RemoveMobilityRecordResponse
+	47, // [47:65] is the sub-list for method output_type
+	29, // [29:47] is the sub-list for method input_type
+	29, // [29:29] is the sub-list for extension type_name
+	29, // [29:29] is the sub-list for extension extendee
+	0,  // [0:29] is the sub-list for field type_name
 }
 
 func init() { file_api_proto_scheduler_proto_init() }
@@ -2939,8 +3604,8 @@ func file_api_proto_scheduler_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_api_proto_scheduler_proto_rawDesc), len(file_api_proto_scheduler_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   42,
+			NumEnums:      3,
+			NumMessages:   51,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

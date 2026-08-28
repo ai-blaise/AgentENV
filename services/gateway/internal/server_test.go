@@ -166,6 +166,40 @@ func (s stubSchedulerClient) GetNode(ctx context.Context, req *schedulerv1.GetNo
 	return s.getNodeFunc(ctx, req, opts...)
 }
 
+// The mobility RPCs are scheduler-side bookkeeping the gateway never calls;
+// the stub implements them so it still satisfies the client interface.
+func (s stubSchedulerClient) UpsertMobilityRecord(
+	_ context.Context,
+	_ *schedulerv1.UpsertMobilityRecordRequest,
+	_ ...grpc.CallOption,
+) (*schedulerv1.UpsertMobilityRecordResponse, error) {
+	return nil, errors.New("gateway does not call UpsertMobilityRecord")
+}
+
+func (s stubSchedulerClient) GetMobilityRecord(
+	_ context.Context,
+	_ *schedulerv1.GetMobilityRecordRequest,
+	_ ...grpc.CallOption,
+) (*schedulerv1.GetMobilityRecordResponse, error) {
+	return nil, errors.New("gateway does not call GetMobilityRecord")
+}
+
+func (s stubSchedulerClient) ListMobilityRecords(
+	_ context.Context,
+	_ *schedulerv1.ListMobilityRecordsRequest,
+	_ ...grpc.CallOption,
+) (*schedulerv1.ListMobilityRecordsResponse, error) {
+	return nil, errors.New("gateway does not call ListMobilityRecords")
+}
+
+func (s stubSchedulerClient) RemoveMobilityRecord(
+	_ context.Context,
+	_ *schedulerv1.RemoveMobilityRecordRequest,
+	_ ...grpc.CallOption,
+) (*schedulerv1.RemoveMobilityRecordResponse, error) {
+	return nil, errors.New("gateway does not call RemoveMobilityRecord")
+}
+
 func (s stubSchedulerClient) UnregisterNode(ctx context.Context, req *schedulerv1.UnregisterNodeRequest, opts ...grpc.CallOption) (*schedulerv1.UnregisterNodeResponse, error) {
 	if s.unregisterNodeFunc == nil {
 		return nil, fmt.Errorf("unexpected UnregisterNode call")

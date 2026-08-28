@@ -10,6 +10,7 @@ mod lease;
 mod record;
 mod runtime;
 mod saga;
+mod scheduler_store;
 
 pub use claim::{ClaimOutcome, MobilityCoordinator, ResumeFence, DEFAULT_CLAIM_TTL};
 pub use evacuation::{
@@ -22,6 +23,8 @@ pub use record::{
     MobilityWrite,
 };
 pub use runtime::{
-    open_mobility_runtime, MobilityHooks, MobilityRecordCounts, MobilityRuntime, NodeMobilityFacts,
+    mobility_runtime_with_store, open_mobility_runtime, MobilityHooks, MobilityRecordCounts,
+    MobilityRuntime, NodeMobilityFacts,
 };
 pub use saga::{MigrationOutcome, MigrationSaga, MigrationSteps};
+pub use scheduler_store::{scheduler_mobility_store, SchedulerMobilityStore};

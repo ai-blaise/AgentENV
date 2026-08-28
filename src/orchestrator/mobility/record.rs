@@ -44,6 +44,15 @@ const MOBILITY_KEY_PREFIX: &str = "mobility/v1/";
 pub struct MobilityGeneration(Uuid);
 
 impl MobilityGeneration {
+    /// Reads a generation off the wire.
+    ///
+    /// Parsed rather than trusted as an opaque string, so a malformed value is
+    /// refused at the boundary instead of silently ordering wrongly against
+    /// every real generation.
+    pub fn parse_str(value: &str) -> Result<Self, uuid::Error> {
+        Ok(Self(Uuid::parse_str(value)?))
+    }
+
     /// Mints a generation that sorts after every generation minted earlier.
     pub fn now() -> Self {
         Self(Uuid::now_v7())
@@ -210,11 +219,34 @@ pub enum MobilityWrite {
     Superseded,
 }
 
-/// Durable per-node index of paused sandboxes that could move.
+/// Durable index of paused sandboxes that could move.
 #[async_trait]
 pub trait MobilityStore: Send + Sync {
-    /// Writes `record` unless a newer generation is already stored.
+    /// Writes `record` unless a generation at least as new is already stored.
+    ///
+    /// Sufficient for bookkeeping — recording a pause, dropping a record — but
+    /// NOT for arbitrating a claim. Every caller mints a fresh generation, so
+    /// every caller's write supersedes whatever it read, and two claimants
+    /// racing are both told they won. Use [`Self::compare_and_set`] wherever
+    /// the answer decides who owns a sandbox.
     async fn upsert(&self, record: &MobilityRecord) -> Result<MobilityWrite>;
+
+    /// Writes `record` only if the stored generation is exactly `expected`.
+    ///
+    /// `None` means "only if no record exists". This is what makes a claim an
+    /// arbitration rather than a race: a claimant reads a record, decides from
+    /// it, and writes conditional on nothing having changed underneath. A
+    /// second claimant that read the same state finds its expectation stale
+    /// and is told it lost.
+    ///
+    /// Without this the protocol has no mutual exclusion at all — generation
+    /// ordering alone cannot provide it, because the loser's generation is
+    /// also newer than what it read.
+    async fn compare_and_set(
+        &self,
+        expected: Option<MobilityGeneration>,
+        record: &MobilityRecord,
+    ) -> Result<MobilityWrite>;
     async fn get(&self, sandbox_id: &SandboxId) -> Result<Option<MobilityRecord>>;
     async fn list(&self) -> Result<Vec<MobilityRecord>>;
     /// Removes a record outright.
@@ -228,6 +260,17 @@ pub trait MobilityStore: Send + Sync {
 #[derive(Clone)]
 pub struct LocalMobilityStore {
     store: Arc<LocalKvStore>,
+    /// Serialises read-modify-write so a compare-and-set is actually atomic.
+    ///
+    /// RocksDB offers no transaction through this wrapper, and the window
+    /// between reading a record and writing it back is precisely what lets two
+    /// claimants both believe they won. One process-wide lock closes it; the
+    /// critical section is two key operations and is only taken on writes.
+    ///
+    /// This makes the local store correct for concurrency *within* one node.
+    /// It does nothing across nodes — that is why a cluster keeps its records
+    /// in the scheduler instead.
+    write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl LocalMobilityStore {
@@ -239,11 +282,15 @@ impl LocalMobilityStore {
     pub async fn open(path: impl Into<std::path::PathBuf>) -> Result<Self> {
         Ok(Self {
             store: Arc::new(LocalKvStore::open(path, LocalStoreDurability::Sync).await?),
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
     pub fn from_store(store: Arc<LocalKvStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            write_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     fn decode(value: &[u8]) -> Result<MobilityRecord> {
@@ -254,15 +301,31 @@ impl LocalMobilityStore {
 #[async_trait]
 impl MobilityStore for LocalMobilityStore {
     async fn upsert(&self, record: &MobilityRecord) -> Result<MobilityWrite> {
-        // Read-then-write rather than a compare-and-swap: RocksDB gives no CAS
-        // here, and the store is written only by this node's own orchestrator,
-        // which serializes its lifecycle transitions per sandbox. The check
-        // exists to discard a late write from a superseded in-process task, not
-        // to arbitrate between nodes — that is the claim protocol's job.
+        // Held across the read and the write, so a late write from a
+        // superseded task cannot slip between them.
+        let _guard = self.write_lock.lock().await;
         if let Some(existing) = self.get(&record.sandbox_id).await? {
             if !record.generation.supersedes(&existing.generation) {
                 return Ok(MobilityWrite::Superseded);
             }
+        }
+        let value = serde_json::to_vec(record).context("encode mobility record")?;
+        self.store.put(record.key(), value).await?;
+        Ok(MobilityWrite::Applied)
+    }
+
+    async fn compare_and_set(
+        &self,
+        expected: Option<MobilityGeneration>,
+        record: &MobilityRecord,
+    ) -> Result<MobilityWrite> {
+        let _guard = self.write_lock.lock().await;
+        let current = self
+            .get(&record.sandbox_id)
+            .await?
+            .map(|record| record.generation);
+        if current != expected {
+            return Ok(MobilityWrite::Superseded);
         }
         let value = serde_json::to_vec(record).context("encode mobility record")?;
         self.store.put(record.key(), value).await?;

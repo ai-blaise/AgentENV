@@ -169,7 +169,16 @@ impl<S: MobilityStore> MobilityCoordinator<S> {
             by_node_id: self.node_id.clone(),
             at_unix_ms: unix_millis(now),
         });
-        match self.store.upsert(&claimed).await? {
+        // Conditional on the generation this decision was made from. An
+        // unconditional write would supersede whatever it found — including a
+        // rival's claim written in the meantime — and both claimants would be
+        // told they won. Generation ordering cannot arbitrate here, because
+        // the loser's generation is also newer than what it read.
+        match self
+            .store
+            .compare_and_set(Some(record.generation), &claimed)
+            .await?
+        {
             MobilityWrite::Applied => Ok(ClaimOutcome::Claimed(Box::new(claimed))),
             MobilityWrite::Superseded => Ok(ClaimOutcome::Superseded),
         }
@@ -190,7 +199,9 @@ impl<S: MobilityStore> MobilityCoordinator<S> {
         }
         let released = record.transitioned_to(MobilityState::Parked);
         Ok(matches!(
-            self.store.upsert(&released).await?,
+            self.store
+                .compare_and_set(Some(record.generation), &released)
+                .await?,
             MobilityWrite::Applied
         ))
     }
@@ -211,8 +222,12 @@ impl<S: MobilityStore> MobilityCoordinator<S> {
             to_node_id: self.node_id.clone(),
             at_unix_ms: unix_millis(now),
         });
+        // Conditional too: the commit is the point of no return, and it must
+        // not overwrite a rival that took the claim while this node restored.
         Ok(matches!(
-            self.store.upsert(&evacuated).await?,
+            self.store
+                .compare_and_set(Some(record.generation), &evacuated)
+                .await?,
             MobilityWrite::Applied
         ))
     }
@@ -645,4 +660,178 @@ mod tests {
             ResumeFence::Allowed
         );
     }
+}
+
+#[cfg(test)]
+mod arbitration_tests {
+    use super::*;
+    use crate::orchestrator::mobility::record::{LocalMobilityStore, MobilityRecord};
+    use crate::orchestrator::store::SandboxMetadata;
+    use crate::snapshot::{ArtifactReach, SnapshotRuntimeVersions};
+    use crate::virtualization::VirtualizationMode;
+    use std::sync::Arc;
+
+    async fn parked() -> (LocalMobilityStore, SandboxId, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalMobilityStore::open(dir.path().join("mobility"))
+            .await
+            .expect("store");
+        let metadata = SandboxMetadata {
+            runtime_versions: SnapshotRuntimeVersions {
+                kernel_version: "vmlinux-6.1.175".to_string(),
+                firecracker_version: "1.15.1".to_string(),
+                envd_version: "0.5.15".to_string(),
+                tools_drive_version: "0.1.0".to_string(),
+            },
+            virtualization_mode: VirtualizationMode::Kvm,
+            ..SandboxMetadata::default()
+        };
+        store
+            .upsert(&MobilityRecord::for_paused(
+                &metadata,
+                "node-a",
+                "x86_64",
+                Some("{}".to_string()),
+                4096,
+                ArtifactReach::ClusterShared,
+                Some("snap-1".to_string()),
+            ))
+            .await
+            .expect("seed");
+        (store, metadata.id, dir)
+    }
+
+    /// The property the whole protocol exists for. Claiming used to be a read
+    /// followed by an unconditional write: every claimant minted a newer
+    /// generation, so every claimant's write superseded what it read and all
+    /// of them were told they won. Two winners means two nodes restore one
+    /// sandbox and both write its drives.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_claimants_produce_exactly_one_winner() {
+        let (store, sandbox_id, _dir) = parked().await;
+
+        let mut handles = Vec::new();
+        for index in 0..24 {
+            let coordinator = MobilityCoordinator::new(store.clone(), format!("node-{index}"));
+            handles.push(tokio::spawn(async move {
+                matches!(
+                    coordinator.claim(&sandbox_id).await.expect("claim"),
+                    ClaimOutcome::Claimed(_)
+                )
+            }));
+        }
+
+        let mut winners = 0;
+        for handle in handles {
+            if handle.await.expect("join") {
+                winners += 1;
+            }
+        }
+        assert_eq!(
+            winners, 1,
+            "exactly one claimant may win; {winners} did, which is two nodes running one sandbox"
+        );
+
+        // And the store agrees with whoever that was.
+        let stored = store.get(&sandbox_id).await.expect("get").expect("record");
+        assert!(
+            matches!(stored.state, MobilityState::Claimed { .. }),
+            "the winning claim must be the stored state, got {:?}",
+            stored.state
+        );
+    }
+
+    /// The catastrophic pairing: the origin resuming locally while a
+    /// destination claims. Both used to succeed, and only the destination had
+    /// a lease guardian that would ever find out.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_local_resume_racing_a_remote_claim_has_one_winner() {
+        for _ in 0..24 {
+            let (store, sandbox_id, _dir) = parked().await;
+            let origin = MobilityCoordinator::new(store.clone(), "node-a");
+            let destination = MobilityCoordinator::new(store.clone(), "node-b");
+
+            let resume = tokio::spawn(async move {
+                origin
+                    .claim_for_local_resume(&sandbox_id)
+                    .await
+                    .expect("resume")
+            });
+            let claim =
+                tokio::spawn(async move { destination.claim(&sandbox_id).await.expect("claim") });
+
+            let resumed = matches!(resume.await.expect("join"), ResumeFence::Allowed);
+            let claimed = matches!(claim.await.expect("join"), ClaimOutcome::Claimed(_));
+            assert!(
+                !(resumed && claimed),
+                "the origin resumed and a destination claimed the same sandbox"
+            );
+        }
+    }
+
+    /// A stale expectation must lose. This is the mechanism the two tests
+    /// above rely on, asserted directly so a regression names itself.
+    #[tokio::test]
+    async fn a_write_conditional_on_a_stale_generation_is_refused() {
+        let (store, sandbox_id, _dir) = parked().await;
+        let original = store.get(&sandbox_id).await.expect("get").expect("record");
+
+        let first = original.transitioned_to(MobilityState::Claimed {
+            by_node_id: "node-b".to_string(),
+            at_unix_ms: 1,
+        });
+        assert_eq!(
+            store
+                .compare_and_set(Some(original.generation), &first)
+                .await
+                .expect("first"),
+            MobilityWrite::Applied
+        );
+
+        // A rival that read the same original state now writes with the
+        // expectation it formed then.
+        let second = original.transitioned_to(MobilityState::Claimed {
+            by_node_id: "node-c".to_string(),
+            at_unix_ms: 2,
+        });
+        assert_eq!(
+            store
+                .compare_and_set(Some(original.generation), &second)
+                .await
+                .expect("second"),
+            MobilityWrite::Superseded,
+            "a stale expectation must lose even though its generation is newer"
+        );
+
+        let stored = store.get(&sandbox_id).await.expect("get").expect("record");
+        assert!(
+            matches!(stored.state, MobilityState::Claimed { ref by_node_id, .. } if by_node_id == "node-b"),
+            "the first writer must still hold it, got {:?}",
+            stored.state
+        );
+    }
+
+    /// Expecting absence is distinct from not checking, and a record that
+    /// appeared in between must make the write lose.
+    #[tokio::test]
+    async fn expecting_absence_loses_once_a_record_exists() {
+        let (store, sandbox_id, _dir) = parked().await;
+        let existing = store.get(&sandbox_id).await.expect("get").expect("record");
+        let replacement = existing.transitioned_to(MobilityState::Parked);
+
+        assert_eq!(
+            store
+                .compare_and_set(None, &replacement)
+                .await
+                .expect("cas"),
+            MobilityWrite::Superseded,
+            "expecting no record must fail when one exists"
+        );
+    }
+
+    use std::sync::Arc as _Arc;
+    const _: fn() = || {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<_Arc<LocalMobilityStore>>();
+    };
 }

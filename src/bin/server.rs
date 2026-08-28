@@ -144,22 +144,49 @@ async fn main() -> anyhow::Result<()> {
     // rather than not at all: refusing to start would turn an optional feature
     // into a boot dependency.
     if config.snapshot.mobility.enabled {
-        match agentenv::orchestrator::open_mobility_runtime(
-            &config.snapshot.mobility.store_path,
-            identity.id.clone(),
-            agentenv::orchestrator::NodeMobilityFacts {
-                cpu_architecture: agentenv::observability::detect_cpu_architecture(),
-                cluster_cpu_config: Arc::clone(&cluster_cpu_arc),
-                memory_page_size: agentenv::observability::host_page_size(),
-                artifact_reach: config.snapshot.artifact_reach(),
-            },
-        )
-        .await
-        {
-            Ok(mobility) => {
-                info!(target: "agentenv", "sandbox mobility enabled");
-                orchestrator.install_mobility(mobility);
+        let facts = agentenv::orchestrator::NodeMobilityFacts {
+            cpu_architecture: agentenv::observability::detect_cpu_architecture(),
+            cluster_cpu_config: Arc::clone(&cluster_cpu_arc),
+            memory_page_size: agentenv::observability::host_page_size(),
+            artifact_reach: config.snapshot.artifact_reach(),
+        };
+
+        // Where the records live decides whether the claim protocol can
+        // arbitrate at all. A destination and an origin are different machines
+        // and cannot agree through a store on one of their disks, so a node in
+        // a cluster keeps its records in the scheduler. The local store is
+        // correct only for a node talking to itself.
+        let installed = match config.cluster.scheduler_endpoint.as_deref() {
+            Some(endpoint) => agentenv::orchestrator::scheduler_mobility_store(
+                endpoint,
+                identity.id.clone(),
+            )
+            .map(|store| {
+                info!(target: "agentenv", %endpoint, "sandbox mobility enabled against the scheduler");
+                agentenv::orchestrator::mobility_runtime_with_store(
+                    store,
+                    identity.id.clone(),
+                    facts.clone(),
+                )
+            }),
+            None => {
+                warn!(
+                    target: "agentenv",
+                    "sandbox mobility is enabled with no scheduler configured; records stay on \
+                     this node, so a paused sandbox can be tracked and drained but no other node \
+                     can claim it"
+                );
+                agentenv::orchestrator::open_mobility_runtime(
+                    &config.snapshot.mobility.store_path,
+                    identity.id.clone(),
+                    facts,
+                )
+                .await
             }
+        };
+
+        match installed {
+            Ok(mobility) => orchestrator.install_mobility(mobility),
             Err(error) => warn!(
                 target: "agentenv",
                 error = %error,

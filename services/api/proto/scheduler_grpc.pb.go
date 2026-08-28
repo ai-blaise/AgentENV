@@ -19,20 +19,24 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Scheduler_Schedule_FullMethodName           = "/scheduler.v1.Scheduler/Schedule"
-	Scheduler_ListNodes_FullMethodName          = "/scheduler.v1.Scheduler/ListNodes"
-	Scheduler_LookupNode_FullMethodName         = "/scheduler.v1.Scheduler/LookupNode"
-	Scheduler_RecordAssignment_FullMethodName   = "/scheduler.v1.Scheduler/RecordAssignment"
-	Scheduler_RecordAssignments_FullMethodName  = "/scheduler.v1.Scheduler/RecordAssignments"
-	Scheduler_Heartbeat_FullMethodName          = "/scheduler.v1.Scheduler/Heartbeat"
-	Scheduler_ReportSandboxEvent_FullMethodName = "/scheduler.v1.Scheduler/ReportSandboxEvent"
-	Scheduler_ListObservedNodes_FullMethodName  = "/scheduler.v1.Scheduler/ListObservedNodes"
-	Scheduler_ListP2PPeers_FullMethodName       = "/scheduler.v1.Scheduler/ListP2pPeers"
-	Scheduler_RecordP2PArtifact_FullMethodName  = "/scheduler.v1.Scheduler/RecordP2pArtifact"
-	Scheduler_ForgetP2PArtifact_FullMethodName  = "/scheduler.v1.Scheduler/ForgetP2pArtifact"
-	Scheduler_LookupP2PArtifact_FullMethodName  = "/scheduler.v1.Scheduler/LookupP2pArtifact"
-	Scheduler_GetNode_FullMethodName            = "/scheduler.v1.Scheduler/GetNode"
-	Scheduler_UnregisterNode_FullMethodName     = "/scheduler.v1.Scheduler/UnregisterNode"
+	Scheduler_Schedule_FullMethodName             = "/scheduler.v1.Scheduler/Schedule"
+	Scheduler_ListNodes_FullMethodName            = "/scheduler.v1.Scheduler/ListNodes"
+	Scheduler_LookupNode_FullMethodName           = "/scheduler.v1.Scheduler/LookupNode"
+	Scheduler_RecordAssignment_FullMethodName     = "/scheduler.v1.Scheduler/RecordAssignment"
+	Scheduler_RecordAssignments_FullMethodName    = "/scheduler.v1.Scheduler/RecordAssignments"
+	Scheduler_Heartbeat_FullMethodName            = "/scheduler.v1.Scheduler/Heartbeat"
+	Scheduler_ReportSandboxEvent_FullMethodName   = "/scheduler.v1.Scheduler/ReportSandboxEvent"
+	Scheduler_ListObservedNodes_FullMethodName    = "/scheduler.v1.Scheduler/ListObservedNodes"
+	Scheduler_ListP2PPeers_FullMethodName         = "/scheduler.v1.Scheduler/ListP2pPeers"
+	Scheduler_RecordP2PArtifact_FullMethodName    = "/scheduler.v1.Scheduler/RecordP2pArtifact"
+	Scheduler_ForgetP2PArtifact_FullMethodName    = "/scheduler.v1.Scheduler/ForgetP2pArtifact"
+	Scheduler_LookupP2PArtifact_FullMethodName    = "/scheduler.v1.Scheduler/LookupP2pArtifact"
+	Scheduler_GetNode_FullMethodName              = "/scheduler.v1.Scheduler/GetNode"
+	Scheduler_UnregisterNode_FullMethodName       = "/scheduler.v1.Scheduler/UnregisterNode"
+	Scheduler_UpsertMobilityRecord_FullMethodName = "/scheduler.v1.Scheduler/UpsertMobilityRecord"
+	Scheduler_GetMobilityRecord_FullMethodName    = "/scheduler.v1.Scheduler/GetMobilityRecord"
+	Scheduler_ListMobilityRecords_FullMethodName  = "/scheduler.v1.Scheduler/ListMobilityRecords"
+	Scheduler_RemoveMobilityRecord_FullMethodName = "/scheduler.v1.Scheduler/RemoveMobilityRecord"
 )
 
 // SchedulerClient is the client API for Scheduler service.
@@ -53,6 +57,17 @@ type SchedulerClient interface {
 	LookupP2PArtifact(ctx context.Context, in *LookupP2PArtifactRequest, opts ...grpc.CallOption) (*LookupP2PArtifactResponse, error)
 	GetNode(ctx context.Context, in *GetNodeRequest, opts ...grpc.CallOption) (*GetNodeResponse, error)
 	UnregisterNode(ctx context.Context, in *UnregisterNodeRequest, opts ...grpc.CallOption) (*UnregisterNodeResponse, error)
+	// Paused-sandbox mobility records.
+	//
+	// These live here rather than on each node because the claim protocol they
+	// support is inherently cross-node: a destination takes a sandbox from an
+	// origin, and two nodes cannot arbitrate through a store on one of their
+	// disks. The scheduler is already the cluster-wide authority for which node
+	// owns a sandbox, and already has a durable store behind it.
+	UpsertMobilityRecord(ctx context.Context, in *UpsertMobilityRecordRequest, opts ...grpc.CallOption) (*UpsertMobilityRecordResponse, error)
+	GetMobilityRecord(ctx context.Context, in *GetMobilityRecordRequest, opts ...grpc.CallOption) (*GetMobilityRecordResponse, error)
+	ListMobilityRecords(ctx context.Context, in *ListMobilityRecordsRequest, opts ...grpc.CallOption) (*ListMobilityRecordsResponse, error)
+	RemoveMobilityRecord(ctx context.Context, in *RemoveMobilityRecordRequest, opts ...grpc.CallOption) (*RemoveMobilityRecordResponse, error)
 }
 
 type schedulerClient struct {
@@ -203,6 +218,46 @@ func (c *schedulerClient) UnregisterNode(ctx context.Context, in *UnregisterNode
 	return out, nil
 }
 
+func (c *schedulerClient) UpsertMobilityRecord(ctx context.Context, in *UpsertMobilityRecordRequest, opts ...grpc.CallOption) (*UpsertMobilityRecordResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(UpsertMobilityRecordResponse)
+	err := c.cc.Invoke(ctx, Scheduler_UpsertMobilityRecord_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerClient) GetMobilityRecord(ctx context.Context, in *GetMobilityRecordRequest, opts ...grpc.CallOption) (*GetMobilityRecordResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetMobilityRecordResponse)
+	err := c.cc.Invoke(ctx, Scheduler_GetMobilityRecord_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerClient) ListMobilityRecords(ctx context.Context, in *ListMobilityRecordsRequest, opts ...grpc.CallOption) (*ListMobilityRecordsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListMobilityRecordsResponse)
+	err := c.cc.Invoke(ctx, Scheduler_ListMobilityRecords_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *schedulerClient) RemoveMobilityRecord(ctx context.Context, in *RemoveMobilityRecordRequest, opts ...grpc.CallOption) (*RemoveMobilityRecordResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RemoveMobilityRecordResponse)
+	err := c.cc.Invoke(ctx, Scheduler_RemoveMobilityRecord_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // SchedulerServer is the server API for Scheduler service.
 // All implementations must embed UnimplementedSchedulerServer
 // for forward compatibility.
@@ -221,6 +276,17 @@ type SchedulerServer interface {
 	LookupP2PArtifact(context.Context, *LookupP2PArtifactRequest) (*LookupP2PArtifactResponse, error)
 	GetNode(context.Context, *GetNodeRequest) (*GetNodeResponse, error)
 	UnregisterNode(context.Context, *UnregisterNodeRequest) (*UnregisterNodeResponse, error)
+	// Paused-sandbox mobility records.
+	//
+	// These live here rather than on each node because the claim protocol they
+	// support is inherently cross-node: a destination takes a sandbox from an
+	// origin, and two nodes cannot arbitrate through a store on one of their
+	// disks. The scheduler is already the cluster-wide authority for which node
+	// owns a sandbox, and already has a durable store behind it.
+	UpsertMobilityRecord(context.Context, *UpsertMobilityRecordRequest) (*UpsertMobilityRecordResponse, error)
+	GetMobilityRecord(context.Context, *GetMobilityRecordRequest) (*GetMobilityRecordResponse, error)
+	ListMobilityRecords(context.Context, *ListMobilityRecordsRequest) (*ListMobilityRecordsResponse, error)
+	RemoveMobilityRecord(context.Context, *RemoveMobilityRecordRequest) (*RemoveMobilityRecordResponse, error)
 	mustEmbedUnimplementedSchedulerServer()
 }
 
@@ -272,6 +338,18 @@ func (UnimplementedSchedulerServer) GetNode(context.Context, *GetNodeRequest) (*
 }
 func (UnimplementedSchedulerServer) UnregisterNode(context.Context, *UnregisterNodeRequest) (*UnregisterNodeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method UnregisterNode not implemented")
+}
+func (UnimplementedSchedulerServer) UpsertMobilityRecord(context.Context, *UpsertMobilityRecordRequest) (*UpsertMobilityRecordResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method UpsertMobilityRecord not implemented")
+}
+func (UnimplementedSchedulerServer) GetMobilityRecord(context.Context, *GetMobilityRecordRequest) (*GetMobilityRecordResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetMobilityRecord not implemented")
+}
+func (UnimplementedSchedulerServer) ListMobilityRecords(context.Context, *ListMobilityRecordsRequest) (*ListMobilityRecordsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListMobilityRecords not implemented")
+}
+func (UnimplementedSchedulerServer) RemoveMobilityRecord(context.Context, *RemoveMobilityRecordRequest) (*RemoveMobilityRecordResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveMobilityRecord not implemented")
 }
 func (UnimplementedSchedulerServer) mustEmbedUnimplementedSchedulerServer() {}
 func (UnimplementedSchedulerServer) testEmbeddedByValue()                   {}
@@ -546,6 +624,78 @@ func _Scheduler_UnregisterNode_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Scheduler_UpsertMobilityRecord_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(UpsertMobilityRecordRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).UpsertMobilityRecord(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_UpsertMobilityRecord_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).UpsertMobilityRecord(ctx, req.(*UpsertMobilityRecordRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Scheduler_GetMobilityRecord_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetMobilityRecordRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).GetMobilityRecord(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_GetMobilityRecord_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).GetMobilityRecord(ctx, req.(*GetMobilityRecordRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Scheduler_ListMobilityRecords_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListMobilityRecordsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).ListMobilityRecords(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_ListMobilityRecords_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).ListMobilityRecords(ctx, req.(*ListMobilityRecordsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Scheduler_RemoveMobilityRecord_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveMobilityRecordRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(SchedulerServer).RemoveMobilityRecord(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Scheduler_RemoveMobilityRecord_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(SchedulerServer).RemoveMobilityRecord(ctx, req.(*RemoveMobilityRecordRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Scheduler_ServiceDesc is the grpc.ServiceDesc for Scheduler service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -608,6 +758,22 @@ var Scheduler_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "UnregisterNode",
 			Handler:    _Scheduler_UnregisterNode_Handler,
+		},
+		{
+			MethodName: "UpsertMobilityRecord",
+			Handler:    _Scheduler_UpsertMobilityRecord_Handler,
+		},
+		{
+			MethodName: "GetMobilityRecord",
+			Handler:    _Scheduler_GetMobilityRecord_Handler,
+		},
+		{
+			MethodName: "ListMobilityRecords",
+			Handler:    _Scheduler_ListMobilityRecords_Handler,
+		},
+		{
+			MethodName: "RemoveMobilityRecord",
+			Handler:    _Scheduler_RemoveMobilityRecord_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

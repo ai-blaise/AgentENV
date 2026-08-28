@@ -41,6 +41,10 @@ type Service struct {
 	rosters *rosterCache
 	// eventLoss turns silently dropped lifecycle event batches into a number.
 	eventLoss *eventLossTracker
+	// mobility arbitrates paused-sandbox ownership across the fleet. It lives
+	// here rather than on each node because a destination and an origin cannot
+	// agree through a store on one of their disks.
+	mobility MobilityStore
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -60,6 +64,7 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		candidateSampleSize: defaultCandidateSampleSize,
 		rosters:             newRosterCache(),
 		eventLoss:           newEventLossTracker(),
+		mobility:            NewInMemoryMobilityStore(),
 		store:               store,
 		artifacts:           NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
 	}
@@ -71,6 +76,20 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 
 // ServiceOption configures optional Service behaviour.
 type ServiceOption func(*Service)
+
+// WithMobilityStore replaces the in-memory mobility store, so a deployment
+// with Redis keeps paused-sandbox records across a scheduler restart.
+//
+// Losing them costs the ability to migrate until each node re-reports, not
+// correctness — but a restart is exactly when a drain is most likely to be
+// under way.
+func WithMobilityStore(store MobilityStore) ServiceOption {
+	return func(s *Service) {
+		if store != nil {
+			s.mobility = store
+		}
+	}
+}
 
 // WithNodeResourceLimit sets per-node resource thresholds for scheduling.
 func WithNodeResourceLimit(limit *config.NodeResourceLimit) ServiceOption {

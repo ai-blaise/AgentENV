@@ -19,6 +19,18 @@ service Scheduler {
   rpc LookupP2pArtifact(LookupP2pArtifactRequest) returns (LookupP2pArtifactResponse);
   rpc GetNode(GetNodeRequest) returns (GetNodeResponse);
   rpc UnregisterNode(UnregisterNodeRequest) returns (UnregisterNodeResponse);
+
+  // Paused-sandbox mobility records.
+  //
+  // These live here rather than on each node because the claim protocol they
+  // support is inherently cross-node: a destination takes a sandbox from an
+  // origin, and two nodes cannot arbitrate through a store on one of their
+  // disks. The scheduler is already the cluster-wide authority for which node
+  // owns a sandbox, and already has a durable store behind it.
+  rpc UpsertMobilityRecord(UpsertMobilityRecordRequest) returns (UpsertMobilityRecordResponse);
+  rpc GetMobilityRecord(GetMobilityRecordRequest) returns (GetMobilityRecordResponse);
+  rpc ListMobilityRecords(ListMobilityRecordsRequest) returns (ListMobilityRecordsResponse);
+  rpc RemoveMobilityRecord(RemoveMobilityRecordRequest) returns (RemoveMobilityRecordResponse);
 }
 
 message Node {
@@ -379,3 +391,111 @@ message UnregisterNodeRequest {
 }
 
 message UnregisterNodeResponse {}
+
+// Where a paused sandbox is in the process of being handed over.
+enum MobilityState {
+  MOBILITY_STATE_UNSPECIFIED = 0;
+  // Held by its origin and available to move.
+  MOBILITY_STATE_PARKED = 1;
+  // A destination has announced it intends to take this sandbox. A claim is
+  // an announcement, not a grant: it exists so the origin refuses a local
+  // resume while a handover is in flight, and so a second destination can see
+  // it is racing.
+  MOBILITY_STATE_CLAIMED = 2;
+  // The sandbox runs on another node now. Kept rather than deleted so a late
+  // claim can be answered with "already gone, and to whom" instead of
+  // "unknown sandbox", which is indistinguishable from a lost record.
+  MOBILITY_STATE_EVACUATED = 3;
+}
+
+// What a destination needs to know before it can take a paused sandbox.
+message MobilityRecord {
+  string sandbox_id = 1;
+  string origin_node_id = 2;
+
+  // A total order over versions of this record, as a UUIDv7 in hyphenated
+  // hex. A write with an older or equal generation is discarded rather than
+  // applied, which is what stops a superseded actor resurrecting stale state.
+  //
+  // Sent as text because its string order is its numeric order — the 48-bit
+  // timestamp leads, big-endian, and every value is the same length — so the
+  // comparison can happen inside a Lua script without parsing.
+  string generation = 3;
+
+  // The runtime the paused guest was booted against, as opaque JSON.
+  //
+  // The scheduler never interprets or compares this; only a candidate node can
+  // say whether it matches its own. Keeping it opaque means the fingerprint
+  // can gain fields without a scheduler release, and it is the part of this
+  // message most likely to grow.
+  string fingerprint_json = 4;
+
+  // Whether the artifacts backing this sandbox are readable off-node.
+  string artifact_reach = 5;
+
+  uint32 cpu_count = 6;
+  uint32 memory_mib = 7;
+
+  // The snapshot the paused state was committed under. Empty means the state
+  // exists only as node-local files, so nothing can take it over yet — which
+  // is the ordinary condition of a freshly paused sandbox.
+  string snapshot_id = 8;
+
+  int64 paused_at_unix_ms = 9;
+
+  MobilityState state = 10;
+  // Set for CLAIMED and EVACUATED: who holds it, or who took it.
+  string holder_node_id = 11;
+  int64 state_at_unix_ms = 12;
+}
+
+message UpsertMobilityRecordRequest {
+  MobilityRecord record = 1;
+
+  // Write only if the stored generation is exactly this.
+  //
+  // Empty means an unconditional write, ordered by generation alone — enough
+  // for bookkeeping, not enough to arbitrate a claim. A claimant sends what it
+  // read, so a rival that read the same state finds its expectation stale and
+  // is told it lost. Generation ordering cannot do that on its own, because
+  // the loser's generation is also newer than what it read.
+  string expected_generation = 2;
+
+  // Whether expected_generation means "no record must exist".
+  //
+  // Needed because the empty string cannot distinguish "expect nothing" from
+  // "do not check", and those are opposite instructions.
+  bool expect_absent = 3;
+}
+
+message UpsertMobilityRecordResponse {
+  // False means a generation at least as new was already stored, so this
+  // write was discarded. Not an error: a superseded actor writing late is the
+  // ordinary shape of a handover race, and the caller should re-read.
+  bool applied = 1;
+}
+
+message GetMobilityRecordRequest {
+  string sandbox_id = 1;
+}
+
+message GetMobilityRecordResponse {
+  MobilityRecord record = 1;
+  bool found = 2;
+}
+
+message ListMobilityRecordsRequest {
+  // Records held by this node. A node asks for its own; a drain asks for the
+  // departing node's.
+  string origin_node_id = 1;
+}
+
+message ListMobilityRecordsResponse {
+  repeated MobilityRecord records = 1;
+}
+
+message RemoveMobilityRecordRequest {
+  string sandbox_id = 1;
+}
+
+message RemoveMobilityRecordResponse {}

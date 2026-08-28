@@ -666,3 +666,233 @@ mod tests {
         assert!(steps.calls().is_empty());
     }
 }
+
+#[cfg(test)]
+mod lost_claim_tests {
+    use super::*;
+    use crate::orchestrator::mobility::record::{
+        LocalMobilityStore, MobilityRecord, MobilityState, MobilityWrite,
+    };
+    use crate::orchestrator::store::SandboxMetadata;
+    use crate::snapshot::{ArtifactReach, MigrationFingerprint, SnapshotRuntimeVersions};
+    use crate::types::SandboxId;
+    use crate::virtualization::VirtualizationMode;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    fn metadata() -> SandboxMetadata {
+        SandboxMetadata {
+            runtime_versions: SnapshotRuntimeVersions {
+                kernel_version: "vmlinux-6.1.175".to_string(),
+                firecracker_version: "1.15.1".to_string(),
+                envd_version: "0.5.15".to_string(),
+                tools_drive_version: "0.1.0".to_string(),
+            },
+            virtualization_mode: VirtualizationMode::Kvm,
+            ..SandboxMetadata::default()
+        }
+    }
+
+    async fn seeded() -> (
+        LocalMobilityStore,
+        SandboxId,
+        MigrationFingerprint,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalMobilityStore::open(dir.path().join("mobility"))
+            .await
+            .expect("store");
+        let metadata = metadata();
+        let record = MobilityRecord::for_paused(
+            &metadata,
+            "node-a",
+            "x86_64",
+            Some("{}".to_string()),
+            4096,
+            ArtifactReach::ClusterShared,
+            Some("snap-1".to_string()),
+        );
+        let fingerprint = record.fingerprint.clone();
+        store.upsert(&record).await.expect("seed");
+        (store, metadata.id, fingerprint, dir)
+    }
+
+    /// The branch that decides what happens when the guest is already live
+    /// here but the claim turned out to be gone. Its own comment calls this
+    /// out as "the guest running here is now the second copy", and until now
+    /// it had never executed.
+    ///
+    /// The lease cannot catch this one: the claim is stolen after the restore
+    /// returns and before the commit, so the guardian never gets a renewal in
+    /// between. Only the commit's own check stands between this and two live
+    /// copies.
+    #[tokio::test]
+    async fn a_claim_lost_between_restore_and_commit_discards_the_restore() {
+        let (store, sandbox_id, fingerprint, _dir) = seeded().await;
+
+        struct StealAtTheEnd {
+            store: LocalMobilityStore,
+            sandbox_id: SandboxId,
+            discarded: Arc<AtomicBool>,
+            released_origin: Arc<AtomicBool>,
+        }
+
+        #[async_trait]
+        impl MigrationSteps for StealAtTheEnd {
+            async fn restore(&self, _record: &MobilityRecord) -> Result<()> {
+                // The guest is up. A rival takes the claim in the instant
+                // before the commit lands.
+                let current = self
+                    .store
+                    .get(&self.sandbox_id)
+                    .await
+                    .expect("get")
+                    .expect("record");
+                let stolen = current.transitioned_to(MobilityState::Claimed {
+                    by_node_id: "node-c".to_string(),
+                    at_unix_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .expect("clock after the epoch")
+                        .as_millis() as u64,
+                });
+                self.store.upsert(&stolen).await.expect("steal");
+                Ok(())
+            }
+
+            async fn discard_restored(&self, _record: &MobilityRecord) -> Result<()> {
+                self.discarded.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn release_origin_state(&self, _record: &MobilityRecord) -> Result<()> {
+                self.released_origin.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let discarded = Arc::new(AtomicBool::new(false));
+        let released_origin = Arc::new(AtomicBool::new(false));
+        let coordinator = Arc::new(
+            MobilityCoordinator::new(store.clone(), "node-b")
+                .with_claim_ttl(Duration::from_secs(30)),
+        );
+        let saga = MigrationSaga::new(
+            coordinator,
+            Arc::new(StealAtTheEnd {
+                store: store.clone(),
+                sandbox_id,
+                discarded: Arc::clone(&discarded),
+                released_origin: Arc::clone(&released_origin),
+            }),
+        )
+        .with_claim_ttl(Duration::from_secs(30));
+
+        let outcome = saga
+            .migrate(&sandbox_id, &fingerprint, &[], &[])
+            .await
+            .expect("migrate");
+
+        match outcome {
+            MigrationOutcome::RolledBack { reason } => assert!(
+                reason.contains("claim was lost"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("a lost claim must roll back, got {other:?}"),
+        }
+        assert!(
+            discarded.load(Ordering::SeqCst),
+            "the guest running here is the second copy and must be torn down"
+        );
+        assert!(
+            !released_origin.load(Ordering::SeqCst),
+            "the origin must keep its copy: this node did not take ownership"
+        );
+
+        // And the rival still holds it, untouched by our rollback.
+        let stored = store.get(&sandbox_id).await.expect("get").expect("record");
+        assert!(
+            matches!(stored.state, MobilityState::Claimed { ref by_node_id, .. } if by_node_id == "node-c"),
+            "the rival's claim must survive our rollback, got {:?}",
+            stored.state
+        );
+    }
+
+    /// A write that loses a race is retryable, not fatal. Treating it as a
+    /// lost claim would tear down a healthy restore because two writes
+    /// happened to interleave.
+    #[tokio::test]
+    async fn a_superseded_write_is_not_taken_as_a_lost_claim() {
+        let (store, sandbox_id, fingerprint, _dir) = seeded().await;
+        let store = AlwaysSuperseded {
+            inner: store,
+            calls: Mutex::new(0),
+        };
+
+        let coordinator = Arc::new(MobilityCoordinator::new(store, "node-b"));
+        let outcome = MigrationSaga::new(coordinator, Arc::new(NoopSteps))
+            .migrate(&sandbox_id, &fingerprint, &[], &[])
+            .await
+            .expect("migrate");
+
+        // The claim itself could not be written, so the migration never
+        // starts — but it reports a race, not a refusal, so the caller retries
+        // rather than giving up on the sandbox.
+        assert_eq!(
+            outcome,
+            MigrationOutcome::NotClaimable(ClaimOutcome::Superseded),
+            "a lost write race must surface as retryable"
+        );
+    }
+
+    struct NoopSteps;
+
+    #[async_trait]
+    impl MigrationSteps for NoopSteps {
+        async fn restore(&self, _record: &MobilityRecord) -> Result<()> {
+            Ok(())
+        }
+        async fn discard_restored(&self, _record: &MobilityRecord) -> Result<()> {
+            Ok(())
+        }
+        async fn release_origin_state(&self, _record: &MobilityRecord) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A store whose writes always lose the generation race, which is what a
+    /// concurrent writer looks like from inside one coordinator.
+    struct AlwaysSuperseded {
+        inner: LocalMobilityStore,
+        calls: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl MobilityStore for AlwaysSuperseded {
+        async fn upsert(&self, _record: &MobilityRecord) -> Result<MobilityWrite> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(MobilityWrite::Superseded)
+        }
+
+        async fn compare_and_set(
+            &self,
+            _expected: Option<crate::orchestrator::MobilityGeneration>,
+            _record: &MobilityRecord,
+        ) -> Result<MobilityWrite> {
+            *self.calls.lock().unwrap() += 1;
+            Ok(MobilityWrite::Superseded)
+        }
+
+        async fn get(&self, sandbox_id: &SandboxId) -> Result<Option<MobilityRecord>> {
+            self.inner.get(sandbox_id).await
+        }
+
+        async fn list(&self) -> Result<Vec<MobilityRecord>> {
+            self.inner.list().await
+        }
+
+        async fn remove(&self, sandbox_id: &SandboxId) -> Result<()> {
+            self.inner.remove(sandbox_id).await
+        }
+    }
+}

@@ -281,6 +281,22 @@ impl<S: MobilityStore> MobilityRuntime<S> {
 /// Fallible on purpose: the caller decides whether a node that cannot open its
 /// store should refuse to start or run without migration. It should run —
 /// refusing would turn an optional feature into a boot dependency.
+/// Builds a runtime over an already-open store.
+///
+/// Separate from [`open_mobility_runtime`] because which store to use is a
+/// deployment question: a node in a cluster needs the scheduler-backed one, a
+/// node on its own can only have the local one.
+pub fn mobility_runtime_with_store<S: MobilityStore + 'static>(
+    store: S,
+    node_id: impl Into<String>,
+    facts: NodeMobilityFacts,
+) -> Arc<dyn MobilityHooks> {
+    Arc::new(MobilityRuntime::new(
+        Arc::new(MobilityCoordinator::new(store, node_id)),
+        facts,
+    ))
+}
+
 pub async fn open_mobility_runtime(
     store_path: impl Into<std::path::PathBuf>,
     node_id: impl Into<String>,
@@ -439,5 +455,191 @@ mod tests {
             runtime.claim_for_local_resume(&SandboxId::new()).await,
             ResumeFence::Allowed
         );
+    }
+}
+
+#[cfg(test)]
+mod committed_and_failure_tests {
+    use super::*;
+    use crate::orchestrator::mobility::record::{LocalMobilityStore, MobilityWrite};
+    use crate::orchestrator::store::SandboxMetadata;
+    use crate::orchestrator::SandboxState;
+    use crate::snapshot::{MigrationFingerprint, SnapshotId, SnapshotRuntimeVersions};
+    use crate::virtualization::VirtualizationMode;
+    use async_trait::async_trait;
+
+    fn facts() -> NodeMobilityFacts {
+        NodeMobilityFacts {
+            cpu_architecture: "x86_64".to_string(),
+            cluster_cpu_config: Arc::new(std::sync::RwLock::new(Some("{}".to_string()))),
+            memory_page_size: 4096,
+            artifact_reach: ArtifactReach::ClusterShared,
+        }
+    }
+
+    fn metadata() -> SandboxMetadata {
+        SandboxMetadata {
+            state: SandboxState::Paused,
+            runtime_versions: SnapshotRuntimeVersions {
+                kernel_version: "vmlinux-6.1.175".to_string(),
+                firecracker_version: "1.15.1".to_string(),
+                envd_version: "0.5.15".to_string(),
+                tools_drive_version: "0.1.0".to_string(),
+            },
+            virtualization_mode: VirtualizationMode::Kvm,
+            ..SandboxMetadata::default()
+        }
+    }
+
+    fn host_fingerprint(metadata: &SandboxMetadata) -> MigrationFingerprint {
+        MigrationFingerprint::from_runtime(
+            &metadata.runtime_versions,
+            "x86_64",
+            VirtualizationMode::Kvm,
+            Some("{}".to_string()),
+            4096,
+        )
+    }
+
+    async fn runtime() -> (
+        MobilityRuntime<LocalMobilityStore>,
+        LocalMobilityStore,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalMobilityStore::open(dir.path().join("mobility"))
+            .await
+            .expect("open store");
+        let coordinator = Arc::new(MobilityCoordinator::new(store.clone(), "node-a"));
+        (MobilityRuntime::new(coordinator, facts()), store, dir)
+    }
+
+    /// The whole point of committing a paused sandbox: it goes from a record
+    /// every plan refuses to one a plan can place. Before this test the entire
+    /// sequence — `committed_to`, `record_committed`, and the API path that
+    /// calls it — had never executed.
+    #[tokio::test]
+    async fn committing_a_snapshot_turns_an_unplaceable_record_into_a_placeable_one() {
+        let (runtime, _store, _dir) = runtime().await;
+        let metadata = metadata();
+        let host = host_fingerprint(&metadata);
+        runtime.record_paused(&metadata).await;
+
+        let candidate = DestinationCandidate {
+            node_id: "node-b".to_string(),
+            fingerprint: host,
+            free_cpu: 64,
+            free_memory_mib: 65536,
+        };
+
+        let before = runtime
+            .plan_evacuation(std::slice::from_ref(&candidate))
+            .await;
+        assert!(before.moves.is_empty(), "nothing is movable yet");
+        assert_eq!(before.unplaceable.len(), 1);
+        assert_eq!(runtime.record_counts().await.stranded_uncommitted, 1);
+
+        let snapshot_id = SnapshotId::generate();
+        runtime.record_committed(&metadata.id, &snapshot_id).await;
+
+        let after = runtime.plan_evacuation(&[candidate]).await;
+        assert_eq!(
+            after.moves.len(),
+            1,
+            "a committed sandbox must become placeable, got {after:?}"
+        );
+        assert_eq!(after.moves[0].sandbox_id, metadata.id);
+        assert_eq!(after.moves[0].to_node_id, "node-b");
+        assert_eq!(
+            runtime.record_counts().await.stranded_uncommitted,
+            0,
+            "it is no longer stranded"
+        );
+    }
+
+    /// Committing a sandbox this node never recorded must not invent a record.
+    /// A fabricated one would advertise a paused sandbox that does not exist
+    /// here, and a drain would try to place it.
+    #[tokio::test]
+    async fn committing_an_unrecorded_sandbox_creates_nothing() {
+        let (runtime, _store, _dir) = runtime().await;
+        runtime
+            .record_committed(&SandboxId::new(), &SnapshotId::generate())
+            .await;
+        assert_eq!(
+            runtime.record_counts().await,
+            MobilityRecordCounts::default()
+        );
+    }
+
+    /// A store that cannot be read is not permission to resume. The store is
+    /// the only thing that knows whether a handover is in flight, and guessing
+    /// "nobody has it" is how two nodes end up running one sandbox.
+    #[tokio::test]
+    async fn an_unreadable_store_refuses_a_local_resume() {
+        let coordinator = Arc::new(MobilityCoordinator::new(BrokenStore, "node-a"));
+        let runtime = MobilityRuntime::new(coordinator, facts());
+
+        let fence = runtime.claim_for_local_resume(&SandboxId::new()).await;
+        assert!(
+            matches!(fence, ResumeFence::ClaimedElsewhere { .. }),
+            "a broken store must fail closed, got {fence:?}"
+        );
+    }
+
+    /// The remaining store-failure paths must degrade rather than panic or
+    /// fail the operation that triggered them.
+    #[tokio::test]
+    async fn a_broken_store_degrades_without_failing_the_caller() {
+        let coordinator = Arc::new(MobilityCoordinator::new(BrokenStore, "node-a"));
+        let runtime = MobilityRuntime::new(coordinator, facts());
+        let metadata = metadata();
+
+        // A pause has already succeeded by the time these run, so none of them
+        // may propagate a failure.
+        runtime.record_paused(&metadata).await;
+        runtime.forget(&metadata.id).await;
+        runtime
+            .record_committed(&metadata.id, &SnapshotId::generate())
+            .await;
+        runtime.publish_metrics().await;
+
+        assert_eq!(
+            runtime.record_counts().await,
+            MobilityRecordCounts::default(),
+            "an unreadable store reports nothing rather than guessing"
+        );
+        assert!(runtime.plan_evacuation(&[]).await.moves.is_empty());
+    }
+
+    /// A store whose every operation fails, for the paths that only run when
+    /// the durable layer is broken.
+    struct BrokenStore;
+
+    #[async_trait]
+    impl MobilityStore for BrokenStore {
+        async fn upsert(&self, _record: &MobilityRecord) -> anyhow::Result<MobilityWrite> {
+            anyhow::bail!("mobility store is unavailable")
+        }
+
+        async fn compare_and_set(
+            &self,
+            _expected: Option<crate::orchestrator::MobilityGeneration>,
+            _record: &MobilityRecord,
+        ) -> anyhow::Result<MobilityWrite> {
+            anyhow::bail!("mobility store is unavailable")
+        }
+
+        async fn get(&self, _sandbox_id: &SandboxId) -> anyhow::Result<Option<MobilityRecord>> {
+            anyhow::bail!("mobility store is unavailable")
+        }
+
+        async fn list(&self) -> anyhow::Result<Vec<MobilityRecord>> {
+            anyhow::bail!("mobility store is unavailable")
+        }
+
+        async fn remove(&self, _sandbox_id: &SandboxId) -> anyhow::Result<()> {
+            anyhow::bail!("mobility store is unavailable")
+        }
     }
 }
