@@ -410,9 +410,9 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 		completeness = RosterComplete
 	}
 
-	roster, requestFullRoster := s.resolveRoster(req, nodeID, completeness)
+	roster, rosterAuthority, requestFullRoster := s.resolveRoster(req, nodeID, completeness)
 	if !requestFullRoster {
-		if err := s.store.ReconcileNodeRoster(node, roster, completeness, now); err != nil {
+		if err := s.store.ReconcileNodeRoster(node, roster, rosterAuthority, now); err != nil {
 			s.logger.Warn("scheduler heartbeat binding reconcile failed",
 				zap.String("node_id", nodeID),
 				zap.Error(err),
@@ -441,11 +441,19 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 // Skipping one round is safe because the binding TTL is required to be several
 // heartbeats long, which the registry validates against the node's reported
 // interval.
+//
+// The completeness to reconcile with is returned rather than taken from the
+// caller, because an elided heartbeat carries none. A node that elides sets
+// roster_complete false — there are no ids in the message for it to be
+// describing — so the authority of a resolved roster is the authority it had
+// when it was received in full, which is what the cache holds. Reading the
+// wire bit instead would make every elided round non-authoritative and stop
+// reaping bindings the node no longer holds.
 func (s *Service) resolveRoster(
 	req *schedulerv1.HeartbeatRequest,
 	nodeID string,
 	completeness RosterCompleteness,
-) (roster []string, requestFullRoster bool) {
+) (roster []string, authority RosterCompleteness, requestFullRoster bool) {
 	digest := strings.TrimSpace(req.GetRosterDigest())
 
 	// No digest, or the roster came along anyway: the wire is authoritative.
@@ -453,7 +461,7 @@ func (s *Service) resolveRoster(
 		if digest != "" {
 			s.rosters.remember(nodeID, digest, req.GetSandboxIds(), completeness == RosterComplete)
 		}
-		return req.GetSandboxIds(), false
+		return req.GetSandboxIds(), completeness, false
 	}
 
 	cached, cachedComplete, ok := s.rosters.lookup(nodeID, digest)
@@ -463,17 +471,24 @@ func (s *Service) resolveRoster(
 			zap.String("roster_digest", digest),
 		)
 		schedulerRosterFullRequestTotal.Inc()
-		return nil, true
+		return nil, completeness, true
 	}
 
-	// A node that has since finished startup recovery upgrades a cached
-	// incomplete roster: the ids are the same, but what an empty one means is
-	// no longer the same.
+	schedulerRosterCacheHitTotal.Inc()
+	// The wire bit may raise the cached authority but never lower it. Raising
+	// is how a node that finished startup recovery without its roster changing
+	// is heard, which matters for a node old enough to still claim
+	// completeness on an elided heartbeat. Lowering would let a correct node's
+	// elided "no ids here to speak for" undo what its full roster established,
+	// and every elided round would stop reaping.
 	if completeness == RosterComplete && !cachedComplete {
 		s.rosters.remember(nodeID, digest, cached, true)
+		cachedComplete = true
 	}
-	schedulerRosterCacheHitTotal.Inc()
-	return cached, false
+	if cachedComplete {
+		return cached, RosterComplete, false
+	}
+	return cached, RosterIncomplete, false
 }
 
 // departedSweepInterval bounds how often the per-node side maps are swept.

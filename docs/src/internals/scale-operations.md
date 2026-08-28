@@ -48,6 +48,20 @@ understood, so a new node against an old scheduler keeps sending everything.
 The matrix is walked explicitly in
 `services/scheduler/internal/version_skew_test.go`.
 
+That permission expires with each response rather than latching on the first
+one that granted it. Schedulers are replaced by rollouts and rollbacks, and a
+node can reach a different one without ever seeing an error, so a permission
+that survived the process that gave it would let a node elide to a scheduler
+that reads an elided roster as an empty one and deletes every binding it holds.
+
+Because the heartbeat that discovers the change has already been sent, an
+elided heartbeat also declines to call itself complete: `roster_complete`
+describes the message, not just the node. A scheduler that cannot resolve the
+digest — including one that has never heard of digests — then reconciles
+nothing instead of deleting everything. The scheduler takes the authority to
+delete from the cached roster the digest resolves to, raised but never lowered
+by the wire bit.
+
 Upgrade order does not matter. Upgrading schedulers first buys the wire
 savings sooner, because nodes cannot elide until a scheduler says they may.
 
@@ -171,11 +185,6 @@ for.
 
 **The scheduler caches a roster under a digest it never verifies**, so a single
 inconsistent heartbeat poisons the cache for every later elided one.
-
-**The elision safety rule is weaker than documented.** The claim that a node
-keeps sending its full roster until a scheduler says it understands digests is
-not quite what the code implements; TLC found a trace where a node keeps
-eliding to a scheduler that never acknowledged. Liveness itself holds.
 
 **`resolveRoster`'s safety argument cites a TTL/heartbeat-interval validation
 that does not exist.** The comment claims the registry validates the ordering

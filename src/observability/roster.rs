@@ -20,6 +20,24 @@
 //! that: false there means "no need", which is also what an older scheduler
 //! sends. So it takes its own field, and the default — send everything — is
 //! the safe one.
+//!
+//! That answer is a property of the process that gave it, not of the
+//! deployment. Schedulers are replaced by rollouts and rollbacks, and a node
+//! can reach a different one without ever seeing an error — so the permission
+//! to elide expires with every response and has to be renewed by the next.
+//!
+//! # Saying so on the wire
+//!
+//! Even that is not quite enough on its own, because it only governs the
+//! heartbeat after the one that discovers the change. A heartbeat already in
+//! flight cannot know which scheduler will receive it.
+//!
+//! So an elided heartbeat also stops claiming its ids are authoritative:
+//! `roster_complete` describes the message, not just the node. Carrying no
+//! roster and simultaneously asserting the node holds nothing is a false
+//! statement, and it is precisely the statement an older scheduler acts on.
+//! Withdrawing it means a misread elision reconciles nothing instead of
+//! deleting everything.
 
 use sha2::{Digest, Sha256};
 
@@ -29,12 +47,27 @@ use crate::types::SandboxId;
 /// what it must repeat.
 #[derive(Debug, Default)]
 pub struct RosterDigestState {
-    /// The digest the scheduler has acknowledged holding a roster for.
-    acknowledged: Option<String>,
-    /// Whether any scheduler response has said digests are understood.
+    /// The roster the scheduler has been sent in full, if any.
+    acknowledged: Option<Acknowledged>,
+    /// Whether the most recent response said digests are understood.
     scheduler_understands_digests: bool,
     /// Whether the scheduler has asked for the roster back.
     full_roster_requested: bool,
+}
+
+/// A roster this node has sent in full, and the terms it sent it on.
+#[derive(Debug, PartialEq, Eq)]
+struct Acknowledged {
+    digest: String,
+    /// Whether that send claimed the roster was the node's authoritative view.
+    ///
+    /// Part of the identity of what the scheduler holds, not a detail of how
+    /// it was sent: the same ids mean different things depending on it, and
+    /// the scheduler caches the answer. A node that finishes startup recovery
+    /// without its roster changing must therefore say so in full rather than
+    /// elide, or the scheduler keeps treating a now-authoritative roster as
+    /// provisional and never reaps what the node has stopped holding.
+    authoritative: bool,
 }
 
 /// What one heartbeat should carry.
@@ -43,12 +76,20 @@ pub struct RosterReport {
     pub digest: String,
     /// `None` means the roster is elided and the digest stands in for it.
     pub sandbox_ids: Option<Vec<String>>,
+    /// Whether the ids in this heartbeat are the node's authoritative view.
+    ///
+    /// False for every elided heartbeat, whatever the node's own state: there
+    /// are no ids in it to be authoritative about.
+    pub roster_complete: bool,
 }
 
 impl RosterDigestState {
     /// Records what a scheduler said about the roster it just received.
     pub fn observe_response(&mut self, digest_accepted: bool, full_roster_requested: bool) {
-        self.scheduler_understands_digests |= digest_accepted;
+        // Assignment, not accumulation. This is the answer from the process
+        // that just replied, and the next reply may come from an older one
+        // that would read an elided roster as an empty one.
+        self.scheduler_understands_digests = digest_accepted;
         self.full_roster_requested = full_roster_requested;
     }
 
@@ -59,37 +100,44 @@ impl RosterDigestState {
     /// this node's roster, and it has no way to tell us so before we have
     /// already elided.
     pub fn reset(&mut self) {
-        self.acknowledged = None;
-        self.full_roster_requested = false;
-        // Deliberately not cleared: whether *some* scheduler in this
-        // deployment understands digests is a property of the deployment, not
-        // of one connection, and re-learning it costs a full roster each time.
-        // The acknowledged digest is what actually gates elision.
+        *self = Self::default();
     }
 
     /// Decides what the next heartbeat carries.
-    pub fn report(&mut self, sandbox_ids: &[SandboxId]) -> RosterReport {
+    ///
+    /// `authoritative` is the node's own claim — whether startup recovery has
+    /// finished and its roster is therefore the whole truth about what it
+    /// holds. It gates what the heartbeat may assert, and a change in it
+    /// forces a full send even when the ids have not moved.
+    pub fn report(&mut self, sandbox_ids: &[SandboxId], authoritative: bool) -> RosterReport {
         let digest = roster_digest(sandbox_ids);
+        let sent = Acknowledged {
+            digest,
+            authoritative,
+        };
 
         let may_elide = self.scheduler_understands_digests
             && !self.full_roster_requested
-            && self.acknowledged.as_deref() == Some(digest.as_str());
+            && self.acknowledged.as_ref() == Some(&sent);
 
         if may_elide {
             return RosterReport {
-                digest,
+                digest: sent.digest,
                 sandbox_ids: None,
+                roster_complete: false,
             };
         }
 
+        let report = RosterReport {
+            digest: sent.digest.clone(),
+            sandbox_ids: Some(sandbox_ids.iter().map(SandboxId::to_string).collect()),
+            roster_complete: authoritative,
+        };
         // Recorded as acknowledged optimistically. If the heartbeat never
         // lands, the next response either asks for the roster back or the
         // connection resets, and both paths send it again.
-        self.acknowledged = Some(digest.clone());
-        RosterReport {
-            digest,
-            sandbox_ids: Some(sandbox_ids.iter().map(SandboxId::to_string).collect()),
-        }
+        self.acknowledged = Some(sent);
+        report
     }
 }
 
@@ -174,7 +222,7 @@ mod tests {
         let roster = ids(3);
 
         for _ in 0..3 {
-            let report = state.report(&roster);
+            let report = state.report(&roster, true);
             assert!(
                 report.sandbox_ids.is_some(),
                 "the roster must not be elided before the scheduler has said it can be"
@@ -187,10 +235,10 @@ mod tests {
         let mut state = accepted();
         let roster = ids(3);
 
-        let first = state.report(&roster);
+        let first = state.report(&roster, true);
         assert_eq!(first.sandbox_ids.as_ref().map(Vec::len), Some(3));
 
-        let second = state.report(&roster);
+        let second = state.report(&roster, true);
         assert_eq!(second.sandbox_ids, None);
         assert_eq!(second.digest, first.digest);
     }
@@ -199,17 +247,17 @@ mod tests {
     fn a_changed_roster_is_always_sent() {
         let mut state = accepted();
         let roster = ids(3);
-        state.report(&roster);
-        assert_eq!(state.report(&roster).sandbox_ids, None);
+        state.report(&roster, true);
+        assert_eq!(state.report(&roster, true).sandbox_ids, None);
 
         let mut grown = roster.clone();
         grown.push(SandboxId::new());
-        let report = state.report(&grown);
+        let report = state.report(&grown, true);
         assert_eq!(report.sandbox_ids.as_ref().map(Vec::len), Some(4));
 
         // And a roster that empties out, which is the case a scheduler most
         // needs to hear about and the one an elision would hide.
-        let report = state.report(&[]);
+        let report = state.report(&[], true);
         assert_eq!(report.sandbox_ids, Some(Vec::new()));
     }
 
@@ -220,15 +268,15 @@ mod tests {
     fn a_requested_roster_is_sent_even_when_unchanged() {
         let mut state = accepted();
         let roster = ids(3);
-        state.report(&roster);
-        assert_eq!(state.report(&roster).sandbox_ids, None);
+        state.report(&roster, true);
+        assert_eq!(state.report(&roster, true).sandbox_ids, None);
 
         state.observe_response(true, true);
-        assert!(state.report(&roster).sandbox_ids.is_some());
+        assert!(state.report(&roster, true).sandbox_ids.is_some());
 
         // And elision resumes once the request is satisfied.
         state.observe_response(true, false);
-        assert_eq!(state.report(&roster).sandbox_ids, None);
+        assert_eq!(state.report(&roster, true).sandbox_ids, None);
     }
 
     /// A reconnect may reach a different scheduler process that has never seen
@@ -237,13 +285,110 @@ mod tests {
     fn reconnecting_resends_the_roster() {
         let mut state = accepted();
         let roster = ids(3);
-        state.report(&roster);
-        assert_eq!(state.report(&roster).sandbox_ids, None);
+        state.report(&roster, true);
+        assert_eq!(state.report(&roster, true).sandbox_ids, None);
 
         state.reset();
         assert!(
-            state.report(&roster).sandbox_ids.is_some(),
+            state.report(&roster, true).sandbox_ids.is_some(),
             "a reconnected node must reintroduce itself"
         );
+    }
+
+    /// A rollout or rollback puts an older scheduler in front of a node that
+    /// has already learned to elide. It answers `roster_digest_accepted=false`
+    /// because it has never heard of the field, and the node has to believe it
+    /// — the alternative is eliding to a process that reads an elided roster
+    /// as an empty one and deletes every binding on the node.
+    ///
+    /// The permission to elide therefore expires with each response instead of
+    /// latching on the first one that granted it.
+    #[test]
+    fn a_scheduler_that_stops_understanding_digests_stops_the_eliding() {
+        let mut state = accepted();
+        let roster = ids(3);
+        state.report(&roster, true);
+        assert_eq!(state.report(&roster, true).sandbox_ids, None);
+
+        state.observe_response(false, false);
+        for _ in 0..3 {
+            assert!(
+                state.report(&roster, true).sandbox_ids.is_some(),
+                "an older scheduler must be sent the roster every time"
+            );
+        }
+
+        // And the node recovers when a newer one is in front of it again.
+        state.observe_response(true, false);
+        assert_eq!(state.report(&roster, true).sandbox_ids, None);
+    }
+
+    /// The same skew, reached through the path that does surface an error: the
+    /// reconnect resets the node, the full roster goes to the older scheduler,
+    /// and its response must not re-arm the elision that the optimistic
+    /// acknowledgement in `report` has just recorded.
+    #[test]
+    fn reconnecting_into_an_older_scheduler_keeps_sending_the_roster() {
+        let mut state = accepted();
+        let roster = ids(3);
+        state.report(&roster, true);
+        assert_eq!(state.report(&roster, true).sandbox_ids, None);
+
+        state.reset();
+        assert!(state.report(&roster, true).sandbox_ids.is_some());
+        state.observe_response(false, false);
+
+        assert!(
+            state.report(&roster, true).sandbox_ids.is_some(),
+            "the roster must keep going out to a scheduler that never acknowledged it"
+        );
+    }
+
+    /// An elided heartbeat carries no ids, so it cannot claim its ids are the
+    /// node's whole truth. Saying otherwise is what lets a scheduler that
+    /// cannot resolve the digest read the message as "this node holds
+    /// nothing".
+    #[test]
+    fn an_elided_heartbeat_does_not_claim_to_be_authoritative() {
+        let mut state = accepted();
+        let roster = ids(3);
+
+        let full = state.report(&roster, true);
+        assert!(full.sandbox_ids.is_some());
+        assert!(full.roster_complete, "a full roster says what it is");
+
+        let elided = state.report(&roster, true);
+        assert_eq!(elided.sandbox_ids, None);
+        assert!(
+            !elided.roster_complete,
+            "an elided roster must not assert authority over ids it did not send"
+        );
+    }
+
+    /// A node still replaying its own state at startup may hold sandboxes it
+    /// has not found yet, so its roster is not authoritative and it says so.
+    /// The scheduler caches that answer alongside the ids, which means the
+    /// node cannot let recovery finish silently: the ids are unchanged, but
+    /// what they mean is not.
+    #[test]
+    fn finishing_recovery_resends_an_unchanged_roster() {
+        let mut state = accepted();
+        let roster = ids(3);
+
+        let recovering = state.report(&roster, false);
+        assert!(recovering.sandbox_ids.is_some());
+        assert!(!recovering.roster_complete);
+        assert_eq!(state.report(&roster, false).sandbox_ids, None);
+
+        let recovered = state.report(&roster, true);
+        assert!(
+            recovered.sandbox_ids.is_some(),
+            "becoming authoritative must be said in full, not elided"
+        );
+        assert!(recovered.roster_complete);
+        assert_eq!(recovered.digest, recovering.digest);
+
+        // And it settles again on the new terms.
+        assert_eq!(state.report(&roster, true).sandbox_ids, None);
     }
 }

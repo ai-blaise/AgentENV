@@ -283,7 +283,7 @@ impl ObservabilityReporter {
         snapshot.machine_info.cpu_config_json = cpu_config_json.clone();
         let node_id = snapshot.node_id.clone();
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let roster = rosters.report(&snapshot.sandbox_ids);
+        let roster = rosters.report(&snapshot.sandbox_ids, snapshot.roster_complete);
         let req = Self::build_heartbeat_request(
             snapshot,
             now_ms,
@@ -469,7 +469,7 @@ impl ObservabilityReporter {
                 backend: endpoint.backend.clone(),
                 address: endpoint.address.clone(),
             }),
-            roster_complete: snapshot.roster_complete,
+            roster_complete: roster.roster_complete,
             heartbeat_interval_ms: interval.as_millis().try_into().unwrap_or(u64::MAX),
         }
     }

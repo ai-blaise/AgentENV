@@ -8,13 +8,16 @@ import (
 	schedulerv1 "agentenv/services/api/proto"
 )
 
+// Models what a correct node sends, which is why completeness tracks `full`:
+// an elided heartbeat carries no ids and so claims no authority over any. See
+// the wire contract in src/observability/roster.rs.
 func rosterHeartbeat(nodeID, digest string, sandboxIDs []string, full bool) *schedulerv1.HeartbeatRequest {
 	return &schedulerv1.HeartbeatRequest{
 		NodeId:            nodeID,
 		ClusterId:         "cluster",
 		ServiceInstanceId: "instance-1",
 		SandboxIds:        sandboxIDs,
-		RosterComplete:    true,
+		RosterComplete:    full,
 		RosterDigest:      digest,
 		RosterFull:        full,
 		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
@@ -106,7 +109,9 @@ func TestAnUnknownDigestRequestsTheRosterInsteadOfDeletingBindings(t *testing.T)
 func TestAHeartbeatWithoutADigestIsAuthoritativeAsBefore(t *testing.T) {
 	service, store := rosterService(t)
 
-	if _, err := service.Heartbeat(context.Background(), rosterHeartbeat("node-a", "", []string{"sandbox-1"}, false)); err != nil {
+	// A node with no digest has no way to elide, so its roster always comes
+	// along — which is what `full` says.
+	if _, err := service.Heartbeat(context.Background(), rosterHeartbeat("node-a", "", []string{"sandbox-1"}, true)); err != nil {
 		t.Fatalf("seed heartbeat: %v", err)
 	}
 	if _, ok := boundNode(t, store, "sandbox-1"); !ok {
@@ -115,7 +120,7 @@ func TestAHeartbeatWithoutADigestIsAuthoritativeAsBefore(t *testing.T) {
 
 	// Now the node reports it owns nothing, with no digest. That is a real
 	// empty roster and the binding must go.
-	if _, err := service.Heartbeat(context.Background(), rosterHeartbeat("node-a", "", nil, false)); err != nil {
+	if _, err := service.Heartbeat(context.Background(), rosterHeartbeat("node-a", "", nil, true)); err != nil {
 		t.Fatalf("empty heartbeat: %v", err)
 	}
 	if _, ok := boundNode(t, store, "sandbox-1"); ok {
@@ -184,6 +189,12 @@ func TestRosterDigestMatchesTheAgreedWireFormat(t *testing.T) {
 // An incomplete roster cached during startup recovery must be upgraded once
 // the node says it has finished, even though the ids did not change: what an
 // empty roster means is different on either side of that line.
+//
+// A current node says so by resending in full, because its own state changed.
+// A node old enough to still assert completeness on an elided heartbeat says
+// so only through the wire bit, and the scheduler has to keep hearing it —
+// hence the explicit flag here. The raise is one-way: the same bit arriving
+// false can never undo it.
 func TestCompletenessUpgradeIsRememberedForAnUnchangedDigest(t *testing.T) {
 	service, _ := rosterService(t)
 	roster := []string{"sandbox-1"}
@@ -194,7 +205,9 @@ func TestCompletenessUpgradeIsRememberedForAnUnchangedDigest(t *testing.T) {
 	if _, err := service.Heartbeat(context.Background(), incomplete); err != nil {
 		t.Fatalf("incomplete heartbeat: %v", err)
 	}
-	if _, err := service.Heartbeat(context.Background(), rosterHeartbeat("node-a", digest, nil, false)); err != nil {
+	recovered := rosterHeartbeat("node-a", digest, nil, false)
+	recovered.RosterComplete = true
+	if _, err := service.Heartbeat(context.Background(), recovered); err != nil {
 		t.Fatalf("complete heartbeat: %v", err)
 	}
 
@@ -204,5 +217,61 @@ func TestCompletenessUpgradeIsRememberedForAnUnchangedDigest(t *testing.T) {
 	}
 	if !complete {
 		t.Fatal("the cached roster should have been upgraded to complete")
+	}
+}
+
+// An elided heartbeat says nothing about its own ids, so the authority to
+// delete has to come from the cached roster it resolves to. Taking the wire
+// bit instead would leave every elided round unauthoritative, and a node that
+// has emptied out would keep its dead bindings until the TTL expired them —
+// which is the failure the cache exists to avoid.
+func TestElidedHeartbeatStillReapsFromTheCachedAuthority(t *testing.T) {
+	service, store := rosterService(t)
+
+	// The node empties out and says so authoritatively, in full.
+	emptyDigest := RosterDigest(nil)
+	if _, err := service.Heartbeat(context.Background(), rosterHeartbeat("node-a", emptyDigest, nil, true)); err != nil {
+		t.Fatalf("empty heartbeat: %v", err)
+	}
+
+	// A binding appears behind the node's back — a stale write, or one the
+	// node has already forgotten. The next elided round must still reap it.
+	if err := store.Record("sandbox-1", Node{ID: "node-a", Endpoint: "10.0.0.1:8000"}, time.Now()); err != nil {
+		t.Fatalf("record stray binding: %v", err)
+	}
+	elided, err := service.Heartbeat(context.Background(), rosterHeartbeat("node-a", emptyDigest, nil, false))
+	if err != nil {
+		t.Fatalf("elided heartbeat: %v", err)
+	}
+	if elided.GetRequestFullRoster() {
+		t.Fatal("a known digest must not trigger a re-send")
+	}
+	if _, ok := boundNode(t, store, "sandbox-1"); ok {
+		t.Fatal("an elided heartbeat must reconcile with the cached roster's authority")
+	}
+}
+
+// The other direction. A node that was still recovering when it sent its
+// roster never claimed authority, and eliding must not manufacture it: an
+// empty roster from a node that has not finished replaying its own state says
+// nothing about what it holds.
+func TestElidedHeartbeatDoesNotPromoteARecoveringRoster(t *testing.T) {
+	service, store := rosterService(t)
+
+	emptyDigest := RosterDigest(nil)
+	recovering := rosterHeartbeat("node-a", emptyDigest, nil, true)
+	recovering.RosterComplete = false
+	if _, err := service.Heartbeat(context.Background(), recovering); err != nil {
+		t.Fatalf("recovering heartbeat: %v", err)
+	}
+
+	if err := store.Record("sandbox-1", Node{ID: "node-a", Endpoint: "10.0.0.1:8000"}, time.Now()); err != nil {
+		t.Fatalf("record binding: %v", err)
+	}
+	if _, err := service.Heartbeat(context.Background(), rosterHeartbeat("node-a", emptyDigest, nil, false)); err != nil {
+		t.Fatalf("elided heartbeat: %v", err)
+	}
+	if _, ok := boundNode(t, store, "sandbox-1"); !ok {
+		t.Fatal("a roster the node never claimed was complete must not delete anything")
 	}
 }
