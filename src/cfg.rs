@@ -195,6 +195,22 @@ pub struct PoolTomlConfig {
     pub firecracker: FirecrackerProcessPoolConfig,
 }
 
+/// What a node does when it loses contact with the scheduler.
+#[derive(Debug, Config, Clone)]
+pub struct SchedulerReportKillSwitchConfig {
+    /// "disabled" (default) or "block_creates".
+    ///
+    /// Pausing running sandboxes is deliberately not offered here: with a
+    /// single scheduler replica a restart is indistinguishable from a
+    /// partition, so that action would pause the fleet on every deploy.
+    #[config(default = "disabled")]
+    pub action: String,
+    /// Seconds without a successful heartbeat before the action applies. Zero
+    /// disables the switch regardless of the action.
+    #[config(default = 0u64)]
+    pub after_secs: u64,
+}
+
 /// Node-local admission thresholds.
 ///
 /// Every limit defaults to unset, so the gate ships inert: enabling it is an
@@ -561,6 +577,8 @@ pub struct ObservabilitySchedulerReportConfig {
     pub enabled: bool,
     #[config(default = 5u64, env = "AENV_OBSERVABILITY_REPORT_INTERVAL_SECS")]
     pub interval_secs: u64,
+    #[config(nested)]
+    pub kill_switch: SchedulerReportKillSwitchConfig,
 }
 
 #[derive(Debug, Config, Clone)]

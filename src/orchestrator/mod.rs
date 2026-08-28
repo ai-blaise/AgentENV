@@ -64,6 +64,14 @@ pub enum OrchestratorError {
     #[error("orchestrator is shutting down")]
     ShuttingDown,
 
+    /// The node has lost contact with the scheduler and is refusing new work.
+    ///
+    /// Distinct from `AdmissionRejected`: that means "I am full", this means
+    /// "I cannot be reached, so I should not be accepting placements I may
+    /// never be told to release".
+    #[error("node has lost contact with the scheduler for {elapsed_secs}s and is not accepting new sandboxes")]
+    SchedulerContactLost { elapsed_secs: u64 },
+
     /// The node refused to start the sandbox from its own view of capacity.
     ///
     /// Placement is advisory and necessarily stale; this is the authoritative

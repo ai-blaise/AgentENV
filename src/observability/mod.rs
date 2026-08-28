@@ -11,6 +11,7 @@
 //! sandboxes on every call.
 
 mod host;
+mod kill_switch;
 mod machine;
 mod model;
 pub mod prometheus;
@@ -18,6 +19,7 @@ mod reporter;
 mod service;
 
 pub use host::{DiskMetric, HostMetrics, HostMetricsCollector};
+pub use kill_switch::{global_kill_switch, KillSwitch, KillSwitchAction};
 pub use model::{MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
 pub use reporter::ObservabilityReporter;
 pub use service::ObservabilityService;

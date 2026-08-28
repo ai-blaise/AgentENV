@@ -352,6 +352,7 @@ where
         self: &Arc<Self>,
         request: CreateSandboxRequest,
     ) -> Result<SandboxMetadata> {
+        self.ensure_scheduler_contact()?;
         // Admission runs before the task spawn and before any side effect, so
         // a rejection costs nothing and leaves no state behind. That is what
         // makes it safe for the caller to place the sandbox elsewhere.
@@ -376,6 +377,28 @@ where
             admission.commit();
         }
         result
+    }
+
+    /// Refuses new sandboxes while the node is out of contact with the
+    /// scheduler.
+    ///
+    /// Deliberately checked only on the create paths rather than in the shared
+    /// lifecycle guard. That guard also covers keep-alive, resume and capture;
+    /// blocking those would stop a partitioned node from renewing the very
+    /// sandboxes it is trying to protect, and auto-eviction would then delete
+    /// them. Refusing new work is the only action that is safe while the node
+    /// cannot tell a scheduler restart from a partition.
+    fn ensure_scheduler_contact(&self) -> Result<()> {
+        let switch = crate::observability::global_kill_switch();
+        if !switch.blocks_creates() {
+            return Ok(());
+        }
+        let elapsed_secs = switch
+            .since_last_success()
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default();
+        metrics::counter!("agentenv_kill_switch_rejected_total").increment(1);
+        Err(OrchestratorError::SchedulerContactLost { elapsed_secs })
     }
 
     /// Reserves node capacity for `count` sandboxes, or reports why not.
@@ -617,6 +640,7 @@ where
         }
         .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?;
 
+        self.ensure_scheduler_contact()?;
         // Admit the whole fan-out before the Running -> Forking transition, so
         // a rejection never strands the source in Forking. Children inherit the
         // source's resources.

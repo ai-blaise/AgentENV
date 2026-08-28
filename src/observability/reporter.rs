@@ -96,6 +96,7 @@ impl ObservabilityReporter {
         let mut event_shutdown_rx = shutdown_rx;
         let mut sandbox_event_rx = event_service.subscribe_sandbox_events();
 
+        let kill_switch = super::global_kill_switch();
         let heartbeat_join = tokio::spawn(async move {
             let mut backoff = config.interval;
             let mut wait = Duration::from_millis(100);
@@ -125,6 +126,10 @@ impl ObservabilityReporter {
                 {
                     Ok(()) => {
                         ever_heartbeat_succeeded.store(true, Ordering::Relaxed);
+                        // Contact restored clears the kill switch without
+                        // operator action, so a partition that heals does not
+                        // leave the node refusing work.
+                        kill_switch.record_success();
                         backoff = config.interval;
                         wait = config.interval;
                     }
@@ -524,6 +529,10 @@ mod tests {
         ObservabilitySchedulerReportConfig {
             enabled: enabled.unwrap_or_default(),
             interval_secs: interval_secs.unwrap_or(5),
+            kill_switch: crate::cfg::SchedulerReportKillSwitchConfig {
+                action: "disabled".to_string(),
+                after_secs: 0,
+            },
         }
     }
 

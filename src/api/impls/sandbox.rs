@@ -52,6 +52,13 @@ impl From<OrchestratorError> for models::Error {
             OrchestratorError::ShuttingDown => {
                 Self::new(503, "orchestrator is shutting down".to_string())
             }
+            // Same shape as a capacity rejection: retryable elsewhere, and
+            // distinguishable so a caller is not left guessing whether the
+            // fleet is full or this node is isolated.
+            OrchestratorError::SchedulerContactLost { elapsed_secs } => Self::new(
+                503,
+                format!("node has lost scheduler contact for {elapsed_secs}s"),
+            ),
             // A capacity rejection is a routing signal, not a fault: the
             // sandbox can start elsewhere. The reason is a closed set, so a
             // caller can distinguish "this node is full" from "the fleet is
