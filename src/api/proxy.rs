@@ -832,6 +832,12 @@ fn parse_target_port_header(headers: &HeaderMap) -> Result<u16, ProxyRequestErro
         .ok_or(ProxyRequestError::InvalidTargetPort)
 }
 
+/// Marks a response as "this node does not own that sandbox".
+///
+/// The gateway uses it to invalidate a cached binding the instant it is
+/// contradicted, rather than serving a moved sandbox for the rest of a TTL.
+pub(crate) const SANDBOX_DISOWNED_HEADER: &str = "x-agentenv-sandbox-disowned";
+
 pub(crate) fn sandbox_not_found_response(sandbox_id: SandboxId) -> Response<Body> {
     proxy_error_response(&ProxyRequestError::SandboxNotFound(sandbox_id))
 }
@@ -905,12 +911,21 @@ fn proxy_error_response(error: &ProxyRequestError) -> Response<Body> {
         ProxyRequestError::InternalServerError => unreachable!("handled above"),
     }
 
-    Response::builder()
-        .status(status)
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; charset=utf-8"),
-        )
+    let mut builder = Response::builder().status(status).header(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    if matches!(error, ProxyRequestError::SandboxNotFound(_)) {
+        // Says "this node does not have that sandbox", which a bare 404 cannot:
+        // the guest's own application returns 404 all the time, and a gateway
+        // that treated those as a moved sandbox would re-resolve on every one.
+        //
+        // Only emitted when the sandbox is absent here. A sandbox that exists
+        // but is not currently proxyable is not disowned — the routing is
+        // still correct and re-resolving would find the same node.
+        builder = builder.header(SANDBOX_DISOWNED_HEADER, HeaderValue::from_static("1"));
+    }
+    builder
         .body(Body::from(message))
         .unwrap_or_else(|_| status.into_response())
 }

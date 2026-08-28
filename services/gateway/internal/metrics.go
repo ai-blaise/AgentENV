@@ -264,3 +264,13 @@ func recordGatewayScheduleRetry(nodeID string) {
 func recordGatewayRefusal(reason string) {
 	gatewayCreateRefusalsTotal.WithLabelValues(reason).Inc()
 }
+
+// gatewayCutoverFollowedTotal counts requests that were re-routed after the
+// node they were sent to disowned the sandbox. A rising rate without
+// migrations happening means bindings are going stale for some other reason.
+var gatewayCutoverFollowedTotal = promauto.NewCounter(
+	prometheus.CounterOpts{
+		Name: "agentenv_gateway_sandbox_cutover_followed_total",
+		Help: "Requests re-routed to a new node after the previous owner disowned the sandbox.",
+	},
+)

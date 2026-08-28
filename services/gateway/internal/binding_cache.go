@@ -111,8 +111,11 @@ func (c *CachingSchedulerClient) LookupNode(
 // Invalidate drops a cached entry. Called when the upstream contradicts the
 // cache — the sandbox has moved or is gone — so the next request re-resolves
 // rather than waiting out the TTL.
+// A nil receiver is a gateway configured without a binding cache, where there
+// is nothing to invalidate. Callers on the response path should not each have
+// to know that.
 func (c *CachingSchedulerClient) Invalidate(sandboxID string) {
-	if sandboxID == "" {
+	if c == nil || sandboxID == "" {
 		return
 	}
 	c.mu.Lock()

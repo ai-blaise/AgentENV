@@ -133,6 +133,7 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 			Transport: upstreamTransport,
 		},
 		upstreamTransport:   upstreamTransport,
+		bindingCache:        bindingCache,
 		requestTimeout:      options.RequestTimeout,
 		maxRespSize:         options.MaxResponseSize,
 		apiKey:              []byte(options.APIKey),
@@ -315,17 +316,26 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	upstreamCtx, cancelUpstream := requestContextForProxy(r, routingCtx, longLived)
 	defer cancelUpstream()
 
+	options := proxyRequestOptions{
+		recordAssignment: shouldRecordAssignment(r, routeSource, hasSandbox),
+		hostRoute:        hostRoute,
+		flushImmediately: longLived,
+	}
+
+	// A sandbox that moved between the lookup and the request would otherwise
+	// fail with the old node's 404, which reads to the client as "your sandbox
+	// is gone" rather than "it is somewhere else now".
+	if s.proxyWithCutover(w, r, routingCtx, upstreamCtx, node, options, sandboxID, routeSource, longLived) {
+		return
+	}
+
 	s.proxyRequest(
 		w,
 		r.Clone(upstreamCtx),
 		r.Context(),
 		upstreamURL,
 		node,
-		proxyRequestOptions{
-			recordAssignment: shouldRecordAssignment(r, routeSource, hasSandbox),
-			hostRoute:        hostRoute,
-			flushImmediately: longLived,
-		},
+		options,
 	)
 }
 
@@ -452,6 +462,9 @@ type proxyRequestOptions struct {
 	recordAssignment bool
 	hostRoute        *hostRoute
 	flushImmediately bool
+	// onDisown fires when the node says it does not have this sandbox, so a
+	// caller that can retry elsewhere knows to.
+	onDisown func()
 }
 
 func (s *Server) proxyRequest(
@@ -499,12 +512,17 @@ func (s *Server) proxyRequest(
 					resp.Header.Set(headerNodeID, nodeID)
 				}
 			}
-			// The owning node disowning a sandbox means the cached binding is
-			// wrong now, not in a second. Re-resolve on the next request
-			// instead of serving the stale node for the rest of the TTL.
-			if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusBadGateway {
+			// A node saying it does not have this sandbox means the cached
+			// binding is wrong now, not in a second. This used to fire on any
+			// 404 or 502, which meant every 404 the guest's own application
+			// returned cost a scheduler round trip; the node now says which it
+			// is, and only a real disown invalidates.
+			if isSandboxDisowned(resp) {
 				if sandboxID, ok := sandboxIDFromHeaders(proxyReq.Header); ok {
 					s.bindingCache.Invalidate(sandboxID)
+				}
+				if options.onDisown != nil {
+					options.onDisown()
 				}
 			}
 			if !options.recordAssignment || resp.StatusCode < 200 || resp.StatusCode >= 300 {
