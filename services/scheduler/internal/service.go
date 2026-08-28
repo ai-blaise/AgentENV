@@ -30,6 +30,10 @@ type Service struct {
 	// defaults to on; disabling it restores the previous behavior of placing on
 	// any discovered node regardless of heartbeat age.
 	healthGateEnabled bool
+	// ledger folds node-reported lifecycle events onto the last heartbeat
+	// snapshot, closing the window in which a burst of creates all read the
+	// same stale numbers. Advisory only; see ReservationLedger.
+	ledger *ReservationLedger
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -45,6 +49,7 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		strategy:          strategy,
 		reportTTL:         defaultObservedReportTTL,
 		healthGateEnabled: true,
+		ledger:            NewReservationLedger(0),
 		store:             store,
 		artifacts:         NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
 	}
@@ -112,13 +117,16 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		recordSchedulerSchedule(s.strategy.Name(), start, err)
 	}()
 
+	now := time.Now()
 	discovered := s.nodes.Snapshot( /* allowLingering */ false)
 	rich := make([]RichNode, 0, len(discovered))
 	for _, n := range discovered {
 		snapshot, health := s.nodes.PeekObservedHealth(n.ID)
 		rich = append(rich, RichNode{
-			Node:     n,
-			Snapshot: snapshot,
+			Node: n,
+			// Fold in what this node has told us since its last heartbeat, so a
+			// burst of creates does not keep reading the same stale numbers.
+			Snapshot: s.ledger.ApplyTo(n.ID, snapshot, now),
 			Health:   health,
 		})
 	}
@@ -128,7 +136,7 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	eligible := rich
 	if s.healthGateEnabled {
 		var dropped map[HealthFilterReason]int
-		eligible, dropped = FilterByHealth(rich, s.reportTTL, time.Now())
+		eligible, dropped = FilterByHealth(rich, s.reportTTL, now)
 		for reason, count := range dropped {
 			recordSchedulerNodesFiltered(string(reason), count)
 		}
@@ -325,6 +333,10 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 		}
 		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
 	}
+	// The heartbeat is the authoritative count, so anything the ledger was
+	// carrying for this node is now either included in it or lost.
+	s.ledger.Reset(nodeID)
+
 	completeness := RosterIncomplete
 	if req.GetRosterComplete() {
 		completeness = RosterComplete
@@ -340,8 +352,22 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 }
 
 func (s *Service) ReportSandboxEvent(_ context.Context, req *schedulerv1.ReportSandboxEventRequest) (*schedulerv1.ReportSandboxEventResponse, error) {
-	s.logger.Debug("scheduler ignored sandbox event batch",
-		zap.String("node_id", req.GetNodeId()),
+	nodeID := strings.TrimSpace(req.GetNodeId())
+	if nodeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "node_id is required")
+	}
+	// Only nodes the scheduler knows about may move its placement view.
+	if _, known := s.nodes.Resolve(nodeID); !known {
+		s.logger.Debug("scheduler ignored sandbox events from unknown node",
+			zap.String("node_id", nodeID),
+			zap.Int("event_count", len(req.GetEvents())),
+		)
+		return &schedulerv1.ReportSandboxEventResponse{}, nil
+	}
+
+	s.ledger.Apply(nodeID, req.GetEvents(), time.Now())
+	s.logger.Debug("scheduler applied sandbox event batch",
+		zap.String("node_id", nodeID),
 		zap.String("service_instance_id", req.GetServiceInstanceId()),
 		zap.Int("event_count", len(req.GetEvents())),
 	)
@@ -466,6 +492,7 @@ func (s *Service) UnregisterNode(_ context.Context, req *schedulerv1.UnregisterN
 	}
 
 	now := time.Now()
+	s.ledger.Forget(nodeID)
 	if err := s.store.ReconcileNodeRoster(Node{ID: nodeID}, nil, RosterFinal, now); err != nil {
 		s.logger.Warn("scheduler unregister binding reconcile failed",
 			zap.String("node_id", nodeID),
