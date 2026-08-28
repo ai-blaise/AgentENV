@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod contention;
 mod in_memory;
 mod metadata;
 
