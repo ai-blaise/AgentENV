@@ -46,6 +46,12 @@ pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
 /// Returns zeroed capacity when networking has not been initialized, so
 /// querying it never forces the global manager into existence as a side effect
 /// of an admission decision.
+/// Network slots available right now, for callers outside this module that
+/// only need the number.
+pub(crate) fn network_slot_capacity_available() -> usize {
+    network_slot_capacity().available()
+}
+
 pub(crate) fn network_slot_capacity() -> network::NetworkSlotCapacity {
     network::NetworkManager::global_if_initialized()
         .map(|manager| manager.slot_capacity())

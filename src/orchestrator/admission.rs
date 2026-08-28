@@ -239,6 +239,30 @@ pub struct AdmissionController {
     cached: Mutex<Option<CachedMetrics>>,
 }
 
+/// Process-wide admission controller.
+///
+/// Invariant: every path that consumes node capacity charges the *same*
+/// counters. Template builds construct a Firecracker sandbox directly on their
+/// own runtime and never reach the orchestrator's create path, so a controller
+/// owned solely by the orchestrator would leave them invisible — they would
+/// consume network slots, devices and memory that admission believed were
+/// free. Sharing one instance is what makes the gate's arithmetic true for the
+/// node rather than for one subsystem of it.
+static GLOBAL: std::sync::OnceLock<Arc<AdmissionController>> = std::sync::OnceLock::new();
+
+/// Returns the process-wide controller, initializing it from global config on
+/// first use.
+pub fn global_admission_controller() -> Arc<AdmissionController> {
+    Arc::clone(GLOBAL.get_or_init(|| {
+        Arc::new(AdmissionController::new(
+            crate::cfg::ConfigManager::global_config()
+                .orchestrator
+                .admission
+                .clone(),
+        ))
+    }))
+}
+
 impl AdmissionController {
     pub fn new(config: AdmissionConfig) -> Self {
         Self {

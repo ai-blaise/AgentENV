@@ -205,6 +205,13 @@ impl TemplateBuildRunner {
         let startup = context.startup.clone();
         let override_startup = context.override_startup;
 
+        // A template build starts a real VM and consumes the same node capacity
+        // an ordinary create does, but it never reaches the orchestrator's
+        // create path. Charging it against the process-wide controller is what
+        // keeps admission's arithmetic true for the node: without it, builds
+        // consume slots, devices and memory the gate believes are free.
+        let admission = crate::orchestrator::global_admission_controller();
+
         let handle =
             spawn_with_trace_context(worker_span, move || -> Result<TemplateBuildExecution> {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -212,6 +219,19 @@ impl TemplateBuildRunner {
                     .build()
                     .context("create tokio runtime")?;
                 rt.block_on(async move {
+                    let capacity = crate::orchestrator::NodeCapacityInputs {
+                        available_network_slots: crate::sandbox::network_slot_capacity_available(),
+                    };
+                    // Held for the lifetime of the build: unlike a sandbox
+                    // create there is no metadata store entry to hand the
+                    // accounting over to, so the reservation *is* the record
+                    // of this build's footprint, released when it finishes.
+                    let _admission_guard = admission
+                        .try_admit(1, resources, capacity, || async { None })
+                        .await
+                        .map_err(|reason| {
+                            anyhow::anyhow!("node at capacity for template build: {reason}")
+                        })?;
                     let mut sandbox = create_sandbox()?;
                     let run_result = async {
                         debug!(

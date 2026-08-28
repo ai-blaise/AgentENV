@@ -11,7 +11,8 @@ use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
 pub use admission::{
-    AdmissionController, AdmissionGuard, AdmissionRejectReason, NodeCapacityInputs,
+    global_admission_controller, AdmissionController, AdmissionGuard, AdmissionRejectReason,
+    NodeCapacityInputs,
 };
 pub use metrics::OrchestratorMetrics;
 pub use persistence::{

@@ -104,7 +104,7 @@ pub struct Orchestrator<
     sandbox_event_tx: broadcast::Sender<SandboxLifecycleEvent>,
     default_sandbox_timeout: Duration,
     is_shutting_down: std::sync::atomic::AtomicBool,
-    admission: AdmissionController,
+    admission: Arc<AdmissionController>,
     /// Set once startup recovery has finished restoring persisted paused
     /// sandboxes into the store.
     ///
@@ -204,7 +204,7 @@ where
             sandbox_event_tx,
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
-            admission: AdmissionController::new(app_config.orchestrator.admission.clone()),
+            admission: super::admission::global_admission_controller(),
             roster_complete: std::sync::atomic::AtomicBool::new(false),
             shutdown_tx,
             shutdown_outcome: OnceCell::new(),
