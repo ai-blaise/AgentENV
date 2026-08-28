@@ -1494,4 +1494,87 @@ mod tests {
         };
         assert_eq!(capacity.available(), 0);
     }
+
+    /// Measures network slot creation throughput at a given concurrency.
+    ///
+    /// Each fresh slot costs a dozen RTNL-serialized netlink operations, two of
+    /// which hold RTNL across a `synchronize_net()`, plus several fork/execs.
+    /// That is the suspected ceiling on per-node cold creates, and whether it
+    /// actually is decides whether deeper netlink work — socket reuse,
+    /// replacing the `ip` shell-outs, a pre-created device bank — is worth
+    /// building. Answering that by measurement rather than inference is the
+    /// whole point of this test.
+    ///
+    /// Ignored by default: it creates real namespaces and devices, so it needs
+    /// root and must not run alongside anything else touching them. Run with:
+    ///
+    /// ```text
+    /// sudo -E cargo test -p agentenv --lib network_slot_creation_throughput -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires root and mutates host network state"]
+    fn network_slot_creation_throughput() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skipping: network slot creation requires root");
+            return;
+        }
+
+        const SLOTS_PER_ROUND: usize = 32;
+
+        for concurrency in [1usize, 2, 4, 8] {
+            let manager = NetworkManager::new(
+                /* maintenance_enabled */ false,
+                /* low_watermark */ 0,
+                /* high_watermark */ 0,
+            );
+
+            let start = std::time::Instant::now();
+            let mut created = Vec::with_capacity(SLOTS_PER_ROUND);
+            let mut failures = 0usize;
+
+            let mut remaining = SLOTS_PER_ROUND;
+            while remaining > 0 {
+                let batch = remaining.min(concurrency);
+                let results: Vec<Result<Slot>> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = (0..batch)
+                        .map(|_| scope.spawn(|| manager.allocate_any()))
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|handle| {
+                            handle.join().unwrap_or_else(|_| {
+                                Err(anyhow!("slot allocation thread panicked"))
+                            })
+                        })
+                        .collect()
+                });
+                for result in results {
+                    match result {
+                        Ok(slot) => created.push(slot),
+                        Err(err) => {
+                            failures += 1;
+                            eprintln!("slot allocation failed: {err:#}");
+                        }
+                    }
+                }
+                remaining -= batch;
+            }
+
+            let elapsed = start.elapsed();
+            let ok = created.len();
+            eprintln!(
+                "concurrency={concurrency:2} slots={ok:3} failures={failures:2} \
+                 elapsed={elapsed:?} per_slot={:?} slots_per_sec={:.1}",
+                elapsed.checked_div(ok.max(1) as u32).unwrap_or_default(),
+                ok as f64 / elapsed.as_secs_f64().max(f64::EPSILON),
+            );
+
+            for slot in created {
+                if let Err(err) = manager.cleanup_slot_and_release_bit(slot) {
+                    eprintln!("slot cleanup failed: {err:#}");
+                }
+            }
+        }
+    }
 }
