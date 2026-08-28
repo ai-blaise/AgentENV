@@ -1318,8 +1318,14 @@ impl FirecrackerSandbox {
         }
 
         // ── Allocate network slot and create network infrastructure ──
-        let slot = NetworkManager::global()
-            .allocate_any()
+        //
+        // Slot creation is synchronous and internally joins dedicated threads
+        // (netns membership is thread-local, so the work cannot simply be made
+        // async). Calling it directly from this async fn parks a runtime worker
+        // for the whole of it on every cold create.
+        let slot = tokio::task::spawn_blocking(|| NetworkManager::global().allocate_any())
+            .await
+            .context("network slot allocation task panicked")?
             .context("Failed to allocate network slot")?;
         debug!(slot = slot.idx, "allocated network slot");
         let interaction_ip = slot.host_interaction_ip;
@@ -1512,8 +1518,9 @@ impl FirecrackerSandbox {
         let interaction_ip = if let Some(slot) = self.network_slot.as_ref() {
             slot.host_interaction_ip
         } else {
-            let slot = NetworkManager::global()
-                .allocate_any()
+            let slot = tokio::task::spawn_blocking(|| NetworkManager::global().allocate_any())
+                .await
+                .context("network slot allocation task panicked")?
                 .context("Failed to allocate network slot for resume")?;
             debug!(slot = slot.idx, "allocated network slot for resume");
             let netns = slot.namespace_path();

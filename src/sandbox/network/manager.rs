@@ -43,6 +43,7 @@ struct NetworkManagerConfig {
     pool: PoolConfig,
     address_plan: NetworkAddressPlan,
     netns_dir: PathBuf,
+    fill_concurrency: usize,
 }
 
 pub(crate) struct NetworkManager {
@@ -64,6 +65,31 @@ pub(crate) struct NetworkManager {
 
     /// Rejects new allocations once shutdown cleanup starts.
     shutting_down: AtomicBool,
+
+    /// Slots built concurrently per refill batch.
+    fill_concurrency: usize,
+}
+
+/// Network slot capacity as admission control needs to read it.
+///
+/// `pooled` slots keep their bitmap bit while they sit in the warm pool, so
+/// `allocated` alone understates what is immediately available: a node with a
+/// full pool and no running sandboxes would look saturated. Admission must
+/// compare against [`NetworkSlotCapacity::available`], which counts a pooled
+/// slot as free because acquiring it costs no netlink work at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NetworkSlotCapacity {
+    pub total: usize,
+    pub allocated: usize,
+    pub pooled: usize,
+}
+
+impl NetworkSlotCapacity {
+    pub fn available(&self) -> usize {
+        self.total
+            .saturating_sub(self.allocated)
+            .saturating_add(self.pooled)
+    }
 }
 
 impl NetworkManager {
@@ -89,6 +115,7 @@ impl NetworkManager {
                 address_plan: NetworkAddressPlan::from_config(&cfg.network)
                     .expect("validated network.internal config should produce an address plan"),
                 netns_dir: cfg.runtime_path.join("netns"),
+                fill_concurrency: cfg.network_pool_fill_concurrency(),
             })
         });
 
@@ -119,6 +146,7 @@ impl NetworkManager {
             },
             address_plan: NetworkAddressPlan::default(),
             netns_dir: std::env::temp_dir().join("aenv-network-tests/netns"),
+            fill_concurrency: 1,
         })
     }
 
@@ -131,6 +159,7 @@ impl NetworkManager {
             netns_dir: config.netns_dir,
             egress_proxy,
             shutting_down: AtomicBool::new(false),
+            fill_concurrency: config.fill_concurrency.max(1),
         };
 
         // Reserve slot 0 (invalid for IP addresses)
@@ -147,6 +176,16 @@ impl NetworkManager {
 
     fn shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::Acquire)
+    }
+
+    /// Current slot capacity. See [`NetworkSlotCapacity`] for why pooled slots
+    /// count as available rather than as consumed.
+    pub(crate) fn slot_capacity(&self) -> NetworkSlotCapacity {
+        NetworkSlotCapacity {
+            total: MAX_SLOTS,
+            allocated: self.allocated.len(),
+            pooled: self.pool.len(),
+        }
     }
 
     fn ensure_pool_maintenance_worker_started(&'static self) {
@@ -304,38 +343,83 @@ impl NetworkManager {
         self.pool.compute_maintenance_action(pool_len)
     }
 
+    /// Publishes slot-pool occupancy. There were previously no warm-pool
+    /// metrics at all, so pool starvation was only visible as create latency.
+    fn publish_pool_metrics(&self) {
+        let capacity = self.slot_capacity();
+        metrics::gauge!("agentenv_pool_size", "pool" => "network").set(capacity.pooled as f64);
+        metrics::gauge!("agentenv_network_slots_allocated").set(capacity.allocated as f64);
+        metrics::gauge!("agentenv_network_slots_available").set(capacity.available() as f64);
+    }
+
+    /// Builds up to `to_fill` warm slots, `fill_concurrency` at a time.
+    ///
+    /// Slot creation is synchronous and thread-bound (netns membership is
+    /// thread-local), so batches are built on scoped threads rather than tasks.
+    /// Each slot costs a dozen RTNL-serialized netlink operations, two of which
+    /// hold RTNL across a `synchronize_net()`, so concurrency here trades
+    /// refill latency against peak kernel lock pressure and does not scale
+    /// linearly.
+    fn fill_warm_slots(&self, to_fill: usize) -> Result<()> {
+        let mut remaining = to_fill;
+        while remaining > 0 && !self.shutting_down() {
+            let batch = remaining.min(self.fill_concurrency);
+            let results: Vec<Result<Slot>> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..batch)
+                    .map(|_| scope.spawn(|| self.allocate_fresh_slot()))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle
+                            .join()
+                            .unwrap_or_else(|_| Err(anyhow!("network slot refill thread panicked")))
+                    })
+                    .collect()
+            });
+
+            let mut saw_failure = false;
+            for result in results {
+                match result {
+                    Ok(slot) => {
+                        let slot_idx = slot.idx;
+                        match self.pool.try_push_bounded(slot) {
+                            Ok(()) => trace!(
+                                slot = slot_idx,
+                                pool_len = self.pool.len(),
+                                "refilled warm network slot"
+                            ),
+                            Err(slot) => self.cleanup_slot_and_release_bit(slot)?,
+                        }
+                    }
+                    Err(err) => {
+                        saw_failure = true;
+                        debug!(error = %err, "skipping pool refill attempt");
+                    }
+                }
+            }
+
+            if saw_failure {
+                // Stop this cycle rather than spinning: the maintenance worker
+                // will try again on its next tick. A tight retry here would
+                // hammer whatever is failing — most often slot exhaustion or
+                // the xtables lock — for as long as it stays broken.
+                metrics::counter!("agentenv_pool_refill_failures_total", "pool" => "network")
+                    .increment(1);
+                break;
+            }
+            remaining -= batch;
+        }
+        Ok(())
+    }
+
     fn run_pool_maintenance_cycle(&self) -> Result<()> {
+        self.publish_pool_metrics();
         let action = self.pool.compute_maintenance_action(self.pool.len());
 
         match action {
             PoolMaintenanceAction::Fill(to_fill) => {
-                for _ in 0..to_fill {
-                    if self.shutting_down() {
-                        break;
-                    }
-
-                    let maybe_slot = match self.allocate_fresh_slot() {
-                        Ok(slot) => Some(slot),
-                        Err(err) => {
-                            debug!(error = %err, "skipping pool refill attempt");
-                            break;
-                        }
-                    };
-
-                    if let Some(slot) = maybe_slot {
-                        let slot_idx = slot.idx;
-                        match self.pool.try_push_bounded(slot) {
-                            Ok(()) => {
-                                trace!(
-                                    slot = slot_idx,
-                                    pool_len = self.pool.len(),
-                                    "refilled warm network slot"
-                                );
-                            }
-                            Err(slot) => self.cleanup_slot_and_release_bit(slot)?,
-                        }
-                    }
-                }
+                self.fill_warm_slots(to_fill)?;
             }
             PoolMaintenanceAction::Drain(to_drain) => {
                 for _ in 0..to_drain {
@@ -1385,5 +1469,29 @@ mod tests {
             }),
             "host route leaked after panic child exit: {host_interaction_ip}/32"
         );
+    }
+
+    /// A pooled slot costs no netlink work to acquire, so admission must count
+    /// it as available. Deriving free capacity from the allocation bitmap alone
+    /// would make a node with a full warm pool look saturated and reject
+    /// creates it could serve instantly.
+    #[test]
+    fn slot_capacity_counts_pooled_slots_as_available() {
+        let capacity = NetworkSlotCapacity {
+            total: 100,
+            allocated: 40,
+            pooled: 10,
+        };
+        assert_eq!(capacity.available(), 70);
+    }
+
+    #[test]
+    fn slot_capacity_saturates_rather_than_underflowing() {
+        let capacity = NetworkSlotCapacity {
+            total: 4,
+            allocated: 8,
+            pooled: 0,
+        };
+        assert_eq!(capacity.available(), 0);
     }
 }

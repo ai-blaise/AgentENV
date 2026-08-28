@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::sync::broadcast;
 
 use crate::orchestrator::{Orchestrator, SandboxLifecycleEvent};
@@ -69,7 +69,13 @@ impl ObservabilityService {
     /// Returns the latest node snapshot exposed by the admin/node APIs and heartbeat reporting.
     pub async fn node_snapshot(&self) -> Result<NodeSnapshot> {
         let runtime = self.orchestrator.metrics_snapshot().await?;
-        let host = self.host_metrics.collect();
+        // The first collection sleeps to take a second CPU sample, and every
+        // collection reads /proc synchronously. This runs on the heartbeat
+        // path, so doing it inline parks a runtime worker.
+        let host_metrics = self.host_metrics.clone();
+        let host = tokio::task::spawn_blocking(move || host_metrics.collect())
+            .await
+            .context("host metrics collection task panicked")?;
 
         Ok(NodeSnapshot {
             version: self.identity.version.clone(),

@@ -203,6 +203,15 @@ pub struct PoolComponentConfig {
     pub maintenance_enabled: bool,
     #[config(default = true)]
     pub startup_prewarm: bool,
+    /// Slots built concurrently per refill batch.
+    ///
+    /// Slot creation is dominated by RTNL-serialized netlink work, so this
+    /// trades refill latency against peak kernel lock pressure rather than
+    /// scaling linearly. Raising it is only safe once `iptables-restore` is
+    /// invoked with `--wait`; without that, concurrent invocations fail on the
+    /// xtables lock and the refill loop abandons the fill.
+    #[config(default = 4usize)]
+    pub fill_concurrency: usize,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -782,6 +791,11 @@ impl AppConfig {
         }
     }
 
+    /// Slots the network pool builds concurrently per refill batch.
+    pub fn network_pool_fill_concurrency(&self) -> usize {
+        self.pool.network.fill_concurrency.max(1)
+    }
+
     pub fn block_pool_config(&self) -> Option<warm_pool::PoolConfig> {
         let pool = &self.pool.block;
 
@@ -1100,6 +1114,9 @@ impl AppConfig {
         }
         if let Some(block) = self.block_pool_config() {
             PoolTomlConfig::validate("block", &block)?;
+        }
+        if network.maintenance_enabled && self.pool.network.fill_concurrency == 0 {
+            bail!("invalid network pool config: fill_concurrency must be > 0");
         }
         if let Some(firecracker) = self.firecracker_pool_config() {
             PoolTomlConfig::validate("firecracker", &firecracker.pool)?;

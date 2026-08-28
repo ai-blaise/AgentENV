@@ -104,10 +104,47 @@ fn build_restore_script(commands: &[IptablesRestoreCommand]) -> String {
     script
 }
 
+/// Seconds `iptables-restore` may block waiting for the xtables lock.
+///
+/// Without `--wait`, concurrent invocations fail outright on /run/xtables.lock
+/// rather than queueing. Slot setup runs one `iptables-restore` per namespace
+/// and the pool refill loop abandons its fill on any error, so under
+/// concurrency the failures did not merely retry — they stopped the pool from
+/// refilling at all.
+const IPTABLES_LOCK_WAIT_SECS: &str = "5";
+
+/// Whether the installed `iptables-restore` understands `--wait`.
+///
+/// Every build since iptables 1.6 does, including the nft backend, where it is
+/// accepted and harmless. The probe exists so an unexpectedly old binary
+/// degrades to the previous behavior instead of failing every call.
+fn iptables_restore_supports_wait() -> bool {
+    static SUPPORTS_WAIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTS_WAIT.get_or_init(|| {
+        let Ok(output) = Command::new("iptables-restore").arg("--help").output() else {
+            return false;
+        };
+        // --help exits non-zero on some builds, so inspect the text, not status.
+        let help = String::from_utf8_lossy(&output.stdout);
+        let help_err = String::from_utf8_lossy(&output.stderr);
+        let supported = help.contains("--wait") || help_err.contains("--wait");
+        if !supported {
+            warn!(
+                "iptables-restore does not support --wait; concurrent network setup may fail on the xtables lock"
+            );
+        }
+        supported
+    })
+}
+
 fn apply_restore_script(script: &str) -> Result<()> {
     crate::privileges::run_with_scoped_capabilities(&[crate::privileges::CAP_NET_ADMIN], || {
-        let mut child = Command::new("iptables-restore")
-            .arg("--noflush")
+        let mut command = Command::new("iptables-restore");
+        command.arg("--noflush");
+        if iptables_restore_supports_wait() {
+            command.arg("--wait").arg(IPTABLES_LOCK_WAIT_SECS);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -132,6 +169,13 @@ fn apply_restore_script(script: &str) -> Result<()> {
         }
 
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // Distinguish lock contention from a malformed ruleset: the first is a
+        // capacity signal that scales with concurrency, the second is a bug.
+        let contended =
+            stderr.contains("xtables lock") || stderr.contains("another app is currently holding");
+        if contended {
+            metrics::counter!("agentenv_network_iptables_lock_contention_total").increment(1);
+        }
         Err(anyhow!("iptables-restore failed: {}", stderr.trim()))
     })
 }
