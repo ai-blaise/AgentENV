@@ -1,6 +1,7 @@
 mod admission;
 mod launch_plan;
 mod metrics;
+mod mobility;
 mod persistence;
 mod proxy;
 mod service;
@@ -15,6 +16,10 @@ pub use admission::{
     NodeCapacityInputs,
 };
 pub use metrics::OrchestratorMetrics;
+pub use mobility::{
+    LocalMobilityStore, MobilityGeneration, MobilityRecord, MobilityState, MobilityStore,
+    MobilityWrite,
+};
 pub use persistence::{
     DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
     SandboxPersistenceError, SandboxPersister,

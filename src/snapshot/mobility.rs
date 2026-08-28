@@ -223,7 +223,8 @@ impl fmt::Display for MigrationIncompatibility {
 /// This is a property of the repository backend, not of any individual layer:
 /// a POSIX repository is a directory on one machine's disk, and an object-store
 /// repository is reachable from the whole cluster.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ArtifactReach {
     /// Every node can fetch the artifact by itself.
     ClusterShared,
