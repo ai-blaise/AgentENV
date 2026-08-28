@@ -77,6 +77,83 @@ struct NamespaceSetup {
     netns_dir: PathBuf,
 }
 
+/// The host's shared rtnetlink connection.
+///
+/// Slot setup and teardown each opened their own netlink socket — a socket, a
+/// bind and a spawned task per operation, several per slot. `Handle` is a
+/// multiplexing sender over one connection and is explicitly meant to be
+/// cloned, so one connection serves the whole process.
+///
+/// The connection lives on a dedicated thread with its own current-thread
+/// runtime rather than on whichever runtime happened to create it first.
+/// Teardown runs on short-lived scratch runtimes (see `run_async`), and a
+/// connection spawned onto one of those would die with it, taking every
+/// outstanding request on other threads with it.
+///
+/// This deliberately does not cover the in-namespace configuration path: that
+/// runs on a thread that has already `setns`'d into the sandbox's namespace,
+/// and a netlink socket carries the namespace it was opened in. Sharing a host
+/// socket there would silently configure the host.
+static HOST_NETLINK: OnceLock<std::result::Result<Handle, String>> = OnceLock::new();
+
+fn host_netlink_handle() -> Result<Handle> {
+    HOST_NETLINK
+        .get_or_init(|| {
+            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            thread::Builder::new()
+                .name("agentenv-netlink".to_string())
+                .spawn(move || {
+                    let runtime = match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime,
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(format!(
+                                "build the netlink connection runtime: {error}"
+                            )));
+                            return;
+                        }
+                    };
+                    // `new_connection` registers the netlink socket with the
+                    // reactor, so it has to run inside the runtime rather than
+                    // beside it. Building the socket outside panics the moment
+                    // it looks for a reactor that is not there.
+                    runtime.block_on(async move {
+                        let (connection, handle, _) = match new_connection() {
+                            Ok(parts) => parts,
+                            Err(error) => {
+                                let _ =
+                                    ready_tx.send(Err(format!("connect to host netlink: {error}")));
+                                return;
+                            }
+                        };
+                        if ready_tx.send(Ok(handle)).is_err() {
+                            return;
+                        }
+                        // Owns the connection for the life of the process.
+                        connection.await;
+                    });
+                })
+                .map_err(|error| format!("spawn the netlink connection thread: {error}"))?;
+
+            ready_rx
+                .recv()
+                .map_err(|_| "the netlink connection thread exited during startup".to_string())?
+        })
+        .clone()
+        .map_err(|error| anyhow!("{error}"))
+}
+
+/// Whether the kernel accepts an on-link /32 route added over netlink.
+///
+/// Adding a route whose gateway sits on a /31 point-to-point link used to fail
+/// on some kernel configurations, which is why this path shelled out to `ip`.
+/// Rather than keep paying a fork and exec per slot for a compatibility case
+/// that may not apply, the first attempt goes over netlink and the answer is
+/// remembered: a kernel that refuses it refuses it every time.
+static NETLINK_ROUTE_ADD_WORKS: OnceLock<bool> = OnceLock::new();
+
 impl Slot {
     fn host_veth_name(idx: u32) -> String {
         format!("{HOST_VETH_PREFIX}{idx}")
@@ -642,8 +719,7 @@ impl Slot {
         veth_vm_ip: Ipv4Addr,
         host_interaction_ip: Ipv4Addr,
     ) -> Result<()> {
-        let (connection, handle, _) = new_connection().context("Netlink connect host")?;
-        tokio::spawn(connection);
+        let handle = host_netlink_handle().context("Netlink connect host")?;
 
         let veth_name = Self::host_veth_name(idx);
 
@@ -670,40 +746,17 @@ impl Slot {
                 .await
                 .context("Failed to set host veth up")?;
 
-            // Add route from host to namespace: packets destined for host_interaction_ip
-            // are forwarded through vpeer IP (in the namespace) as the gateway.
-            // This is how the host can reach the VM - the namespace's DNAT rule then
-            // translates the destination to the VM's internal IP.
-            //
-            // Using `ip route add` command as netlink route add with gateway on /31
-            // subnet has compatibility issues with some kernel configurations.
-            let output = crate::privileges::run_with_scoped_capabilities(
-                &[crate::privileges::CAP_NET_ADMIN],
-                || {
-                    std::process::Command::new("ip")
-                        .args([
-                            "route",
-                            "add",
-                            &format!("{}/32", host_interaction_ip),
-                            "via",
-                            &veth_vm_ip.to_string(),
-                            "dev",
-                            &veth_name,
-                        ])
-                        .output()
-                        .context("Failed to execute ip route add")
-                },
-            )?;
-
-            if !output.status.success() {
-                return Err(anyhow!(
-                    "Failed to add route to {}/32 via {} dev {}: {}",
-                    host_interaction_ip,
-                    veth_vm_ip,
-                    veth_name,
-                    String::from_utf8_lossy(&output.stderr)
-                ));
-            }
+            // Route host traffic for host_interaction_ip through the namespace's
+            // vpeer address; the namespace's DNAT rule then rewrites it to the
+            // VM's internal address.
+            Self::add_host_interaction_route(
+                &handle,
+                link.header.index,
+                &veth_name,
+                host_interaction_ip,
+                veth_vm_ip,
+            )
+            .await?;
         } else {
             return Err(anyhow!(
                 "Host veth interface {} not found after move",
@@ -713,11 +766,92 @@ impl Slot {
         Ok(())
     }
 
+    /// Adds the host-to-namespace route, over netlink when the kernel allows it.
+    ///
+    /// The gateway sits on a /31 point-to-point link, which some kernel
+    /// configurations reject over netlink. The first slot finds out; every slot
+    /// after it takes the answer from [`NETLINK_ROUTE_ADD_WORKS`] rather than
+    /// re-probing, so a working kernel never forks and a rejecting one forks
+    /// exactly as often as it did before.
+    async fn add_host_interaction_route(
+        handle: &Handle,
+        link_index: u32,
+        veth_name: &str,
+        host_interaction_ip: Ipv4Addr,
+        veth_vm_ip: Ipv4Addr,
+    ) -> Result<()> {
+        if NETLINK_ROUTE_ADD_WORKS.get() != Some(&false) {
+            let route = rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
+                .destination_prefix(host_interaction_ip, 32)
+                .gateway(veth_vm_ip)
+                .output_interface(link_index)
+                .build();
+            match handle.route().add(route).execute().await {
+                Ok(()) => {
+                    let _ = NETLINK_ROUTE_ADD_WORKS.set(true);
+                    return Ok(());
+                }
+                Err(error) if NETLINK_ROUTE_ADD_WORKS.get() == Some(&true) => {
+                    // Netlink has worked on this kernel before, so this is a
+                    // real failure for this route rather than a capability gap.
+                    return Err(anyhow!(
+                        "Failed to add route to {host_interaction_ip}/32 via {veth_vm_ip} \
+                         dev {veth_name} over netlink: {error}"
+                    ));
+                }
+                Err(error) => {
+                    let _ = NETLINK_ROUTE_ADD_WORKS.set(false);
+                    warn!(
+                        error = %error,
+                        "kernel rejected an on-link /32 route over netlink; \
+                         falling back to `ip route` for the life of this process"
+                    );
+                }
+            }
+        }
+
+        Self::add_host_interaction_route_via_ip(veth_name, host_interaction_ip, veth_vm_ip)
+    }
+
+    fn add_host_interaction_route_via_ip(
+        veth_name: &str,
+        host_interaction_ip: Ipv4Addr,
+        veth_vm_ip: Ipv4Addr,
+    ) -> Result<()> {
+        let output = crate::privileges::run_with_scoped_capabilities(
+            &[crate::privileges::CAP_NET_ADMIN],
+            || {
+                Command::new("ip")
+                    .args([
+                        "route",
+                        "add",
+                        &format!("{host_interaction_ip}/32"),
+                        "via",
+                        &veth_vm_ip.to_string(),
+                        "dev",
+                        veth_name,
+                    ])
+                    .output()
+                    .context("Failed to execute ip route add")
+            },
+        )?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "Failed to add route to {}/32 via {} dev {}: {}",
+            host_interaction_ip,
+            veth_vm_ip,
+            veth_name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+
     /// Async helper to delete veth interface.
     /// Idempotent: succeeds even if the interface doesn't exist.
     async fn delete_veth_interface_async(idx: u32) -> Result<()> {
-        let (connection, handle, _) = new_connection()?;
-        tokio::spawn(connection);
+        let handle = host_netlink_handle()?;
 
         let veth_name = Self::host_veth_name(idx);
         let mut links = handle.link().get().match_name(veth_name.clone()).execute();
@@ -1233,5 +1367,49 @@ mod tests {
                 Slot::host_veth_name(slot_idx)
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod host_netlink_tests {
+    use super::*;
+
+    /// The shared connection has to outlive whatever runtime first asked for a
+    /// handle. Slot teardown runs on short-lived scratch runtimes (see
+    /// `run_async`), so a connection spawned onto the first caller's runtime
+    /// would already be dead by the second call — and would take every
+    /// in-flight request on other threads down with it.
+    #[test]
+    fn the_shared_connection_outlives_the_runtime_that_created_it() {
+        let first = {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("scratch runtime");
+            // Dropped at the end of this block, exactly as a teardown scratch
+            // runtime is.
+            runtime.block_on(async { host_netlink_handle() })
+        };
+        // Not tolerated as "netlink is unavailable here": AF_NETLINK exists in
+        // every Linux network namespace and opening a socket needs no
+        // privilege, so a failure means the connection is broken.
+        let first = first.expect("a handle onto the shared netlink connection");
+
+        let second = host_netlink_handle().expect("a second handle onto the same connection");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("second runtime");
+        for (label, handle) in [("first", first), ("second", second)] {
+            let dumped = runtime.block_on(async {
+                let mut links = handle.link().get().execute();
+                links.try_next().await
+            });
+            assert!(
+                dumped.is_ok(),
+                "the {label} handle should still serve requests: {dumped:?}"
+            );
+        }
     }
 }
