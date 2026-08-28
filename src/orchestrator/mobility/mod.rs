@@ -6,9 +6,11 @@
 
 mod claim;
 mod record;
+mod saga;
 
 pub use claim::{ClaimOutcome, MobilityCoordinator, ResumeFence, DEFAULT_CLAIM_TTL};
 pub use record::{
     LocalMobilityStore, MobilityGeneration, MobilityRecord, MobilityState, MobilityStore,
     MobilityWrite,
 };
+pub use saga::{MigrationOutcome, MigrationSaga, MigrationSteps};

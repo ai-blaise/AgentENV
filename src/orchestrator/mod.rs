@@ -17,8 +17,9 @@ pub use admission::{
 };
 pub use metrics::OrchestratorMetrics;
 pub use mobility::{
-    ClaimOutcome, LocalMobilityStore, MobilityCoordinator, MobilityGeneration, MobilityRecord,
-    MobilityState, MobilityStore, MobilityWrite, ResumeFence, DEFAULT_CLAIM_TTL,
+    ClaimOutcome, LocalMobilityStore, MigrationOutcome, MigrationSaga, MigrationSteps,
+    MobilityCoordinator, MobilityGeneration, MobilityRecord, MobilityState, MobilityStore,
+    MobilityWrite, ResumeFence, DEFAULT_CLAIM_TTL,
 };
 pub use persistence::{
     DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,
