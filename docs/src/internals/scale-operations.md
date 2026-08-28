@@ -91,6 +91,25 @@ Until all three hold, P2P is a per-deployment opt-in.
 
 ## Migration and draining
 
+### Making a sandbox movable
+
+Turn on `snapshot.mobility.enabled` and the node records every sandbox it
+pauses. The record will say the sandbox cannot move, and that is accurate: a
+pause writes its artifacts to node-local storage, so no destination can read
+them. `agentenv_mobility_stranded_sandboxes` counts exactly these.
+
+`POST /sandboxes/{id}/snapshots` on a **paused** sandbox publishes those
+artifacts to the repository and marks the record movable. The publish copies
+or hard-links, so the sandbox stays resumable on its own node either way, and
+a failed publish never marks it movable. With `repository_backend = "oss"` the
+snapshot is readable cluster-wide; with `posix_fs` it is still one machine's
+disk and the plan will keep refusing it.
+
+So the sequence for a drainable node is: mobility enabled, an object-store
+repository, and each paused sandbox snapshotted.
+
+### Planning and executing
+
 Draining is planned before it is run, and the plan can be inspected without
 touching anything. What it cannot place is reported with why — "no compatible
 node" and "no room" are kept distinct because they call for opposite
@@ -143,3 +162,14 @@ Deliberate gaps, so nobody plans around them:
   client-facing routing (the gateway follows it), but connections terminated
   inside the guest do not survive. That needs a guest-side sidecar and a
   tools-drive ABI change, which is a one-way door.
+- **The cross-node call that executes a plan.** Everything either side of it
+  exists: the origin records and fences, the planner decides, the saga orders
+  the steps and their compensations, and the destination's restore is an
+  ordinary snapshot resume. What is missing is the request that asks a
+  destination to claim and restore a specific sandbox, which is new node-to-node
+  API surface. Implement `MoveExecutor` to send it and `MigrationSteps` to
+  service it; both are traits precisely so the ordering and compensation logic
+  could be tested without a fleet, and both have recorded tests showing the
+  contract they have to satisfy. It was not built here because verifying it
+  needs two hosts with `/dev/kvm`, and a migration path whose failure modes
+  have never once been executed is worse than an honest gap.
