@@ -483,13 +483,16 @@ impl SnapshotSealing {
     /// delivering nothing. The secret is cluster-wide by nature, so it has to
     /// be provisioned that way.
     pub fn from_config(config: &crate::cfg::AppConfig) -> Result<Self> {
-        let Some(secret) = config
-            .snapshot
-            .artifact_sealing_secret
-            .as_deref()
-            .map(str::trim)
-            .filter(|secret| !secret.is_empty())
-        else {
+        Self::from_secret(config.snapshot.artifact_sealing_secret.as_deref())
+    }
+
+    /// The decision `from_config` makes, without an `AppConfig` to assemble.
+    ///
+    /// Split out so the blank-and-absent handling can be tested directly: it
+    /// decides whether a fleet publishes guest state at all, and it is exactly
+    /// the kind of parsing that looks obviously right and silently is not.
+    pub fn from_secret(secret: Option<&str>) -> Result<Self> {
+        let Some(secret) = secret.map(str::trim).filter(|secret| !secret.is_empty()) else {
             return Ok(Self::disabled());
         };
         Ok(Self::with_key(
@@ -778,5 +781,118 @@ mod tests {
     fn the_secret_is_not_printed() {
         let rendered = format!("{:?}", key());
         assert_eq!(rendered, "ArtifactSealingKey(<redacted>)");
+    }
+}
+
+#[cfg(test)]
+mod file_and_config_tests {
+    use super::*;
+
+    fn key() -> ArtifactSealingKey {
+        ArtifactSealingKey::from_bytes(vec![7_u8; KEY_LEN]).expect("key")
+    }
+
+    fn scope() -> SealScope<'static> {
+        SealScope::new("snap-1", "vm_state.bin")
+    }
+
+    /// `seal_path` was covered and `open_path` was not, which left the two
+    /// halves of one production round trip asymmetrically tested: publication
+    /// seals a file, resolution opens one, and only the first had ever run.
+    #[test]
+    fn a_file_round_trips_through_seal_and_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plain = dir.path().join("vm_state.bin");
+        let sealed = dir.path().join("vm_state.sealed");
+        let reopened = dir.path().join("vm_state.reopened");
+
+        // Larger than one chunk, so the file path exercises the same chunk
+        // loop the streaming API does rather than a single-chunk special case.
+        let contents: Vec<u8> = (0..DEFAULT_CHUNK_SIZE as usize * 2 + 17)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        std::fs::write(&plain, &contents).expect("write plaintext");
+
+        let sealed_len = seal_path(&key(), &scope(), &plain, &sealed).expect("seal");
+        assert_eq!(sealed_len, contents.len() as u64);
+
+        let opened_len = open_path(&key(), &scope(), &sealed, &reopened).expect("open");
+        assert_eq!(opened_len, contents.len() as u64);
+        assert_eq!(
+            std::fs::read(&reopened).expect("read reopened"),
+            contents,
+            "the file must come back byte for byte"
+        );
+    }
+
+    /// A peer that hands over a file it cannot authenticate must fail the
+    /// open, not write a partial or wrong plaintext that a guest then boots.
+    #[test]
+    fn a_tampered_file_fails_to_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let plain = dir.path().join("vm_state.bin");
+        let sealed = dir.path().join("vm_state.sealed");
+        let reopened = dir.path().join("vm_state.reopened");
+        std::fs::write(&plain, b"guest memory").expect("write");
+        seal_path(&key(), &scope(), &plain, &sealed).expect("seal");
+
+        let mut bytes = std::fs::read(&sealed).expect("read sealed");
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&sealed, &bytes).expect("rewrite sealed");
+
+        open_path(&key(), &scope(), &sealed, &reopened).expect_err("a modified file must not open");
+    }
+
+    #[test]
+    fn opening_a_missing_file_reports_the_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let error = open_path(
+            &key(),
+            &scope(),
+            &dir.path().join("absent.sealed"),
+            &dir.path().join("out"),
+        )
+        .expect_err("a missing artifact must not open");
+        assert!(
+            error.to_string().contains("absent.sealed"),
+            "the error should name the file: {error}"
+        );
+    }
+
+    /// This decides whether a fleet publishes guest state at all. Absent and
+    /// blank must both disable rather than produce a key from nothing, and a
+    /// malformed secret must fail loudly at startup rather than quietly
+    /// leaving sealing off.
+    #[test]
+    fn the_sealing_secret_is_parsed_the_way_startup_needs() {
+        for secret in [None, Some(""), Some("   "), Some("\n")] {
+            let sealing = SnapshotSealing::from_secret(secret).expect("blank disables");
+            assert!(
+                !sealing.is_enabled(),
+                "secret {secret:?} must leave sealing off"
+            );
+        }
+
+        let hex = hex::encode([3_u8; KEY_LEN]);
+        let sealing = SnapshotSealing::from_secret(Some(&hex)).expect("valid secret");
+        assert!(sealing.is_enabled());
+
+        // Surrounding whitespace is a copy-paste artefact, not a different key.
+        let padded = format!("  {hex}\n");
+        assert!(SnapshotSealing::from_secret(Some(&padded))
+            .expect("padded secret")
+            .is_enabled());
+
+        // A secret that is present but wrong must stop the node, because the
+        // alternative is a fleet that believes it is sealing and is not.
+        let error = SnapshotSealing::from_secret(Some("not-hex-at-all"))
+            .expect_err("a malformed secret must fail startup");
+        assert!(
+            error.to_string().contains("artifact_sealing_secret"),
+            "the error should name the setting: {error:#}"
+        );
+        SnapshotSealing::from_secret(Some(&hex::encode([1_u8; 16])))
+            .expect_err("a too-short secret must fail startup");
     }
 }
