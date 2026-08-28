@@ -29,6 +29,8 @@ pub(crate) struct ResolvedP2pConfig {
     pub lookup_timeout: Duration,
     pub fetch_timeout: Duration,
     pub peer_discovery_refresh_interval: Duration,
+    /// How often this node re-announces its published artifacts.
+    pub reannounce_interval: Duration,
 }
 
 impl ResolvedP2pConfig {
@@ -45,6 +47,7 @@ impl ResolvedP2pConfig {
             listen_addr: Some(str::trim(p2p.listen_addr.as_str()))
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string),
+            reannounce_interval: Duration::from_secs(p2p.reannounce_interval_secs),
             lookup_timeout: Duration::from_millis(p2p.lookup_timeout_ms),
             fetch_timeout: Duration::from_millis(p2p.fetch_timeout_ms),
             peer_discovery_refresh_interval: Duration::from_secs(

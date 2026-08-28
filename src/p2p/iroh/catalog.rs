@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::Context;
 use iroh::endpoint::Connection;
@@ -83,6 +83,22 @@ impl PublishedArtifactCatalog {
         key: &P2pArtifactKey,
     ) -> Option<P2pArtifactDescriptor> {
         self.inner.read().await.get(key).cloned()
+    }
+
+    /// A non-owning handle to the advertised keys.
+    ///
+    /// Used to re-announce to a scheduler that has forgotten them. The catalog
+    /// is the node's own durable record, so it survives a scheduler restart
+    /// even though the scheduler's index does not.
+    ///
+    /// Deliberately weak and over the key map alone rather than the catalog:
+    /// a background task holding a full catalog clone would keep its RocksDB
+    /// handle open, so a transport that had been dropped could not release the
+    /// database lock and a restart in the same process would fail to reopen it.
+    pub(crate) fn keys_handle(
+        &self,
+    ) -> Weak<RwLock<HashMap<P2pArtifactKey, P2pArtifactDescriptor>>> {
+        Arc::downgrade(&self.inner)
     }
 
     pub(crate) async fn upsert(&self, descriptor: P2pArtifactDescriptor) -> Result<()> {

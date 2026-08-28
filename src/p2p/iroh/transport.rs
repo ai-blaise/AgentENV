@@ -44,6 +44,10 @@ const CATALOG_DB_DIR: &str = "catalog.db";
 const MAX_CONCURRENT_CATALOG_LOOKUPS: usize = 4;
 const ENDPOINT_ADDR_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_STORE_GC_INTERVAL: Duration = Duration::from_mins(5);
+
+/// Keys re-announced per cycle, so a node holding many artifacts spreads the
+/// work across intervals rather than spiking the scheduler.
+const REANNOUNCE_BATCH: usize = 64;
 const PUBLISH_TAG_PREFIX: &str = "agentenv:p2p:v1:";
 
 enum BlobFetchSource {
@@ -154,6 +158,11 @@ impl IrohBlobsP2pTransport {
         let downloader = Downloader::new(&store, router.endpoint());
 
         Self::spawn_gc_arming_task(Arc::clone(&pending_gc), gc_interval);
+        Self::spawn_reannounce_task(
+            published_catalog.keys_handle(),
+            Arc::clone(&peer_discovery),
+            config.reannounce_interval,
+        );
 
         info!(
             node_id,
@@ -774,6 +783,61 @@ fn publish_tag_name(key: &P2pArtifactKey) -> String {
 }
 
 impl IrohBlobsP2pTransport {
+    /// Periodically re-announces this node's published artifacts.
+    ///
+    /// The scheduler's artifact index is in-memory and lost on restart, and
+    /// keys were recorded only at publish and fetch time. A restarted scheduler
+    /// therefore stayed permanently empty for everything already published, and
+    /// every lookup silently degraded to broad O(nodes) peer polling for the
+    /// life of the process.
+    ///
+    /// The node's own catalog is durable, so it can simply say again what it
+    /// holds. Announcements are idempotent, so this needs no coordination with
+    /// the scheduler's state; it converges from whatever the scheduler has.
+    /// Keys are sent in bounded batches so a node holding many artifacts
+    /// spreads the work over several intervals instead of spiking.
+    fn spawn_reannounce_task(
+        catalog: std::sync::Weak<
+            tokio::sync::RwLock<std::collections::HashMap<P2pArtifactKey, P2pArtifactDescriptor>>,
+        >,
+        peer_discovery: Arc<dyn P2pPeerDiscovery>,
+        interval: Duration,
+    ) {
+        if interval.is_zero() {
+            return;
+        }
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut cursor = 0usize;
+            loop {
+                ticker.tick().await;
+                // The transport is gone; stop rather than resurrect its state.
+                let Some(catalog) = catalog.upgrade() else {
+                    return;
+                };
+                let keys: Vec<P2pArtifactKey> = catalog.read().await.keys().cloned().collect();
+                drop(catalog);
+                if keys.is_empty() {
+                    cursor = 0;
+                    continue;
+                }
+                if cursor >= keys.len() {
+                    cursor = 0;
+                }
+                let end = (cursor + REANNOUNCE_BATCH).min(keys.len());
+                for key in &keys[cursor..end] {
+                    if let Err(error) = peer_discovery.record_key(key).await {
+                        // The scheduler being unreachable is transient; the next
+                        // cycle will announce the same key again.
+                        debug!(%key, error = %error, "re-announce of P2P artifact failed");
+                    }
+                }
+                cursor = end;
+            }
+        });
+    }
+
     /// Arms the collector gate periodically.
     ///
     /// Arming slightly ahead of the collector's own interval means each sweep

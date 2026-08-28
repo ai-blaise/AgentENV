@@ -651,6 +651,14 @@ pub struct P2pConfig {
     pub fetch_timeout_ms: u64,
     #[config(default = 5u64)]
     pub peer_discovery_refresh_interval_secs: u64,
+    /// Seconds between re-announcements of this node's published artifacts to
+    /// the scheduler's index.
+    ///
+    /// The index is in-memory and lost on scheduler restart, so without
+    /// re-announcement every lookup silently degrades to broad peer polling for
+    /// the life of that scheduler process. Zero disables re-announcement.
+    #[config(default = 60u64)]
+    pub reannounce_interval_secs: u64,
 }
 
 macro_rules! impl_config_default {
