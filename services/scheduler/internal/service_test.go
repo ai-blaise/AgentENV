@@ -23,6 +23,14 @@ func (failingBindingStore) Record(string, Node, time.Time) error {
 	return errors.New("binding store failed")
 }
 
+func (failingBindingStore) RecordBatch(assignments []BindingAssignment, _ time.Time) []error {
+	errs := make([]error, len(assignments))
+	for i := range errs {
+		errs[i] = errors.New("binding store failed")
+	}
+	return errs
+}
+
 func (failingBindingStore) ReconcileNode(Node, []string, time.Time) error {
 	return errors.New("binding store failed")
 }

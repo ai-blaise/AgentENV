@@ -6,13 +6,17 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -27,6 +31,7 @@ type stubSchedulerClient struct {
 	listNodesFunc          func(context.Context, *schedulerv1.ListNodesRequest, ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error)
 	lookupNodeFunc         func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error)
 	recordAssignmentFunc   func(context.Context, *schedulerv1.RecordAssignmentRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error)
+	recordAssignmentsFunc  func(context.Context, *schedulerv1.RecordAssignmentsRequest, ...grpc.CallOption) (*schedulerv1.RecordAssignmentsResponse, error)
 	heartbeatFunc          func(context.Context, *schedulerv1.HeartbeatRequest, ...grpc.CallOption) (*schedulerv1.HeartbeatResponse, error)
 	reportSandboxEventFunc func(context.Context, *schedulerv1.ReportSandboxEventRequest, ...grpc.CallOption) (*schedulerv1.ReportSandboxEventResponse, error)
 	listObservedFunc       func(context.Context, *schedulerv1.ListObservedNodesRequest, ...grpc.CallOption) (*schedulerv1.ListObservedNodesResponse, error)
@@ -83,6 +88,26 @@ func (s stubSchedulerClient) RecordAssignment(ctx context.Context, req *schedule
 		return nil, fmt.Errorf("unexpected RecordAssignment call")
 	}
 	return s.recordAssignmentFunc(ctx, req, opts...)
+}
+
+func (s stubSchedulerClient) RecordAssignments(ctx context.Context, req *schedulerv1.RecordAssignmentsRequest, opts ...grpc.CallOption) (*schedulerv1.RecordAssignmentsResponse, error) {
+	if s.recordAssignmentsFunc != nil {
+		return s.recordAssignmentsFunc(ctx, req, opts...)
+	}
+	// Fall back to the singular stub so a test that only wires
+	// recordAssignmentFunc still observes every batched assignment.
+	if s.recordAssignmentFunc == nil {
+		return nil, fmt.Errorf("unexpected RecordAssignments call")
+	}
+	results := make([]*schedulerv1.RecordAssignmentResult, 0, len(req.GetAssignments()))
+	for _, assignment := range req.GetAssignments() {
+		result := &schedulerv1.RecordAssignmentResult{SandboxId: assignment.GetSandboxId()}
+		if _, err := s.recordAssignmentFunc(ctx, assignment, opts...); err != nil {
+			result.Error = err.Error()
+		}
+		results = append(results, result)
+	}
+	return &schedulerv1.RecordAssignmentsResponse{Results: results}, nil
 }
 
 func (s stubSchedulerClient) Heartbeat(ctx context.Context, req *schedulerv1.HeartbeatRequest, opts ...grpc.CallOption) (*schedulerv1.HeartbeatResponse, error) {
@@ -1570,9 +1595,7 @@ func TestRecordAssignmentFromResponseUsesHeaderWithoutReadingBody(t *testing.T) 
 	resp.Header.Set(headerSandboxID, "sbx-from-header")
 
 	node := &schedulerv1.Node{NodeId: "node-1", Endpoint: "http://node"}
-	if err := server.recordAssignmentFromResponse(context.Background(), resp, node); err != nil {
-		t.Fatalf("recordAssignmentFromResponse returned error: %v", err)
-	}
+	server.recordAssignmentFromResponse(context.Background(), resp, node)
 
 	if readInvoked {
 		t.Fatal("expected response body to remain unread when sandbox id header is present")
@@ -2494,5 +2517,198 @@ func TestGatewayClassifiesClientCanceledProxyErrors(t *testing.T) {
 	getReq := httptest.NewRequest(http.MethodGet, "/process.Process/StreamInput", nil)
 	if isStreamInputProxyRequest(getReq) {
 		t.Fatalf("GET StreamInput should not be classified as stream input")
+	}
+}
+
+// forkResponseBody is the literal shape POST /sandboxes/{id}/fork returns: a
+// bare JSON array of SandboxForkResult, each with exactly one of sandbox or
+// error set. Decoding this into a map silently yields nothing, which is how
+// fork children ended up with no scheduler bindings.
+const forkResponseBody = `[
+  {"sandbox":{"templateID":"tpl","sandboxID":"sbx-child-1","clientID":"c","envdVersion":"1"}},
+  {"error":{"code":500,"message":"failed to start"}},
+  {"sandbox":{"templateID":"tpl","sandboxID":"sbx-child-2","clientID":"c","envdVersion":"1"}}
+]`
+
+func TestExtractSandboxIDsFromForkResponse(t *testing.T) {
+	ids := extractSandboxIDsFromResponse([]byte(forkResponseBody))
+
+	want := []string{"sbx-child-1", "sbx-child-2"}
+	if len(ids) != len(want) {
+		t.Fatalf("extracted %d ids (%v), want %d", len(ids), ids, len(want))
+	}
+	for i, id := range want {
+		if ids[i] != id {
+			t.Fatalf("ids[%d] = %q, want %q", i, ids[i], id)
+		}
+	}
+}
+
+func TestExtractSandboxIDsFromCreateResponse(t *testing.T) {
+	body := `{"templateID":"tpl","sandboxID":"sbx-1","clientID":"c","envdVersion":"1"}`
+	ids := extractSandboxIDsFromResponse([]byte(body))
+	if len(ids) != 1 || ids[0] != "sbx-1" {
+		t.Fatalf("extracted %v, want [sbx-1]", ids)
+	}
+}
+
+func TestExtractSandboxIDsRejectsUnknownShapes(t *testing.T) {
+	cases := map[string]string{
+		"empty object":      `{}`,
+		"empty array":       `[]`,
+		"error only":        `[{"error":{"code":500,"message":"boom"}}]`,
+		"not json":          `<html>nope</html>`,
+		"null":              `null`,
+		"non string id":     `{"sandboxID":42}`,
+		"blank id":          `{"sandboxID":"   "}`,
+		"too deeply nested": `{"data":{"items":[{"sandbox":{"sandbox":{"sandboxID":"buried"}}}]}}`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if ids := extractSandboxIDsFromResponse([]byte(body)); ids != nil {
+				t.Fatalf("extracted %v, want nil", ids)
+			}
+		})
+	}
+}
+
+// TestForkResponseContractMatchesSpec pins the response shape the extractor is
+// written against. The extraction tests alone cannot catch a spec change that
+// moves the identifier; this one can.
+func TestForkResponseContractMatchesSpec(t *testing.T) {
+	spec, err := os.ReadFile(filepath.Join("..", "..", "..", "src", "api", "openapi.yml"))
+	if err != nil {
+		t.Skipf("openapi spec unavailable: %v", err)
+	}
+	text := string(spec)
+
+	forkIdx := strings.Index(text, "/sandboxes/{sandboxID}/fork:")
+	if forkIdx < 0 {
+		t.Fatal("fork path not found in openapi spec")
+	}
+	// Look at the fork operation's 201 response body only.
+	section := text[forkIdx:]
+	if end := strings.Index(section, "\n  /"); end > 0 {
+		section = section[:end]
+	}
+	createdIdx := strings.Index(section, `"201"`)
+	if createdIdx < 0 {
+		t.Fatal("fork 201 response not found in openapi spec")
+	}
+	created := section[createdIdx:]
+	if end := strings.Index(created, `"400"`); end > 0 {
+		created = created[:end]
+	}
+
+	if !strings.Contains(created, "type: array") {
+		t.Fatal("fork 201 body is no longer an array; extractSandboxIDsFromResponse must be revisited")
+	}
+	if !strings.Contains(created, "SandboxForkResult") {
+		t.Fatal("fork 201 items are no longer SandboxForkResult; extractSandboxIDsFromResponse must be revisited")
+	}
+	if !strings.Contains(text, "    SandboxForkResult:") {
+		t.Fatal("SandboxForkResult schema missing from openapi spec")
+	}
+	resultIdx := strings.Index(text, "    SandboxForkResult:")
+	resultSchema := text[resultIdx:]
+	if end := strings.Index(resultSchema[1:], "\n    Template:"); end > 0 {
+		resultSchema = resultSchema[:end]
+	}
+	if !strings.Contains(resultSchema, "sandbox:") {
+		t.Fatal("SandboxForkResult no longer carries a nested sandbox object")
+	}
+}
+
+func TestRecordAssignmentFromResponseRecordsEveryForkChild(t *testing.T) {
+	var mu sync.Mutex
+	var batched []string
+	server := newTestServer(t, stubSchedulerClient{
+		recordAssignmentsFunc: func(_ context.Context, req *schedulerv1.RecordAssignmentsRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentsResponse, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			results := make([]*schedulerv1.RecordAssignmentResult, 0, len(req.GetAssignments()))
+			for _, assignment := range req.GetAssignments() {
+				batched = append(batched, assignment.GetSandboxId())
+				results = append(results, &schedulerv1.RecordAssignmentResult{SandboxId: assignment.GetSandboxId()})
+			}
+			return &schedulerv1.RecordAssignmentsResponse{Results: results}, nil
+		},
+	}, time.Second, 1<<20)
+
+	resp := &http.Response{
+		StatusCode: http.StatusCreated,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(forkResponseBody)),
+	}
+	node := &schedulerv1.Node{NodeId: "node-1", Endpoint: "http://node"}
+	server.recordAssignmentFromResponse(context.Background(), resp, node)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(batched) != 2 {
+		t.Fatalf("recorded %v, want both fork children in one batch", batched)
+	}
+
+	// The response body must survive being read for extraction.
+	forwarded, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read forwarded body: %v", err)
+	}
+	if string(forwarded) != forkResponseBody {
+		t.Fatalf("forwarded body was altered:\n%s", string(forwarded))
+	}
+}
+
+// TestRecordAssignmentNeverFailsProxiedResponse pins the invariant that binding
+// recording cannot turn a successful create into a client-visible failure. The
+// node has already created the sandboxes by this point.
+func TestRecordAssignmentNeverFailsProxiedResponse(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{
+		recordAssignmentsFunc: func(_ context.Context, _ *schedulerv1.RecordAssignmentsRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentsResponse, error) {
+			return nil, errors.New("scheduler unavailable")
+		},
+		recordAssignmentFunc: func(_ context.Context, _ *schedulerv1.RecordAssignmentRequest, _ ...grpc.CallOption) (*schedulerv1.RecordAssignmentResponse, error) {
+			return nil, errors.New("scheduler unavailable")
+		},
+	}, time.Second, 1<<20)
+
+	resp := &http.Response{
+		StatusCode: http.StatusCreated,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(forkResponseBody)),
+	}
+	node := &schedulerv1.Node{NodeId: "node-1", Endpoint: "http://node"}
+	server.recordAssignmentFromResponse(context.Background(), resp, node)
+
+	forwarded, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read forwarded body: %v", err)
+	}
+	if string(forwarded) != forkResponseBody {
+		t.Fatalf("forwarded body was altered:\n%s", string(forwarded))
+	}
+}
+
+// TestRecordAssignmentPreservesTruncatedBodyPrefix guards the failure mode where
+// declining to record an oversized response also swallowed the bytes already
+// read from it, shipping the client a body missing its first limit+1 bytes.
+func TestRecordAssignmentPreservesTruncatedBodyPrefix(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{}, time.Second, 8)
+
+	body := `{"sandboxID":"sbx-oversized-response-body"}`
+	resp := &http.Response{
+		StatusCode: http.StatusCreated,
+		Header:     http.Header{},
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+	node := &schedulerv1.Node{NodeId: "node-1", Endpoint: "http://node"}
+	server.recordAssignmentFromResponse(context.Background(), resp, node)
+
+	forwarded, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read forwarded body: %v", err)
+	}
+	if string(forwarded) != body {
+		t.Fatalf("forwarded body = %q, want the complete original body", string(forwarded))
 	}
 }

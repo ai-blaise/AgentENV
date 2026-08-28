@@ -9,6 +9,7 @@ service Scheduler {
   rpc ListNodes(ListNodesRequest) returns (ListNodesResponse);
   rpc LookupNode(LookupNodeRequest) returns (LookupNodeResponse);
   rpc RecordAssignment(RecordAssignmentRequest) returns (RecordAssignmentResponse);
+  rpc RecordAssignments(RecordAssignmentsRequest) returns (RecordAssignmentsResponse);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc ReportSandboxEvent(ReportSandboxEventRequest) returns (ReportSandboxEventResponse);
   rpc ListObservedNodes(ListObservedNodesRequest) returns (ListObservedNodesResponse);
@@ -83,6 +84,27 @@ message RecordAssignmentRequest {
 
 message RecordAssignmentResponse {}
 
+// RecordAssignmentsRequest records a batch of sandbox-to-node bindings in one
+// call. Fork creates up to 100 children in a single response, and recording
+// them one RPC at a time serializes that many round trips inside the caller's
+// deadline.
+message RecordAssignmentsRequest {
+  repeated RecordAssignmentRequest assignments = 1;
+}
+
+// RecordAssignmentsResponse reports per-assignment outcomes positionally: entry
+// i describes assignments[i]. A partially applied batch is normal — the caller
+// logs the failures rather than failing the client request that produced them.
+message RecordAssignmentsResponse {
+  repeated RecordAssignmentResult results = 1;
+}
+
+message RecordAssignmentResult {
+  string sandbox_id = 1;
+  // Empty when the binding was recorded.
+  string error = 2;
+}
+
 message MachineInfo {
   string cpu_family = 1;
   string cpu_model = 2;
@@ -139,6 +161,11 @@ message NodeSnapshot {
   uint32 paused_sandbox_count = 14;
   uint32 paused_allocated_cpu = 15;
   uint64 paused_allocated_memory_bytes = 16;
+
+  // Observed guest memory consumption, as opposed to the allocated ceiling
+  // above. Field numbers 17-19 are allocated for this even though only a
+  // placement change populates them, so no other change claims them.
+  reserved 17, 18, 19;
 }
 
 message P2pEndpoint {
@@ -158,6 +185,18 @@ message ObservedNode {
   int64 last_seen_unix_ms = 9;
 }
 
+// HeartbeatRequest field registry. Field numbers 10-16 are allocated ahead of
+// use so independent changes cannot claim the same number:
+//
+//   10  roster_complete         (allocated, defined below)
+//   11  heartbeat_interval_ms   (allocated, defined below)
+//   12  p2p_artifacts           (reserved for the P2P index re-announce)
+//   13  roster_digest           (reserved for the sequenced worker outbox)
+//   14  last_event_seq          (reserved for the sequenced worker outbox)
+//   15  roster_generation       (reserved for the sequenced worker outbox)
+//   16  roster_full             (reserved for the sequenced worker outbox)
+//
+// Observed-usage fields are allocated on NodeSnapshot (17-19), not here.
 message HeartbeatRequest {
   string node_id = 1;
   string cluster_id = 2;
@@ -168,6 +207,21 @@ message HeartbeatRequest {
   NodeSnapshot snapshot = 7;
   repeated string sandbox_ids = 8;
   P2pEndpoint p2p_endpoint = 9;
+
+  // Whether sandbox_ids is the node's complete roster. A node sets this only
+  // once startup recovery has finished; until then the scheduler must not
+  // treat an empty roster as "this node owns nothing" and delete its bindings.
+  //
+  // Absent (false) is the conservative reading, so an older node talking to a
+  // newer scheduler never triggers the wipe.
+  bool roster_complete = 10;
+
+  // The node's configured heartbeat interval, so the scheduler can validate
+  // that its own binding TTL is ordered correctly against it rather than
+  // assuming a value. Zero means the node did not report one.
+  uint64 heartbeat_interval_ms = 11;
+
+  reserved 12, 13, 14, 15, 16;
 }
 
 message HeartbeatResponse {

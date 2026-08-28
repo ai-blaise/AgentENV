@@ -352,7 +352,11 @@ func (s *Server) proxyRequest(
 			if !options.recordAssignment || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 				return nil
 			}
-			return s.recordAssignmentFromResponse(originalCtx, resp, node)
+			// Recording never fails the response: the node has already created
+			// the sandboxes, so a 502 here would hide identifiers the client
+			// can never recover.
+			s.recordAssignmentFromResponse(originalCtx, resp, node)
+			return nil
 		},
 		ErrorHandler: func(rw http.ResponseWriter, _ *http.Request, err error) {
 			if errors.Is(err, context.Canceled) {
@@ -380,12 +384,6 @@ func (s *Server) proxyRequest(
 				return
 			}
 
-			var proxyErr *proxyResponseError
-			if errors.As(err, &proxyErr) {
-				http.Error(rw, proxyErr.message, proxyErr.statusCode)
-				return
-			}
-
 			s.logger.Warn("proxy request failed",
 				zap.Error(err),
 				zap.String("node", node.GetNodeId()),
@@ -406,46 +404,42 @@ func isStreamInputProxyRequest(r *http.Request) bool {
 	return r.Method == http.MethodPost && r.URL.Path == "/process.Process/StreamInput"
 }
 
-type proxyResponseError struct {
-	statusCode int
-	message    string
-	cause      error
-}
-
-func (e *proxyResponseError) Error() string {
-	if e.cause != nil {
-		return e.cause.Error()
-	}
-	return e.message
-}
-
-func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node) error {
+// recordAssignmentFromResponse records the bindings for the sandboxes an
+// upstream response just created.
+//
+// It never fails the response. The node has already created the sandboxes by
+// the time this runs, and returning an error here turns a successful create
+// into a 502 the client cannot act on — the sandboxes exist either way, and
+// the client is not told their identifiers. Every failure path therefore logs
+// and returns nil; a missed binding is repaired by the owning node's next
+// heartbeat reconcile.
+func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Response, node *schedulerv1.Node) {
 	recordCtx, cancelRecord := context.WithTimeout(ctx, recordAssignmentTimeout(s.requestTimeout))
 	defer cancelRecord()
 
 	if sandboxID, ok := sandboxIDFromHeaders(resp.Header); ok {
 		s.recordAssignment(recordCtx, sandboxID, node, "response_header")
-		return nil
+		return
 	}
 
 	body, truncated, err := readBodyWithLimit(resp.Body, s.maxRespSize)
 	if err != nil {
-		return &proxyResponseError{
-			statusCode: http.StatusBadGateway,
-			message:    "failed to read upstream response",
-			cause:      err,
-		}
+		s.logger.Warn("failed to read upstream response while recording assignment",
+			zap.Error(err),
+			zap.String("node_id", node.GetNodeId()),
+		)
+		// Reattach what was read so the client still receives the prefix.
+		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), resp.Body))
+		return
 	}
 	if truncated {
-		s.logger.Warn("upstream response exceeded configured forwarding limit",
+		s.logger.Warn("upstream response exceeded configured forwarding limit; skipping assignment recording",
 			zap.Int64("max_response_size_bytes", s.maxRespSize),
 			zap.Int64("upstream_content_length", resp.ContentLength),
 			zap.String("content_type", resp.Header.Get("Content-Type")),
 		)
-		return &proxyResponseError{
-			statusCode: http.StatusBadGateway,
-			message:    "upstream response too large",
-		}
+		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), resp.Body))
+		return
 	}
 	_ = resp.Body.Close()
 
@@ -456,10 +450,55 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 	}
 	resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
 
-	for _, sandboxID := range extractSandboxIDsFromResponse(body) {
-		s.recordAssignment(recordCtx, sandboxID, node, "response_body")
+	s.recordAssignments(recordCtx, extractSandboxIDsFromResponse(body), node, "response_body")
+}
+
+// recordAssignments records a set of bindings in one RPC. Fork returns up to
+// 100 children in a single response; recording them one RPC at a time
+// serialized that many round trips inside one deadline, so the tail was
+// silently dropped once the deadline passed.
+func (s *Server) recordAssignments(ctx context.Context, sandboxIDs []string, node *schedulerv1.Node, source string) {
+	switch len(sandboxIDs) {
+	case 0:
+		return
+	case 1:
+		s.recordAssignment(ctx, sandboxIDs[0], node, source)
+		return
 	}
-	return nil
+
+	assignments := make([]*schedulerv1.RecordAssignmentRequest, 0, len(sandboxIDs))
+	for _, sandboxID := range sandboxIDs {
+		assignments = append(assignments, &schedulerv1.RecordAssignmentRequest{SandboxId: sandboxID, Node: node})
+	}
+
+	rpcStart := time.Now()
+	resp, err := s.scheduler.RecordAssignments(ctx, &schedulerv1.RecordAssignmentsRequest{Assignments: assignments})
+	recordGatewaySchedulerRPC("RecordAssignments", rpcStart, err)
+	if err != nil {
+		s.logger.Warn("record assignments failed",
+			zap.Error(err),
+			zap.Int("sandbox_count", len(sandboxIDs)),
+			zap.String("node_id", node.GetNodeId()),
+		)
+		return
+	}
+
+	for _, result := range resp.GetResults() {
+		if result.GetError() == "" {
+			continue
+		}
+		s.logger.Warn("record assignment failed",
+			zap.String("sandbox_id", result.GetSandboxId()),
+			zap.String("node_id", node.GetNodeId()),
+			zap.String("error", result.GetError()),
+		)
+	}
+
+	s.logger.Debug("gateway recorded sandbox assignments",
+		zap.Int("sandbox_count", len(sandboxIDs)),
+		zap.String("node_id", node.GetNodeId()),
+		zap.String("source", source),
+	)
 }
 
 func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *schedulerv1.Node, source string) {
@@ -478,6 +517,11 @@ func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *s
 	)
 }
 
+// readBodyWithLimit reads up to limit bytes from src.
+//
+// On truncation it returns the bytes it consumed along with truncated=true.
+// Callers that forward the response must reattach that prefix to the unread
+// remainder, or the client receives a body missing its first limit+1 bytes.
 func readBodyWithLimit(src io.Reader, limit int64) ([]byte, bool, error) {
 	if limit <= 0 {
 		body, err := io.ReadAll(src)
@@ -488,7 +532,7 @@ func readBodyWithLimit(src io.Reader, limit int64) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	if int64(len(body)) > limit {
-		return nil, true, nil
+		return body, true, nil
 	}
 	return body, false, nil
 }
@@ -785,44 +829,60 @@ func extractSandboxIDFromResponse(body []byte) (string, bool) {
 	return ids[0], true
 }
 
+// sandboxIDKeys are the property names a sandbox identifier can appear under
+// in a node response body.
+var sandboxIDKeys = [...]string{"sandboxID", "sandboxId", "sandbox_id"}
+
+// maxSandboxIDSearchDepth bounds the walk below. The deepest shape any endpoint
+// produces is a top-level array of objects carrying a nested `sandbox` object,
+// which is depth 3.
+const maxSandboxIDSearchDepth = 3
+
+// extractSandboxIDsFromResponse collects the sandbox identifiers a create-like
+// response describes.
+//
+// The response shapes differ per endpoint: POST /sandboxes and
+// POST /sandboxes-cold return a single object (and also set the
+// x-agentenv-sandbox-id header, so they rarely reach here), while
+// POST /sandboxes/{id}/fork returns a bare JSON array of per-child results,
+// each carrying either a nested `sandbox` object or an `error`. Decoding into
+// a concrete shape therefore silently drops whichever shape it does not match,
+// so this walks the decoded document instead, bounded by depth.
 func extractSandboxIDsFromResponse(body []byte) []string {
-	var payload map[string]any
+	var payload any
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return nil
 	}
+
 	var ids []string
-	appendSandboxID := func(value any) {
-		if id, ok := value.(string); ok && strings.TrimSpace(id) != "" {
-			ids = append(ids, id)
-		}
-	}
-	for _, key := range []string{"sandboxID", "sandboxId", "sandbox_id"} {
-		appendSandboxID(payload[key])
-	}
-	if data, ok := payload["data"].(map[string]any); ok {
-		for _, key := range []string{"sandboxID", "sandboxId", "sandbox_id"} {
-			appendSandboxID(data[key])
-		}
-	}
-	appendSandboxIDsFromArray := func(value any) {
-		items, ok := value.([]any)
-		if !ok {
+	var walk func(node any, depth int)
+	walk = func(node any, depth int) {
+		if depth > maxSandboxIDSearchDepth {
 			return
 		}
-		for _, item := range items {
-			object, ok := item.(map[string]any)
-			if !ok {
-				continue
+		switch value := node.(type) {
+		case map[string]any:
+			for _, key := range sandboxIDKeys {
+				if id, ok := value[key].(string); ok && strings.TrimSpace(id) != "" {
+					ids = append(ids, id)
+				}
 			}
-			for _, key := range []string{"sandboxID", "sandboxId", "sandbox_id"} {
-				appendSandboxID(object[key])
+			// Descend only through the container keys that carry sandboxes, so
+			// an unrelated string field named like an ID elsewhere in the
+			// document cannot be mistaken for one.
+			for _, key := range [...]string{"sandbox", "sandboxes", "data", "items"} {
+				if child, ok := value[key]; ok {
+					walk(child, depth+1)
+				}
+			}
+		case []any:
+			for _, item := range value {
+				walk(item, depth+1)
 			}
 		}
 	}
-	appendSandboxIDsFromArray(payload["sandboxes"])
-	if data, ok := payload["data"].(map[string]any); ok {
-		appendSandboxIDsFromArray(data["sandboxes"])
-	}
+	walk(payload, 0)
+
 	if len(ids) == 0 {
 		return nil
 	}

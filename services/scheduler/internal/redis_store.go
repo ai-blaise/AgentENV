@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -112,6 +113,64 @@ func (s *RedisBindingStore) Record(sandboxID string, node Node, _ time.Time) err
 		return fmt.Errorf("redis record binding: %w", err)
 	}
 	return nil
+}
+
+func (s *RedisBindingStore) RecordBatch(assignments []BindingAssignment, _ time.Time) []error {
+	if len(assignments) == 0 {
+		return nil
+	}
+
+	errs := make([]error, len(assignments))
+
+	ctx, cancel := s.context()
+	defer cancel()
+
+	// One pipeline for the whole batch: a 100-way fork otherwise pays 100
+	// sequential round trips inside the caller's deadline.
+	pipe := s.client.Pipeline()
+	commands := make([]*redis.Cmd, len(assignments))
+	for i, assignment := range assignments {
+		sandboxID := strings.TrimSpace(assignment.SandboxID)
+		node := assignment.Node
+		node.ID = strings.TrimSpace(node.ID)
+		node.Endpoint = strings.TrimSpace(node.Endpoint)
+		if sandboxID == "" || node.ID == "" || node.Endpoint == "" {
+			continue
+		}
+		value, err := marshalRedisBindingRecord(node)
+		if err != nil {
+			errs[i] = err
+			continue
+		}
+		commands[i] = redisRecordBindingScript.Run(ctx, pipe,
+			[]string{s.bindingKey(sandboxID), s.nodeKey(node.ID)},
+			value,
+			node.ID,
+			sandboxID,
+			int64(s.bindingTTL/time.Millisecond),
+			s.keyPrefix,
+			s.nodeIndexTTLMillis(),
+		)
+	}
+
+	// Exec reports the first command error; per-command results are read below,
+	// so a single failure does not mask the outcome of its siblings.
+	if _, err := pipe.Exec(ctx); err != nil && !errors.Is(err, redis.Nil) {
+		for i := range errs {
+			if errs[i] == nil && commands[i] != nil {
+				errs[i] = fmt.Errorf("redis record binding: %w", err)
+			}
+		}
+	}
+	for i, cmd := range commands {
+		if cmd == nil || errs[i] != nil {
+			continue
+		}
+		if err := cmd.Err(); err != nil && !errors.Is(err, redis.Nil) {
+			errs[i] = fmt.Errorf("redis record binding: %w", err)
+		}
+	}
+	return errs
 }
 
 func (s *RedisBindingStore) ReconcileNode(node Node, sandboxIDs []string, _ time.Time) error {

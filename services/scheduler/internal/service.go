@@ -173,21 +173,79 @@ func lookupNode(logger *zap.Logger, store BindingStore, req *schedulerv1.LookupN
 	return &schedulerv1.LookupNodeResponse{Node: node.ToProto()}, nil
 }
 
-func (s *Service) RecordAssignment(_ context.Context, req *schedulerv1.RecordAssignmentRequest) (*schedulerv1.RecordAssignmentResponse, error) {
-	if strings.TrimSpace(req.GetSandboxId()) == "" {
-		return nil, status.Error(codes.InvalidArgument, "sandbox_id is required")
+// validateAssignment applies the checks shared by RecordAssignment and
+// RecordAssignments so a batched write cannot bypass a validation the single
+// write enforces.
+func (s *Service) validateAssignment(sandboxID string, protoNode *schedulerv1.Node) (Node, error) {
+	if strings.TrimSpace(sandboxID) == "" {
+		return Node{}, status.Error(codes.InvalidArgument, "sandbox_id is required")
 	}
-	node := NodeFromProto(req.GetNode())
+	node := NodeFromProto(protoNode)
 	if strings.TrimSpace(node.ID) == "" || strings.TrimSpace(node.Endpoint) == "" {
-		return nil, status.Error(codes.InvalidArgument, "node_id and endpoint are required")
+		return Node{}, status.Error(codes.InvalidArgument, "node_id and endpoint are required")
 	}
 	if !s.isKnownNode(node) {
 		s.logger.Warn("scheduler rejected assignment for unknown node",
-			zap.String("sandbox_id", req.GetSandboxId()),
+			zap.String("sandbox_id", sandboxID),
 			zap.String("node_id", node.ID),
 			zap.String("endpoint", node.Endpoint),
 		)
-		return nil, status.Error(codes.InvalidArgument, "node is not in scheduler node list")
+		return Node{}, status.Error(codes.InvalidArgument, "node is not in scheduler node list")
+	}
+	return node, nil
+}
+
+// RecordAssignments records a batch of bindings in one store pass. Individual
+// failures are reported positionally rather than failing the batch, because
+// the caller has already created the sandboxes these bindings describe and
+// cannot undo them.
+func (s *Service) RecordAssignments(_ context.Context, req *schedulerv1.RecordAssignmentsRequest) (*schedulerv1.RecordAssignmentsResponse, error) {
+	requested := req.GetAssignments()
+	if len(requested) == 0 {
+		return &schedulerv1.RecordAssignmentsResponse{}, nil
+	}
+
+	results := make([]*schedulerv1.RecordAssignmentResult, len(requested))
+	assignments := make([]BindingAssignment, len(requested))
+	accepted := make([]int, 0, len(requested))
+	for i, assignment := range requested {
+		results[i] = &schedulerv1.RecordAssignmentResult{SandboxId: assignment.GetSandboxId()}
+		node, err := s.validateAssignment(assignment.GetSandboxId(), assignment.GetNode())
+		if err != nil {
+			results[i].Error = err.Error()
+			continue
+		}
+		assignments[i] = BindingAssignment{SandboxID: assignment.GetSandboxId(), Node: node}
+		accepted = append(accepted, i)
+	}
+
+	if len(accepted) == 0 {
+		return &schedulerv1.RecordAssignmentsResponse{Results: results}, nil
+	}
+
+	batch := make([]BindingAssignment, 0, len(accepted))
+	for _, i := range accepted {
+		batch = append(batch, assignments[i])
+	}
+	for offset, err := range s.store.RecordBatch(batch, time.Now()) {
+		if err == nil {
+			continue
+		}
+		i := accepted[offset]
+		s.logger.Warn("scheduler record assignment binding store failed",
+			zap.String("sandbox_id", batch[offset].SandboxID),
+			zap.String("node_id", batch[offset].Node.ID),
+			zap.Error(err),
+		)
+		results[i].Error = status.Error(codes.Unavailable, "binding store unavailable").Error()
+	}
+	return &schedulerv1.RecordAssignmentsResponse{Results: results}, nil
+}
+
+func (s *Service) RecordAssignment(_ context.Context, req *schedulerv1.RecordAssignmentRequest) (*schedulerv1.RecordAssignmentResponse, error) {
+	node, err := s.validateAssignment(req.GetSandboxId(), req.GetNode())
+	if err != nil {
+		return nil, err
 	}
 	if err := s.store.Record(req.GetSandboxId(), node, time.Now()); err != nil {
 		s.logger.Warn("scheduler record assignment binding store failed",

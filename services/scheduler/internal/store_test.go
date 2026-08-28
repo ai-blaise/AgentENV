@@ -229,3 +229,69 @@ func TestArtifactStoreLookupReturnsAllNodesWhenLimitIsNonPositive(t *testing.T) 
 		}
 	}
 }
+
+func TestInMemoryBindingStoreRecordBatch(t *testing.T) {
+	store := NewInMemoryBindingStore(time.Minute)
+	now := time.Now()
+	nodeA := Node{ID: "node-a", Endpoint: "http://a"}
+
+	errs := store.RecordBatch([]BindingAssignment{
+		{SandboxID: "sbx-1", Node: nodeA},
+		{SandboxID: "  ", Node: nodeA},
+		{SandboxID: "sbx-2", Node: nodeA},
+	}, now)
+
+	if len(errs) != 3 {
+		t.Fatalf("RecordBatch returned %d results, want 3", len(errs))
+	}
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("errs[%d] = %v, want nil", i, err)
+		}
+	}
+	for _, sandboxID := range []string{"sbx-1", "sbx-2"} {
+		node, ok, err := store.Get(sandboxID, now)
+		if err != nil || !ok {
+			t.Fatalf("Get(%q) = (%v, %v, %v), want the recorded node", sandboxID, node, ok, err)
+		}
+		if node.ID != nodeA.ID {
+			t.Fatalf("Get(%q) node = %q, want %q", sandboxID, node.ID, nodeA.ID)
+		}
+	}
+	if _, ok, _ := store.Get("  ", now); ok {
+		t.Fatal("blank sandbox id must not be recorded")
+	}
+}
+
+func TestInMemoryBindingStoreRecordBatchEmpty(t *testing.T) {
+	store := NewInMemoryBindingStore(time.Minute)
+	if errs := store.RecordBatch(nil, time.Now()); errs != nil {
+		t.Fatalf("RecordBatch(nil) = %v, want nil", errs)
+	}
+}
+
+// TestInMemoryBindingStoreRecordBatchMovesNode covers the same node-change
+// bookkeeping Record performs, so the batch path cannot leave a stale entry in
+// the previous node's reverse index.
+func TestInMemoryBindingStoreRecordBatchMovesNode(t *testing.T) {
+	store := NewInMemoryBindingStore(time.Minute)
+	now := time.Now()
+	nodeA := Node{ID: "node-a", Endpoint: "http://a"}
+	nodeB := Node{ID: "node-b", Endpoint: "http://b"}
+
+	store.RecordBatch([]BindingAssignment{{SandboxID: "sbx-1", Node: nodeA}}, now)
+	store.RecordBatch([]BindingAssignment{{SandboxID: "sbx-1", Node: nodeB}}, now)
+
+	node, ok, err := store.Get("sbx-1", now)
+	if err != nil || !ok || node.ID != nodeB.ID {
+		t.Fatalf("Get after move = (%v, %v, %v), want node-b", node, ok, err)
+	}
+	// Reconciling the old node with an empty roster must not delete a binding
+	// that now belongs to another node.
+	if err := store.ReconcileNode(nodeA, nil, now); err != nil {
+		t.Fatalf("ReconcileNode: %v", err)
+	}
+	if _, ok, _ := store.Get("sbx-1", now); !ok {
+		t.Fatal("binding owned by node-b was deleted by node-a reconcile")
+	}
+}

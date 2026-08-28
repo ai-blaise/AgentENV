@@ -11,9 +11,24 @@ import (
 const defaultBindingTTL = 30 * time.Second
 const defaultArtifactStoreCapacity = 1_000_000
 
+// BindingAssignment is one sandbox-to-node binding in a batch write.
+type BindingAssignment struct {
+	SandboxID string
+	Node      Node
+}
+
 type BindingStore interface {
 	Get(sandboxID string, now time.Time) (Node, bool, error)
 	Record(sandboxID string, node Node, now time.Time) error
+	// RecordBatch records every assignment and returns a slice of errors
+	// positionally aligned with assignments: entry i reports assignments[i],
+	// and a nil entry means that binding was recorded. A failure that prevents
+	// the whole batch from being attempted fills every entry with that error.
+	//
+	// Fork creates up to 100 children in one response, so recording them one
+	// at a time serializes that many lock acquisitions or round trips inside
+	// the caller's deadline.
+	RecordBatch(assignments []BindingAssignment, now time.Time) []error
 	ReconcileNode(node Node, sandboxIDs []string, now time.Time) error
 }
 
@@ -72,6 +87,25 @@ func (s *InMemoryBindingStore) Record(sandboxID string, node Node, now time.Time
 	defer s.mu.Unlock()
 	s.upsertLocked(sandboxID, node, now)
 	return nil
+}
+
+func (s *InMemoryBindingStore) RecordBatch(assignments []BindingAssignment, now time.Time) []error {
+	if len(assignments) == 0 {
+		return nil
+	}
+
+	errs := make([]error, len(assignments))
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, assignment := range assignments {
+		sandboxID := strings.TrimSpace(assignment.SandboxID)
+		if sandboxID == "" {
+			continue
+		}
+		s.upsertLocked(sandboxID, assignment.Node, now)
+	}
+	return errs
 }
 
 func (s *InMemoryBindingStore) ReconcileNode(node Node, sandboxIDs []string, now time.Time) error {
