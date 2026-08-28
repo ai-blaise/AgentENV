@@ -402,6 +402,34 @@ pub struct SnapshotConfig {
     pub artifact_sealing_secret: Option<String>,
     #[config(nested)]
     pub image_publish: SnapshotImagePublishConfig,
+    #[config(nested)]
+    pub mobility: MobilityConfig,
+}
+
+impl SnapshotConfig {
+    /// Whether this node's snapshot repository can be read by other nodes.
+    ///
+    /// A POSIX repository is a directory on one machine's disk; object storage
+    /// is reachable cluster-wide. Nothing else about the backend matters to a
+    /// migration decision.
+    pub fn artifact_reach(&self) -> crate::snapshot::ArtifactReach {
+        self.repository_backend.into()
+    }
+}
+
+/// Whether this node participates in sandbox migration.
+#[derive(Debug, Config, Clone)]
+pub struct MobilityConfig {
+    /// When true, the node records each paused sandbox so a drain can see it,
+    /// and refuses a local resume while another node is taking it over.
+    ///
+    /// Off by default: it opens a durable store, and a node that never
+    /// migrates anything should not pay for one.
+    #[config(env = "AENV_MOBILITY_ENABLED", default = false)]
+    pub enabled: bool,
+    /// Where the mobility records live.
+    #[config(default = "$AENV_HOME/mobility")]
+    pub store_path: PathBuf,
 }
 
 #[derive(Debug, Config, Clone)]

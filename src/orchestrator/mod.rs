@@ -17,10 +17,11 @@ pub use admission::{
 };
 pub use metrics::OrchestratorMetrics;
 pub use mobility::{
-    drain, plan_evacuation, ClaimOutcome, DestinationCandidate, DrainBudget, DrainReport,
-    EvacuationPlan, LeaseGuardian, LeaseLost, LeasePacing, LeaseWatch, LocalMobilityStore,
-    MigrationOutcome, MigrationSaga, MigrationSteps, MobilityCoordinator, MobilityGeneration,
-    MobilityRecord, MobilityState, MobilityStore, MobilityWrite, MoveExecutor, PlannedMove,
+    drain, open_mobility_runtime, plan_evacuation, ClaimOutcome, DestinationCandidate, DrainBudget,
+    DrainReport, EvacuationPlan, LeaseGuardian, LeaseLost, LeasePacing, LeaseWatch,
+    LocalMobilityStore, MigrationOutcome, MigrationSaga, MigrationSteps, MobilityCoordinator,
+    MobilityGeneration, MobilityHooks, MobilityRecord, MobilityRecordCounts, MobilityRuntime,
+    MobilityState, MobilityStore, MobilityWrite, MoveExecutor, NodeMobilityFacts, PlannedMove,
     RenewOutcome, ResumeFence, SandboxLayers, UnplaceableReason, UnplaceableSandbox,
     DEFAULT_CLAIM_TTL,
 };
@@ -60,6 +61,17 @@ pub enum SandboxOperation {
 pub enum OrchestratorError {
     #[error("failed to load sandbox config")]
     ConfigLoadFailed(#[from] anyhow::Error),
+
+    /// Another node is taking this sandbox over, or has already taken it.
+    ///
+    /// Distinct from every other resume failure: nothing is wrong with the
+    /// sandbox, and resuming it here anyway is precisely the outcome the
+    /// handover exists to prevent.
+    #[error("sandbox {sandbox_id} cannot be resumed here: {reason}")]
+    SandboxHeldElsewhere {
+        sandbox_id: crate::types::SandboxId,
+        reason: String,
+    },
 
     #[error(
         "{resource} uses virtualization mode '{resource_mode}', but this node runs in mode '{node_mode}'"

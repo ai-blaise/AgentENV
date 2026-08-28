@@ -8,6 +8,7 @@ mod claim;
 mod evacuation;
 mod lease;
 mod record;
+mod runtime;
 mod saga;
 
 pub use claim::{ClaimOutcome, MobilityCoordinator, ResumeFence, DEFAULT_CLAIM_TTL};
@@ -19,5 +20,8 @@ pub use lease::{LeaseGuardian, LeaseLost, LeasePacing, LeaseWatch, RenewOutcome}
 pub use record::{
     LocalMobilityStore, MobilityGeneration, MobilityRecord, MobilityState, MobilityStore,
     MobilityWrite,
+};
+pub use runtime::{
+    open_mobility_runtime, MobilityHooks, MobilityRecordCounts, MobilityRuntime, NodeMobilityFacts,
 };
 pub use saga::{MigrationOutcome, MigrationSaga, MigrationSteps};

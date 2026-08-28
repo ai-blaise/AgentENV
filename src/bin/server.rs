@@ -135,8 +135,39 @@ async fn main() -> anyhow::Result<()> {
         &cluster_cpu_arc,
     )));
     let image_resolver = Arc::new(ImageResolver::new(config));
+
     let factory = FirecrackerSandboxFactory::with_cpu_config(Arc::clone(&cluster_cpu_arc));
     let orchestrator = Orchestrator::with_file_backed_store_and_factory(factory).await?;
+
+    // Mobility is installed after the orchestrator exists and before it serves
+    // traffic. A node that cannot open its store still runs, without migration
+    // rather than not at all: refusing to start would turn an optional feature
+    // into a boot dependency.
+    if config.snapshot.mobility.enabled {
+        match agentenv::orchestrator::open_mobility_runtime(
+            &config.snapshot.mobility.store_path,
+            identity.id.clone(),
+            agentenv::orchestrator::NodeMobilityFacts {
+                cpu_architecture: agentenv::observability::detect_cpu_architecture(),
+                cluster_cpu_config: Arc::clone(&cluster_cpu_arc),
+                memory_page_size: agentenv::observability::host_page_size(),
+                artifact_reach: config.snapshot.artifact_reach(),
+            },
+        )
+        .await
+        {
+            Ok(mobility) => {
+                info!(target: "agentenv", "sandbox mobility enabled");
+                orchestrator.install_mobility(mobility);
+            }
+            Err(error) => warn!(
+                target: "agentenv",
+                error = %error,
+                "failed to open the mobility store; this node will not participate in migration"
+            ),
+        }
+    }
+
     let observability_config = &config.observability;
     let observability = if observability_config.enabled {
         Some(Arc::new(

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 use std::time::{Duration, SystemTime};
 
@@ -28,6 +28,7 @@ use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
 };
+use super::mobility::{MobilityHooks, ResumeFence};
 use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, SandboxPersister};
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
@@ -118,6 +119,13 @@ pub struct Orchestrator<
     shutdown_outcome: OnceCell<ShutdownOutcome>,
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
+    /// Mobility bookkeeping, when this node participates in migration.
+    ///
+    /// Empty on a node that does not, so nothing here costs anything until an
+    /// operator asks for it. Installed after construction because the durable
+    /// store it needs is opened asynchronously, and a node that fails to open
+    /// it should still run — without migration rather than not at all.
+    mobility: OnceLock<Arc<dyn MobilityHooks>>,
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
@@ -153,6 +161,19 @@ where
     F: SandboxBackendFactory,
     P: SandboxPersister + 'static,
 {
+    /// Installs mobility bookkeeping. Called once at startup; a later call is
+    /// ignored so a mis-ordered init cannot swap a live store.
+    pub fn install_mobility(&self, mobility: Arc<dyn MobilityHooks>) {
+        if self.mobility.set(mobility).is_err() {
+            warn!("mobility was already installed; ignoring the later one");
+        }
+    }
+
+    /// This node's mobility bookkeeping, if it participates in migration.
+    pub fn mobility(&self) -> Option<&Arc<dyn MobilityHooks>> {
+        self.mobility.get()
+    }
+
     pub async fn new(store: S, factory: F, persister: P) -> Result<Arc<Self>> {
         let image_refs = local_image_services_from_global_config().runtime_refs;
         Self::new_inner(store, factory, persister, image_refs).await
@@ -210,6 +231,7 @@ where
             shutdown_outcome: OnceCell::new(),
             image_refs,
             access_tokens,
+            mobility: OnceLock::new(),
         });
 
         // Start the auto-evict task.
@@ -1173,6 +1195,12 @@ where
         }
         self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
             .await;
+        if let Some(mobility) = self.mobility() {
+            // A deleted sandbox leaves no tombstone: it did not move, it
+            // stopped existing, and a drain that still saw it would keep
+            // trying to place something that is gone.
+            mobility.forget(&sandbox_id).await;
+        }
         info!("sandbox deleted");
 
         Ok(())
@@ -1419,6 +1447,14 @@ where
             )));
         }
         let resources = persisted_metadata.resources;
+        if let Some(mobility) = self.mobility() {
+            // After the state is durable and before the sandbox is announced
+            // as paused, so a drain that reads the record finds a sandbox that
+            // really is paused. Best effort: the pause has already succeeded,
+            // and failing it now would leave a running sandbox that cannot be
+            // stopped over a bookkeeping problem.
+            mobility.record_paused(&persisted_metadata).await;
+        }
         self.store.update(persisted_metadata).await?;
 
         // Stop the sandbox to free up resources.
@@ -1465,6 +1501,29 @@ where
         timeout: NewTimeout,
     ) -> Result<SandboxMetadata> {
         self.ensure_accepting_lifecycle_operations()?;
+
+        // Before any state transition: a destination may be restoring this
+        // sandbox right now, and resuming it here as well is the one failure
+        // the handover protocol exists to prevent. Taking the claim rather
+        // than reading it, because a destination that claims between a read
+        // and the resume would produce exactly that.
+        if let Some(mobility) = self.mobility() {
+            match mobility.claim_for_local_resume(&sandbox_id).await {
+                ResumeFence::Allowed => {}
+                ResumeFence::ClaimedElsewhere { by_node_id } => {
+                    return Err(OrchestratorError::SandboxHeldElsewhere {
+                        sandbox_id,
+                        reason: format!("{by_node_id} is taking it over"),
+                    });
+                }
+                ResumeFence::Evacuated { to_node_id } => {
+                    return Err(OrchestratorError::SandboxHeldElsewhere {
+                        sandbox_id,
+                        reason: format!("it now runs on {to_node_id}"),
+                    });
+                }
+            }
+        }
 
         info!("resuming sandbox");
         let mut metadata = self
@@ -1567,6 +1626,12 @@ where
         if let Ok(metadata) = resumed.as_ref() {
             self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                 .await;
+            if let Some(mobility) = self.mobility() {
+                // Running here again, so it is no longer a migration
+                // candidate. Dropping the record also releases the claim this
+                // node took to fence the resume.
+                mobility.forget(&sandbox_id).await;
+            }
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Resume,
                 metadata.id,

@@ -228,6 +228,21 @@ p2p_enabled = true
 # them. Resolution falls back to the repository, which costs bandwidth only.
 # artifact_sealing_secret = ""
 
+# Whether this node participates in sandbox migration.
+#
+# When enabled the node records each paused sandbox so a drain can see it, and
+# refuses a local resume while another node is taking it over. Off by default:
+# it opens a durable store, and a node that never migrates anything should not
+# pay for one.
+#
+# A paused sandbox's state is written to node-local storage, so until it is
+# committed to a repository the whole cluster can read, the record correctly
+# reports it as unmovable. Enabling this makes that visible before a drain
+# rather than during one.
+# [snapshot.mobility]
+# enabled = false
+# store_path = "$AENV_HOME/mobility"
+
 # OSS only: publish a compatible rootfs back to its source registry as
 # agentenv-snapshot-{snapshot_id}. Existing remote layers are reused by digest;
 # only new deltas are uploaded, and APIs return the tag as imageRef. Memory and

@@ -136,6 +136,9 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         shutdown_outcome: tokio::sync::OnceCell::new(),
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
+        // Mobility off by default here: it has its own tests, and the
+        // lifecycle tests should not need a durable store to pause a sandbox.
+        mobility: std::sync::OnceLock::new(),
     })
 }
 
@@ -5126,5 +5129,168 @@ async fn fork_sandbox_register_failure_cleans_up_metrics() -> Result<()> {
 
     orchestrator.delete_sandbox(child.id).await?;
     orchestrator.delete_sandbox(source.id).await?;
+    Ok(())
+}
+
+/// A recording stand-in for the mobility subsystem.
+///
+/// The real one is covered by its own tests; what is unproven here is that the
+/// orchestrator calls it at all, and at the right points. A subsystem wired to
+/// nothing is the failure mode this guards.
+#[derive(Default)]
+struct RecordingMobility {
+    calls: StdMutex<Vec<String>>,
+    fence: StdMutex<Option<crate::orchestrator::ResumeFence>>,
+}
+
+impl RecordingMobility {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    fn fence_with(&self, fence: crate::orchestrator::ResumeFence) {
+        *self.fence.lock().unwrap() = Some(fence);
+    }
+}
+
+#[async_trait]
+impl crate::orchestrator::MobilityHooks for RecordingMobility {
+    async fn record_paused(&self, metadata: &SandboxMetadata) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("record_paused:{}", metadata.id));
+    }
+
+    async fn claim_for_local_resume(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> crate::orchestrator::ResumeFence {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("claim:{sandbox_id}"));
+        self.fence
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or(crate::orchestrator::ResumeFence::Allowed)
+    }
+
+    async fn forget(&self, sandbox_id: &SandboxId) {
+        self.calls
+            .lock()
+            .unwrap()
+            .push(format!("forget:{sandbox_id}"));
+    }
+
+    async fn record_counts(&self) -> crate::orchestrator::MobilityRecordCounts {
+        crate::orchestrator::MobilityRecordCounts::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mobility_records_a_pause_and_forgets_a_resume() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let mobility = Arc::new(RecordingMobility::default());
+    orchestrator.install_mobility(mobility.clone());
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+    assert!(
+        mobility.calls().is_empty(),
+        "a running sandbox is not a migration candidate"
+    );
+
+    orchestrator.pause_sandbox(sandbox_id).await?;
+    assert_eq!(
+        mobility.calls(),
+        vec![format!("record_paused:{sandbox_id}")],
+        "pausing must make the sandbox visible to a drain"
+    );
+
+    orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .await?;
+    assert_eq!(
+        mobility.calls(),
+        vec![
+            format!("record_paused:{sandbox_id}"),
+            format!("claim:{sandbox_id}"),
+            format!("forget:{sandbox_id}"),
+        ],
+        "resuming must claim first and drop the record once it is running here"
+    );
+
+    Ok(())
+}
+
+/// The fence has to hold before anything is mutated. A sandbox another node is
+/// restoring must stay paused here, not half-resume and then fail.
+#[tokio::test(flavor = "multi_thread")]
+async fn mobility_refuses_a_resume_another_node_has_claimed() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let mobility = Arc::new(RecordingMobility::default());
+    orchestrator.install_mobility(mobility.clone());
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+    orchestrator.pause_sandbox(sandbox_id).await?;
+
+    mobility.fence_with(crate::orchestrator::ResumeFence::ClaimedElsewhere {
+        by_node_id: "node-b".to_string(),
+    });
+    let error = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .await
+        .expect_err("a claimed sandbox must not resume here");
+    assert!(
+        matches!(error, OrchestratorError::SandboxHeldElsewhere { .. }),
+        "unexpected error: {error:?}"
+    );
+
+    let after = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("metadata should survive a refused resume");
+    assert_eq!(
+        after.state,
+        SandboxState::Paused,
+        "a refused resume must leave the sandbox exactly as it was"
+    );
+
+    Ok(())
+}
+
+/// A deleted sandbox did not move, it stopped existing. A drain that still saw
+/// it would keep trying to place something that is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn mobility_forgets_a_deleted_sandbox() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let mobility = Arc::new(RecordingMobility::default());
+    orchestrator.install_mobility(mobility.clone());
+
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    assert_proxy_ready(&orchestrator, &sandbox_id).await?;
+
+    orchestrator.delete_sandbox(sandbox_id).await?;
+    assert!(
+        mobility.calls().contains(&format!("forget:{sandbox_id}")),
+        "deleting must drop the record, got {:?}",
+        mobility.calls()
+    );
+
     Ok(())
 }
