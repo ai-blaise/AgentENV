@@ -783,6 +783,45 @@ pub(crate) fn regctl_command(binary: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// Attempts to spawn `regctl` before giving up on `ETXTBSY`.
+const REGCTL_SPAWN_RETRY_ATTEMPTS: usize = 5;
+/// Pause between spawn retries. The window is one `fork`-to-`exec` gap wide.
+const REGCTL_SPAWN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Runs a prepared `regctl` command, retrying a spawn that lost a race with a
+/// concurrent fork.
+///
+/// `regctl` is staged and renamed into place by the dependency installer. If
+/// any thread in this process is holding a write handle to a file at the
+/// moment another thread forks, the child inherits that handle until it execs
+/// — and an `exec` of a file some process holds open for writing is refused
+/// with `ETXTBSY`. The window is microseconds wide and the failure is
+/// transient by construction: the writer closes, and the next attempt works.
+///
+/// Without this, image resolution fails outright on a host doing several
+/// things at once, which is the only kind of host it runs on.
+pub(crate) async fn regctl_output(
+    binary: &Path,
+    build: impl Fn(&mut Command),
+) -> std::io::Result<std::process::Output> {
+    let mut attempt = 1;
+    loop {
+        let mut command = regctl_command(binary);
+        build(&mut command);
+        match command.output().await {
+            Err(error)
+                if error.raw_os_error() == Some(nix::libc::ETXTBSY)
+                    && attempt < REGCTL_SPAWN_RETRY_ATTEMPTS =>
+            {
+                tracing::debug!(attempt, "regctl was busy being written; retrying the spawn");
+                tokio::time::sleep(REGCTL_SPAWN_RETRY_DELAY).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Run a regctl invocation, retrying failures with exponential backoff to
 /// absorb transient registry errors.
 pub(crate) async fn run_regctl(
@@ -793,11 +832,11 @@ pub(crate) async fn run_regctl(
     let mut backoff = REGCTL_RETRY_BASE_DELAY;
     let mut last_stderr = String::new();
     for attempt in 1..=REGCTL_RETRY_ATTEMPTS {
-        let output = regctl_command(regctl_binary)
-            .args(args)
-            .output()
-            .await
-            .context("spawn regctl")?;
+        let output = regctl_output(regctl_binary, |command| {
+            command.args(args);
+        })
+        .await
+        .context("spawn regctl")?;
         if output.status.success() {
             return Ok(output);
         }

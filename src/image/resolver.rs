@@ -381,15 +381,16 @@ async fn discover_overlaybd_referrer(
     // OVERLAYBD_REFERRER_ARTIFACT_TYPES: `regctl artifact list` takes a single
     // `--filter-artifact-type`, which cannot express "any of these types" in
     // one call.
-    let output = oci_image::regctl_command(regctl_binary)
-        .arg("artifact")
-        .arg("list")
-        .arg("--format")
-        .arg("body")
-        .arg(subject_ref)
-        .output()
-        .await
-        .context("spawn regctl artifact list")?;
+    let output = oci_image::regctl_output(regctl_binary, |command| {
+        command
+            .arg("artifact")
+            .arg("list")
+            .arg("--format")
+            .arg("body")
+            .arg(subject_ref);
+    })
+    .await
+    .context("spawn regctl artifact list")?;
 
     if !output.status.success() {
         bail!(
