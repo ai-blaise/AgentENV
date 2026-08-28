@@ -88,9 +88,18 @@ func NewKubernetesDiscovery(
 		ignorePodInformer:     ignorePodInformer,
 		noSchedulePodInformer: noSchedulePodInformer,
 	}
-	addSyncEventHandler(endpointSliceInformer, discovery.syncFromStore)
-	addSyncEventHandler(ignorePodInformer, discovery.syncFromStore)
-	addSyncEventHandler(noSchedulePodInformer, discovery.syncFromStore)
+	// A registration that does not take means the node view silently freezes
+	// at whatever it last held, so this fails construction rather than
+	// starting a discovery that will never discover anything.
+	for _, informer := range []cache.SharedIndexInformer{
+		endpointSliceInformer,
+		ignorePodInformer,
+		noSchedulePodInformer,
+	} {
+		if err := addSyncEventHandler(informer, discovery.syncFromStore); err != nil {
+			return nil, fmt.Errorf("register kubernetes discovery event handler: %w", err)
+		}
+	}
 
 	return discovery, nil
 }
@@ -118,11 +127,18 @@ func newPodSelectorInformer(clientset kubernetes.Interface, namespace string, se
 	return factory.Core().V1().Pods().Informer()
 }
 
-func addSyncEventHandler(informer cache.SharedIndexInformer, sync func()) {
+// addSyncEventHandler attaches the handler that keeps the node view in step
+// with the cluster, and reports a registration that did not take.
+//
+// The error was previously discarded. It is returned by client-go when the
+// informer has already stopped, and in that case none of AddFunc/UpdateFunc/
+// DeleteFunc ever fire — so the scheduler keeps serving whatever fleet view it
+// last had, forever, with nothing anywhere saying why.
+func addSyncEventHandler(informer cache.SharedIndexInformer, sync func()) error {
 	if informer == nil {
-		return
+		return nil
 	}
-	informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
+	_, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(_ interface{}) {
 			sync()
 		},
@@ -133,6 +149,7 @@ func addSyncEventHandler(informer cache.SharedIndexInformer, sync func()) {
 			sync()
 		},
 	})
+	return err
 }
 
 func (d *KubernetesDiscovery) Run(ctx context.Context) error {

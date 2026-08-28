@@ -104,6 +104,15 @@ func validateAPIKey(value, source string) (string, error) {
 	return value, nil
 }
 
+// How long a client may take to send its request headers.
+//
+// Bounds Slowloris without touching the body, which matters because this
+// proxy carries uploads and long-lived streams that legitimately take minutes.
+const gatewayReadHeaderTimeout = 20 * time.Second
+
+// How long an idle keep-alive connection is held open.
+const gatewayIdleTimeout = 120 * time.Second
+
 func main() {
 	configPath := flag.String("config", "", "path to JSON config file")
 	flag.Parse()
@@ -164,6 +173,14 @@ func main() {
 	httpServer := &http.Server{
 		Addr:    cfg.Gateway.HTTPListenAddr,
 		Handler: s.Handler(),
+		// Without a header deadline a client that dribbles request headers
+		// holds a connection and a goroutine indefinitely, which is all
+		// Slowloris is. ReadTimeout and WriteTimeout are deliberately NOT set:
+		// this proxy carries long-lived streams and interactive sessions, and
+		// a whole-request deadline would cut them. IdleTimeout bounds
+		// keep-alive connections that go quiet.
+		ReadHeaderTimeout: gatewayReadHeaderTimeout,
+		IdleTimeout:       gatewayIdleTimeout,
 	}
 	metricsServer := &http.Server{
 		Addr:    cfg.Gateway.MetricsListenAddr,

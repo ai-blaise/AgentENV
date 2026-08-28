@@ -2,6 +2,15 @@ module agentenv/services
 
 go 1.25.0
 
+// Pinned to the first toolchain without the reachable standard-library
+// advisories govulncheck reports against the gateway and scheduler listeners:
+// GO-2026-6090 (crypto/tls post-handshake message flood on the public
+// listener), GO-2026-6089, GO-2026-6091, GO-2026-6218, GO-2026-5972 and
+// GO-2026-5026. The module language level stays at 1.25 so nothing here
+// depends on newer semantics; this only refuses to build the shipped binary
+// with a toolchain that carries those bugs.
+toolchain go1.26.6
+
 require (
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/prometheus/client_golang v1.20.5
@@ -41,11 +50,11 @@ require (
 	github.com/prometheus/common v0.55.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
-	golang.org/x/net v0.53.0 // indirect
+	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/sys v0.43.0 // indirect
-	golang.org/x/term v0.42.0 // indirect
-	golang.org/x/text v0.36.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/term v0.45.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.3.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260414002931-afd174a4e478 // indirect
 	gopkg.in/inf.v0 v0.9.1 // indirect

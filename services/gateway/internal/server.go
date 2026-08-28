@@ -605,7 +605,15 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 			zap.String("node_id", node.GetNodeId()),
 		)
 		// Reattach what was read so the client still receives the prefix.
-		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), resp.Body))
+		//
+		// prefixedBody, not io.NopCloser: wrapping in a NopCloser drops the
+		// upstream body's Close, so the connection is never released and its
+		// transport goroutine never exits. On a proxy that is a leak per
+		// oversized or unreadable response.
+		resp.Body = &prefixedBody{
+			Reader: io.MultiReader(bytes.NewReader(body), resp.Body),
+			closer: resp.Body,
+		}
 		return
 	}
 	if truncated {
@@ -614,7 +622,10 @@ func (s *Server) recordAssignmentFromResponse(ctx context.Context, resp *http.Re
 			zap.Int64("upstream_content_length", resp.ContentLength),
 			zap.String("content_type", resp.Header.Get("Content-Type")),
 		)
-		resp.Body = io.NopCloser(io.MultiReader(bytes.NewReader(body), resp.Body))
+		resp.Body = &prefixedBody{
+			Reader: io.MultiReader(bytes.NewReader(body), resp.Body),
+			closer: resp.Body,
+		}
 		return
 	}
 	_ = resp.Body.Close()
