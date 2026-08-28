@@ -1,6 +1,7 @@
 package main
 
 import (
+	"agentenv/services/shared/config"
 	"os"
 	"path/filepath"
 	"strings"
@@ -107,5 +108,21 @@ func TestLoadAPIKeyAllowsSymlinkedSecret(t *testing.T) {
 	}
 	if got != testAPIKey {
 		t.Fatalf("loadAPIKeyFrom() = %q, want %q", got, testAPIKey)
+	}
+}
+
+func TestSchedulerConnectionRequiresTLSUnlessExplicitlyInsecure(t *testing.T) {
+	if _, err := newSchedulerConn("127.0.0.1:9090", config.GatewayConfig{}); err == nil {
+		t.Fatal("scheduler connection unexpectedly accepted missing mTLS identity")
+	}
+
+	conn, err := newSchedulerConn("127.0.0.1:9090", config.GatewayConfig{
+		AllowInsecureScheduler: true,
+	})
+	if err != nil {
+		t.Fatalf("explicit insecure scheduler connection failed: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close scheduler connection: %v", err)
 	}
 }

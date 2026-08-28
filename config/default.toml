@@ -137,6 +137,17 @@ peer_discovery_refresh_interval_secs = 5
 [cluster]
 # Shared scheduler gRPC endpoint for node reporting and P2P peer discovery.
 # scheduler_endpoint = "http://127.0.0.1:9090"
+# Production scheduler clients require mTLS. These three paths are mandatory
+# together for an https endpoint; the domain defaults to the endpoint host.
+# scheduler_tls_ca_path = "/etc/agentenv/tls/ca.pem"
+# scheduler_tls_cert_path = "/etc/agentenv/tls/envd.pem"
+# scheduler_tls_key_path = "/etc/agentenv/tls/envd-key.pem"
+# scheduler_tls_domain_name = "scheduler.agentenv.internal"
+# Development-only escape hatch for plaintext scheduler transport.
+scheduler_allow_insecure_transport = false
+# Reject requests for existing sandboxes unless the gateway supplies the
+# scheduler-issued fencing generation. Enable after all gateways are upgraded.
+require_route_generation = false
 
 [sandbox_proxy]
 # DNS suffixes accepted for host-based routes such as

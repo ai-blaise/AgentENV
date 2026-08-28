@@ -156,28 +156,39 @@ func parseSchedulerDuration(raw json.RawMessage, field string) (time.Duration, e
 }
 
 type GatewayConfig struct {
-	HTTPListenAddr         string        `json:"http_listen_addr"`
-	MetricsListenAddr      string        `json:"metrics_listen_addr"`
-	SchedulerAddr          string        `json:"scheduler_addr"`
-	QueryOnlySchedulerAddr string        `json:"query_only_scheduler_addr"`
-	RequestTimeout         time.Duration `json:"request_timeout"`
-	ForwardResponseSize    int64         `json:"forward_response_size"`
-	SandboxProxyDomains    []string      `json:"sandbox_proxy_domains"`
+	HTTPListenAddr         string             `json:"http_listen_addr"`
+	MetricsListenAddr      string             `json:"metrics_listen_addr"`
+	SchedulerAddr          string             `json:"scheduler_addr"`
+	QueryOnlySchedulerAddr string             `json:"query_only_scheduler_addr"`
+	RequestTimeout         time.Duration      `json:"request_timeout"`
+	ForwardResponseSize    int64              `json:"forward_response_size"`
+	SandboxProxyDomains    []string           `json:"sandbox_proxy_domains"`
+	SchedulerTLS           SchedulerTLSConfig `json:"scheduler_tls"`
+	AllowInsecureScheduler bool               `json:"allow_insecure_scheduler"`
 	// DebugMode enables debug-only behaviors in the gateway such as exposing
 	// the backend node id on proxied responses. It is off by default.
 	DebugMode bool `json:"debug_mode"`
 }
 
+type SchedulerTLSConfig struct {
+	CAPath     string `json:"ca_path"`
+	CertPath   string `json:"cert_path"`
+	KeyPath    string `json:"key_path"`
+	ServerName string `json:"server_name"`
+}
+
 func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	type wire struct {
-		HTTPListenAddr         *string         `json:"http_listen_addr"`
-		MetricsListenAddr      *string         `json:"metrics_listen_addr"`
-		SchedulerAddr          *string         `json:"scheduler_addr"`
-		QueryOnlySchedulerAddr *string         `json:"query_only_scheduler_addr"`
-		RequestTimeout         json.RawMessage `json:"request_timeout"`
-		ForwardResponseSize    *int64          `json:"forward_response_size"`
-		SandboxProxyDomains    *[]string       `json:"sandbox_proxy_domains"`
-		DebugMode              *bool           `json:"debug_mode"`
+		HTTPListenAddr         *string             `json:"http_listen_addr"`
+		MetricsListenAddr      *string             `json:"metrics_listen_addr"`
+		SchedulerAddr          *string             `json:"scheduler_addr"`
+		QueryOnlySchedulerAddr *string             `json:"query_only_scheduler_addr"`
+		RequestTimeout         json.RawMessage     `json:"request_timeout"`
+		ForwardResponseSize    *int64              `json:"forward_response_size"`
+		SandboxProxyDomains    *[]string           `json:"sandbox_proxy_domains"`
+		SchedulerTLS           *SchedulerTLSConfig `json:"scheduler_tls"`
+		AllowInsecureScheduler *bool               `json:"allow_insecure_scheduler"`
+		DebugMode              *bool               `json:"debug_mode"`
 	}
 
 	parsed := wire{}
@@ -202,6 +213,12 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.SandboxProxyDomains != nil {
 		g.SandboxProxyDomains = *parsed.SandboxProxyDomains
+	}
+	if parsed.SchedulerTLS != nil {
+		g.SchedulerTLS = *parsed.SchedulerTLS
+	}
+	if parsed.AllowInsecureScheduler != nil {
+		g.AllowInsecureScheduler = *parsed.AllowInsecureScheduler
 	}
 	if parsed.DebugMode != nil {
 		g.DebugMode = *parsed.DebugMode
@@ -324,6 +341,10 @@ func overrideWithEnv(cfg *Config) error {
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
 	set("GATEWAY_QUERY_ONLY_SCHEDULER_ADDR", &cfg.Gateway.QueryOnlySchedulerAddr)
+	set("GATEWAY_SCHEDULER_TLS_CA_PATH", &cfg.Gateway.SchedulerTLS.CAPath)
+	set("GATEWAY_SCHEDULER_TLS_CERT_PATH", &cfg.Gateway.SchedulerTLS.CertPath)
+	set("GATEWAY_SCHEDULER_TLS_KEY_PATH", &cfg.Gateway.SchedulerTLS.KeyPath)
+	set("GATEWAY_SCHEDULER_TLS_SERVER_NAME", &cfg.Gateway.SchedulerTLS.ServerName)
 
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_SANDBOX_PROXY_DOMAINS")); v != "" {
 		cfg.Gateway.SandboxProxyDomains = splitCommaSeparated(v)
@@ -367,6 +388,14 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid GATEWAY_DEBUG_MODE %q: %w", v, err)
 		}
 		cfg.Gateway.DebugMode = b
+	}
+
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_ALLOW_INSECURE_SCHEDULER")); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid GATEWAY_ALLOW_INSECURE_SCHEDULER %q: %w", v, err)
+		}
+		cfg.Gateway.AllowInsecureScheduler = b
 	}
 
 	return nil
@@ -483,6 +512,26 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 		if c.Gateway.SchedulerAddr == "" {
 			return errors.New("gateway.scheduler_addr is required")
+		}
+		tlsFields := []string{
+			strings.TrimSpace(c.Gateway.SchedulerTLS.CAPath),
+			strings.TrimSpace(c.Gateway.SchedulerTLS.CertPath),
+			strings.TrimSpace(c.Gateway.SchedulerTLS.KeyPath),
+		}
+		tlsCount := 0
+		for _, field := range tlsFields {
+			if field != "" {
+				tlsCount++
+			}
+		}
+		if tlsCount != 0 && tlsCount != len(tlsFields) {
+			return errors.New("gateway.scheduler_tls ca_path, cert_path, and key_path must be configured together")
+		}
+		if tlsCount == 0 && !c.Gateway.AllowInsecureScheduler {
+			return errors.New("gateway scheduler mTLS is required unless allow_insecure_scheduler is explicit")
+		}
+		if tlsCount != 0 && c.Gateway.AllowInsecureScheduler {
+			return errors.New("gateway scheduler mTLS and allow_insecure_scheduler are mutually exclusive")
 		}
 	}
 	return nil

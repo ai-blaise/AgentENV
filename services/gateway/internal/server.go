@@ -33,6 +33,7 @@ const (
 	headerTargetPort           = "x-agentenv-target-port"
 	headerE2BTargetPort        = "e2b-sandbox-port"
 	headerNodeID               = "x-agentenv-node-id"
+	headerRouteGeneration      = "x-agentenv-route-generation"
 	maxRecordAssignmentTimeout = 5 * time.Second
 )
 
@@ -376,6 +377,13 @@ func (s *Server) proxyRequest(
 			req.Out.URL.RawQuery = upstreamURL.RawQuery
 			req.Out.Host = req.In.Host
 			injectForwardedHeaders(req.Out.Header, req.In)
+			generation := node.GetGeneration()
+			if generation == 0 {
+				// Generation zero predates fencing. Treat it as the initial
+				// generation during a rolling control-plane upgrade.
+				generation = 1
+			}
+			req.Out.Header.Set(headerRouteGeneration, strconv.FormatUint(generation, 10))
 			if options.hostRoute != nil {
 				req.Out.Header.Set(headerSandboxID, options.hostRoute.sandboxID)
 				req.Out.Header.Set(headerTargetPort, strconv.Itoa(options.hostRoute.targetPort))

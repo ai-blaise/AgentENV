@@ -30,6 +30,10 @@ pub enum NewTimeout {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SandboxMetadata {
     pub id: SandboxId,
+    /// Scheduler-owned fencing token for requests routed to this runtime.
+    /// Generation zero is never valid; legacy records belong to generation 1.
+    #[serde(default = "default_route_generation")]
+    pub route_generation: u64,
     pub snapshot_id: String,
     pub snapshot_alias: Option<String>,
     pub state: SandboxState,
@@ -72,6 +76,7 @@ impl Default for SandboxMetadata {
     fn default() -> Self {
         Self {
             id: SandboxId::new(),
+            route_generation: default_route_generation(),
             snapshot_id: "unknown".to_string(),
             snapshot_alias: None,
             state: SandboxState::Creating,
@@ -99,6 +104,10 @@ impl Default for SandboxMetadata {
             paused_state: None,
         }
     }
+}
+
+const fn default_route_generation() -> u64 {
+    1
 }
 
 impl SandboxMetadata {

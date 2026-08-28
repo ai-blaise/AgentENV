@@ -2085,9 +2085,16 @@ func TestHandleProxyHTTPForwardingAndRecordAssignment(t *testing.T) {
 func TestCreateWithStableSandboxIDStillSchedulesAndForwardsID(t *testing.T) {
 	const sandboxID = "019c4f58-8a74-7e11-82de-2b87f6ada375"
 
-	upstreamID := make(chan string, 1)
+	type routingHeaders struct {
+		sandboxID  string
+		generation string
+	}
+	upstreamRoute := make(chan routingHeaders, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamID <- r.Header.Get(headerSandboxID)
+		upstreamRoute <- routingHeaders{
+			sandboxID:  r.Header.Get(headerSandboxID),
+			generation: r.Header.Get(headerRouteGeneration),
+		}
 		w.Header().Set(headerSandboxID, sandboxID)
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"sandboxID":"` + sandboxID + `"}`))
@@ -2102,7 +2109,7 @@ func TestCreateWithStableSandboxIDStillSchedulesAndForwardsID(t *testing.T) {
 			scheduleCalls++
 			scheduledID = request.GetSandboxId()
 			return &schedulerv1.ScheduleResponse{Node: &schedulerv1.Node{
-				NodeId: "node-1", Endpoint: upstream.URL,
+				NodeId: "node-1", Endpoint: upstream.URL, Generation: 7,
 			}}, nil
 		},
 		lookupNodeFunc: func(context.Context, *schedulerv1.LookupNodeRequest, ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
@@ -2136,8 +2143,12 @@ func TestCreateWithStableSandboxIDStillSchedulesAndForwardsID(t *testing.T) {
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("status = %d, want 201", resp.StatusCode)
 	}
-	if got := <-upstreamID; got != sandboxID {
-		t.Fatalf("upstream sandbox ID = %q, want %q", got, sandboxID)
+	upstreamHeaders := <-upstreamRoute
+	if upstreamHeaders.sandboxID != sandboxID {
+		t.Fatalf("upstream sandbox ID = %q, want %q", upstreamHeaders.sandboxID, sandboxID)
+	}
+	if upstreamHeaders.generation != "7" {
+		t.Fatalf("upstream route generation = %q, want %q", upstreamHeaders.generation, "7")
 	}
 	if scheduleCalls != 1 || lookupCalls != 0 {
 		t.Fatalf("schedule calls = %d, lookup calls = %d", scheduleCalls, lookupCalls)

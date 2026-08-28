@@ -361,6 +361,23 @@ Shared cluster-level service endpoints.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `scheduler_endpoint` | string | unset | gRPC endpoint for the scheduler, for example `"http://127.0.0.1:9090"`. Used by scheduler heartbeat reporting and P2P peer discovery. |
+| `scheduler_tls_ca_path` | path | unset | PEM CA bundle used to authenticate an HTTPS scheduler. Required with the client certificate and key. |
+| `scheduler_tls_cert_path` | path | unset | PEM client certificate presented to the scheduler. |
+| `scheduler_tls_key_path` | path | unset | PEM private key for the scheduler client certificate. |
+| `scheduler_tls_domain_name` | string | endpoint host | TLS server name override. Prefer a DNS name covered by the scheduler certificate. |
+| `scheduler_allow_insecure_transport` | boolean | `false` | Explicitly permit plaintext HTTP gRPC. Intended only for isolated development/test networks. |
+| `require_route_generation` | boolean | `false` | Require `x-agentenv-route-generation` on requests for existing sandboxes. Enable after every gateway forwards scheduler-issued generations. A present stale or malformed generation is rejected even while this rollout gate is disabled. |
+
+An `https://` scheduler endpoint is fail-closed and requires all three mTLS
+files. An `http://` endpoint is rejected unless
+`scheduler_allow_insecure_transport = true`. The same authenticated channel is
+used for heartbeat/lifecycle reporting and scheduler-backed P2P discovery.
+
+Confirmed sandbox routes are renewable leases, not permanent bindings. The
+Rust control plane expires a route when node inventory stops refreshing it,
+while retaining a durable owner/generation fence so expiry cannot silently
+reassign the same sandbox ID to a different node. Deleted IDs are retired and
+cannot be reused.
 
 ## `[p2p]`
 

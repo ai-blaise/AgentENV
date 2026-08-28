@@ -53,8 +53,9 @@ struct Args {
     heartbeat_ttl_seconds: u64,
     #[arg(long, default_value_t = 120)]
     reservation_ttl_seconds: u64,
-    #[arg(long, default_value_t = 3600)]
-    assignment_ttl_seconds: u64,
+    /// Route lease duration. Healthy node inventories renew confirmed leases.
+    #[arg(long, visible_alias = "assignment-ttl-seconds", default_value_t = 300)]
+    lease_ttl_seconds: u64,
     /// Consecutive full heartbeats a confirmed route may be absent from before removal.
     #[arg(long, default_value_t = 3)]
     reconciliation_miss_threshold: u8,
@@ -148,23 +149,15 @@ async fn main() -> anyhow::Result<()> {
     let tls = load_tls(&args).await?;
 
     let reservation_ttl = Duration::from_secs(args.reservation_ttl_seconds);
-    let assignment_ttl = Duration::from_secs(args.assignment_ttl_seconds);
+    let lease_ttl = Duration::from_secs(args.lease_ttl_seconds);
     let assignments: Arc<dyn AssignmentStore> = match args.redis_url.as_deref() {
         Some(redis_url) => Arc::new(
-            RedisAssignmentStore::connect(
-                redis_url,
-                &args.cluster_id,
-                reservation_ttl,
-                assignment_ttl,
-            )
-            .await?,
+            RedisAssignmentStore::connect(redis_url, &args.cluster_id, reservation_ttl, lease_ttl)
+                .await?,
         ),
         None => {
             warn!("using process-local assignment state; horizontal replicas are unsafe");
-            Arc::new(InMemoryAssignmentStore::new(
-                reservation_ttl,
-                assignment_ttl,
-            )?)
+            Arc::new(InMemoryAssignmentStore::new(reservation_ttl, lease_ttl)?)
         }
     };
 
@@ -267,8 +260,8 @@ fn validate_args(args: &Args) -> anyhow::Result<()> {
     if args.redis_url.is_none() && !args.allow_ephemeral_state {
         bail!("--redis-url is required unless --allow-ephemeral-state is explicit");
     }
-    if args.assignment_ttl_seconds < args.reservation_ttl_seconds {
-        bail!("assignment TTL must be at least the reservation TTL");
+    if args.lease_ttl_seconds < args.reservation_ttl_seconds {
+        bail!("lease TTL must be at least the reservation TTL");
     }
     if args.reconciliation_miss_threshold == 0 {
         bail!("reconciliation miss threshold must be greater than zero");

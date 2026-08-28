@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 use tonic::Request;
 use tracing::{debug, error, info, trace, warn};
 
@@ -61,7 +61,7 @@ impl ObservabilityReporter {
         let Some(config) = ReporterConfig::resolve(config, cluster_config) else {
             return Ok(None);
         };
-        let scheduler_channel = Self::build_scheduler_channel(&config.scheduler_endpoint)?;
+        let scheduler_channel = crate::grpc::scheduler_channel(cluster_config)?;
 
         Ok(Some(Self {
             config,
@@ -313,13 +313,6 @@ impl ObservabilityReporter {
         Ok(())
     }
 
-    fn build_scheduler_channel(scheduler_endpoint: &str) -> Result<Channel> {
-        let raw_endpoint = scheduler_endpoint.to_string();
-        let endpoint = Endpoint::from_shared(raw_endpoint.clone())
-            .with_context(|| format!("invalid scheduler endpoint: {raw_endpoint}"))?;
-        Ok(endpoint.connect_lazy())
-    }
-
     async fn send_heartbeat(
         config: &ReporterConfig,
         service: &ObservabilityService,
@@ -563,6 +556,12 @@ mod tests {
     fn make_cluster_config(endpoint: Option<&str>) -> ClusterConfig {
         ClusterConfig {
             scheduler_endpoint: endpoint.map(|s| s.to_string()),
+            scheduler_tls_ca_path: None,
+            scheduler_tls_cert_path: None,
+            scheduler_tls_key_path: None,
+            scheduler_tls_domain_name: None,
+            scheduler_allow_insecure_transport: true,
+            require_route_generation: false,
         }
     }
 

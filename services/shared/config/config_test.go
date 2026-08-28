@@ -92,6 +92,7 @@ func TestValidateAcceptsSupportedLogFormats(t *testing.T) {
 	for _, format := range formats {
 		cfg := defaultConfig("gateway")
 		cfg.LogFormat = format
+		cfg.Gateway.AllowInsecureScheduler = true
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("expected format %q to validate, got error %v", format, err)
 		}
@@ -103,6 +104,7 @@ func TestLoadParsesGatewayRequestTimeoutDurationString(t *testing.T) {
 	path := filepath.Join(tmpDir, "config.json")
 	content := `{
 		"gateway": {
+			"allow_insecure_scheduler": true,
 			"request_timeout": "45s",
 			"sandbox_proxy_domains": ["sandbox-proxy.example.invalid", "sandbox-proxy-alt.example.invalid"]
 		}
@@ -142,6 +144,7 @@ func TestLoadRejectsNumericGatewayRequestTimeout(t *testing.T) {
 }
 
 func TestLoadAppliesGatewayRequestTimeoutEnvDuration(t *testing.T) {
+	t.Setenv("GATEWAY_ALLOW_INSECURE_SCHEDULER", "true")
 	t.Setenv("GATEWAY_REQUEST_TIMEOUT", "1m30s")
 	t.Setenv("GATEWAY_SANDBOX_PROXY_DOMAINS", " sandbox-proxy.example.invalid,sandbox-proxy-alt.example.invalid ,,")
 
@@ -154,6 +157,30 @@ func TestLoadAppliesGatewayRequestTimeoutEnvDuration(t *testing.T) {
 	}
 	if got := cfg.Gateway.SandboxProxyDomains; len(got) != 2 || got[0] != "sandbox-proxy.example.invalid" || got[1] != "sandbox-proxy-alt.example.invalid" {
 		t.Fatalf("unexpected proxy domains from env: %#v", got)
+	}
+}
+
+func TestGatewaySchedulerTransportIsFailClosed(t *testing.T) {
+	cfg := defaultConfig("gateway")
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("gateway config unexpectedly accepted scheduler transport without mTLS")
+	}
+
+	cfg.Gateway.AllowInsecureScheduler = true
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("explicit insecure scheduler transport was rejected: %v", err)
+	}
+
+	cfg.Gateway.SchedulerTLS = SchedulerTLSConfig{
+		CAPath: "ca.pem", CertPath: "client.pem", KeyPath: "client-key.pem",
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("gateway config accepted mTLS and insecure transport together")
+	}
+
+	cfg.Gateway.AllowInsecureScheduler = false
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("complete scheduler mTLS config was rejected: %v", err)
 	}
 }
 

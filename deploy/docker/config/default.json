@@ -20,6 +20,7 @@
   "gateway": {
     "http_listen_addr": ":8080",
     "scheduler_addr": "scheduler:9090",
+    "allow_insecure_scheduler": true,
     "request_timeout": "90s",
     "forward_response_size": 4194304,
     "sandbox_proxy_domains": []

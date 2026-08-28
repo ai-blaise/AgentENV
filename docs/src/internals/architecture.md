@@ -150,8 +150,8 @@ The node observability path combines request-time host collection with request-t
 - `src/observability/machine.rs` captures static machine descriptors from `/proc/cpuinfo`.
 - `src/observability/host.rs` collects host CPU, memory, and disk usage each time a node snapshot is requested. CPU percent is derived from two `/proc/stat` samples; on the first request it takes both samples with a 100ms window to avoid returning a synthetic zero.
 - `src/observability/service.rs` merges the latest orchestrator counters, identity, machine info, request-time host metrics, and current sandbox ID roster into a `NodeSnapshot` returned by the admin endpoints and reused by heartbeat reporting.
-- `src/observability/reporter.rs` optionally sends periodic heartbeat reports to scheduler over gRPC (`Heartbeat`) and performs best-effort `UnregisterNode` on shutdown.
-- Scheduler report config can be provided from TOML (`[observability.scheduler_report]`) and uses `[cluster].scheduler_endpoint` as the shared scheduler address. The reporter enable flag, address, and interval can be overridden by env vars (`AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED`, `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT`, `AENV_OBSERVABILITY_REPORT_INTERVAL_SECS`).
+- `src/observability/reporter.rs` sends periodic heartbeats plus durable, ordered lifecycle batches to the scheduler and performs best-effort `UnregisterNode` on shutdown.
+- Scheduler report config uses `[cluster].scheduler_endpoint`. Production HTTPS endpoints require a CA and client identity; plaintext requires the explicit `scheduler_allow_insecure_transport` development gate. Heartbeat reporting and P2P discovery share this transport policy.
 - If a P2P transport exposes a local endpoint, the reporter includes it in the scheduler heartbeat so other nodes can discover it.
 
 This keeps node requests lightweight on orchestrator data: they avoid re-listing and sorting all sandboxes on every API call while still returning fresh host metrics.
@@ -203,23 +203,27 @@ flowchart LR
     scheduler -.->|node selection /<br/> lookup result| gateway
 ```
 
-**Gateway** (`services/gateway/`): HTTP reverse proxy. Extracts sandbox data-plane routes from headers (`x-agentenv-sandbox-id` / `e2b-sandbox-id`) or configured host-based proxy domains (`{port}-{sandboxID}.{domain}`). Host-based routes are only enabled for explicit `gateway.sandbox_proxy_domains` entries, require RFC 952/1123 DNS-label-compatible sandbox IDs, and require the full `{port}-{sandboxID}` label to fit the 63-character DNS label limit. Runtime nodes have their own `[sandbox_proxy].domains` setting for the same host-based URL shape and return the first configured domain in sandbox metadata. In multi-node deployments, repository helpers can apply one `SANDBOX_PROXY_DOMAINS` value to both gateway and runtime node configuration. Sandbox control-plane routes such as `/sandboxes/{id}/pause` are routed by sandbox ID from the URL path; sandbox data-plane traffic is not inferred from URL path alone. For new sandboxes, calls `Schedule()` to pick a node. For existing sandboxes, calls `LookupNode()`. After sandbox creation, calls `RecordAssignment()` to seed a sandbox-to-node binding. Without explicit routing headers, it also handles cluster aggregation of `GET /sandboxes`, `GET /v2/sandboxes`, `GET /nodes`, and resolves `GET /nodes/{id}` via scheduler before proxying to the resolved node.
+**Gateway** (`services/gateway/`): HTTP reverse proxy. It resolves a stable sandbox ID through the scheduler and overwrites `x-agentenv-route-generation` with the returned fencing generation before forwarding. Runtime nodes compare that token with persisted sandbox metadata; a stale token receives `409 Conflict`, and the header is stripped before traffic reaches a guest workload. Gateway-to-scheduler transport is mTLS by default; `allow_insecure_scheduler` is an explicit compatibility option for local or legacy deployments.
 
-**Scheduler** (`services/scheduler/`): gRPC service with pluggable node discovery and in-memory sandbox-to-node bindings, plus observed-node snapshots reported by runtime nodes. RPCs include `Schedule`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ListObservedNodes`, `ListP2pPeers`, `GetNode`, and `UnregisterNode`. Strategies: round_robin (default), random. Proto contract: `services/api/proto/scheduler.proto`. For P2P, scheduler stores and returns opaque peer endpoints from heartbeat records; artifact catalog lookup and byte transfer stay node-to-node.
+**Rust control plane** (`crates/control-plane/`): bounded placement plus atomic assignment storage. Multi-replica deployments require Redis; process-local storage is an explicit single-replica test mode. Confirmed routes have renewable leases, while non-expiring owner/generation fences prevent lease expiry from becoming implicit reassignment. Node inventories renew leases, repair missing routes, and require consecutive misses before removing a route. Redis Lua scripts keep capacity reservations, lifecycle cursors, route materialization, route indexes, and fencing transitions atomic within a cluster shard. The server requires client-authenticated TLS unless plaintext is explicitly enabled.
 
 Binding lifecycle:
 
-- `RecordAssignment` creates the initial binding immediately after sandbox creation succeeds.
-- Runtime heartbeats include the node's full sandbox ID roster. Scheduler treats that roster as the source of truth for that node and removes bindings missing from the latest heartbeat.
-- `binding_ttl` is a freshness TTL for routing information, not a copy of sandbox timeout. If a binding stops being refreshed by gateway or heartbeats, scheduler drops it on the next lookup or roster reconcile.
-- `UnregisterNode` removes the observed node record and proactively clears bindings owned by that node.
+- `Schedule` atomically claims a stable sandbox ID and reserves cross-replica shadow capacity before the gateway contacts a worker.
+- A sync-written node-local idempotency journal makes repeated create attempts return the original result or terminal failure.
+- The node appends lifecycle changes to a sync-written RocksDB outbox. Its reporter retries ordered batches until the scheduler acknowledges a contiguous sequence.
+- Lifecycle events materialize routes asynchronously. `RecordAssignment` remains a rolling-upgrade latency optimization rather than the sole correctness path.
+- Runtime inventories renew route leases and repair missing materialized routes. Consecutive missing inventories remove a route, but retain its owner/generation fence.
+- A route lookup fails closed after lease expiry. Neither expiry nor scheduler restart authorizes a different owner; owner changes require an explicit generation-advancing transaction.
 
 Discovery modes:
 
 - `static`: explicit `scheduler.nodes` list from config
 - `kubernetes`: EndpointSlice watch over the headless `agentenv-nodes` Service, using ready DaemonSet Pod IPs as backend endpoints
 
-**Limitations**: All bindings are in-memory (lost on scheduler restart). After a scheduler restart, bindings are rebuilt from new sandbox creations plus the next heartbeat roster from each runtime node. Kubernetes discovery updates the schedulable node set dynamically, but binding persistence is still not replicated.
+The legacy Go scheduler remains for rolling compatibility. Production installs
+should use the Rust control plane with Redis and mTLS; its ephemeral store mode
+is deliberately rejected unless `--allow-ephemeral-state` is supplied.
 
 **Deployment**:
 

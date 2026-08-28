@@ -1,5 +1,5 @@
 use super::{ApiImpl, Claims};
-use crate::{api::proxy, types::SandboxId};
+use crate::{api::proxy, cfg::ConfigManager, types::SandboxId};
 use agentenv_http_server::apis;
 use async_trait::async_trait;
 use axum::{
@@ -18,6 +18,43 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a HeaderVal
     let mut values = headers.get_all(name).iter();
     let value = values.next()?;
     values.next().is_none().then_some(value)
+}
+
+fn route_generation(headers: &HeaderMap) -> Result<Option<u64>, StatusCode> {
+    let values = headers
+        .get_all(proxy::ROUTE_GENERATION_HEADER)
+        .iter()
+        .collect::<Vec<_>>();
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => value
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|generation| *generation > 0)
+            .map(Some)
+            .ok_or(StatusCode::BAD_REQUEST),
+        _ => Err(StatusCode::BAD_REQUEST),
+    }
+}
+
+fn generation_is_authorized(
+    headers: &HeaderMap,
+    expected: u64,
+    required: bool,
+) -> Result<bool, StatusCode> {
+    match route_generation(headers)? {
+        Some(actual) => Ok(actual == expected),
+        None => Ok(!required),
+    }
+}
+
+fn control_path_sandbox_id(path: &str) -> Option<SandboxId> {
+    let mut segments = path.trim_start_matches('/').split('/');
+    if segments.next()? != "sandboxes" {
+        return None;
+    }
+    SandboxId::parse_str(segments.next()?).ok()
 }
 
 impl ApiImpl {
@@ -56,11 +93,26 @@ where
 
     let api_impl = api_impl.as_ref();
     if !proxy_request {
-        return if api_impl.has_valid_api_key(request.headers()) {
-            next.run(request).await
-        } else {
-            StatusCode::UNAUTHORIZED.into_response()
-        };
+        if !api_impl.has_valid_api_key(request.headers()) {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if let Some(sandbox_id) = control_path_sandbox_id(request.uri().path()) {
+            let metadata = match api_impl.orchestrator().get_sandbox(&sandbox_id).await {
+                Ok(Some(metadata)) => metadata,
+                // Let the generated handler retain its endpoint-specific 404.
+                Ok(None) => return next.run(request).await,
+                Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            };
+            let required = ConfigManager::global_config()
+                .cluster
+                .require_route_generation;
+            match generation_is_authorized(request.headers(), metadata.route_generation, required) {
+                Ok(true) => {}
+                Ok(false) => return StatusCode::CONFLICT.into_response(),
+                Err(status) => return status.into_response(),
+            }
+        }
+        return next.run(request).await;
     }
 
     let has_api_key = api_impl.has_valid_api_key(request.headers());
@@ -86,6 +138,14 @@ where
         }
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     };
+    let required = ConfigManager::global_config()
+        .cluster
+        .require_route_generation;
+    match generation_is_authorized(request.headers(), metadata.route_generation, required) {
+        Ok(true) => {}
+        Ok(false) => return StatusCode::CONFLICT.into_response(),
+        Err(status) => return status.into_response(),
+    }
 
     let envd_request = target_port == proxy::effective_envd_port(&metadata);
     let envd_authorized = envd_request
@@ -140,5 +200,62 @@ impl apis::ApiAuthBasic for ApiImpl {
         // The outer middleware is authoritative. This adapter keeps the
         // E2B-compatible generated router from rejecting its API-key request.
         self.has_valid_api_key(headers).then_some(Claims)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_generation_is_single_nonzero_u64() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(route_generation(&headers).unwrap(), None);
+        headers.insert(
+            proxy::ROUTE_GENERATION_HEADER,
+            HeaderValue::from_static("7"),
+        );
+        assert_eq!(route_generation(&headers).unwrap(), Some(7));
+
+        headers.insert(
+            proxy::ROUTE_GENERATION_HEADER,
+            HeaderValue::from_static("0"),
+        );
+        assert_eq!(route_generation(&headers), Err(StatusCode::BAD_REQUEST));
+        headers.append(
+            proxy::ROUTE_GENERATION_HEADER,
+            HeaderValue::from_static("8"),
+        );
+        assert_eq!(route_generation(&headers), Err(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn stale_generations_are_rejected_even_before_enforcement_is_required() {
+        let mut headers = HeaderMap::new();
+        assert!(generation_is_authorized(&headers, 7, false).unwrap());
+        assert!(!generation_is_authorized(&headers, 7, true).unwrap());
+
+        headers.insert(
+            proxy::ROUTE_GENERATION_HEADER,
+            HeaderValue::from_static("6"),
+        );
+        assert!(!generation_is_authorized(&headers, 7, false).unwrap());
+        headers.insert(
+            proxy::ROUTE_GENERATION_HEADER,
+            HeaderValue::from_static("7"),
+        );
+        assert!(generation_is_authorized(&headers, 7, true).unwrap());
+    }
+
+    #[test]
+    fn only_existing_sandbox_control_paths_have_a_fence_subject() {
+        let sandbox_id = SandboxId::new();
+        assert_eq!(
+            control_path_sandbox_id(&format!("/sandboxes/{sandbox_id}/pause")),
+            Some(sandbox_id)
+        );
+        assert_eq!(control_path_sandbox_id("/sandboxes"), None);
+        assert_eq!(control_path_sandbox_id("/templates/id"), None);
+        assert_eq!(control_path_sandbox_id("/sandboxes/not-a-uuid"), None);
     }
 }

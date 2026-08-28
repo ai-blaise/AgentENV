@@ -45,12 +45,12 @@ fn peer_discovery_from_config(
     p2p: &config::ResolvedP2pConfig,
     node_identity: &NodeIdentity,
 ) -> Arc<dyn P2pPeerDiscovery> {
-    let Some(scheduler_endpoint) = config.cluster.scheduler_endpoint.clone() else {
+    if config.cluster.scheduler_endpoint.is_none() {
         return Arc::new(NoopP2pPeerDiscovery);
-    };
+    }
 
     SchedulerPeerDiscovery::start(
-        scheduler_endpoint,
+        &config.cluster,
         node_identity.id.clone(),
         node_identity.cluster_id.to_string(),
         p2p.peer_discovery_refresh_interval,

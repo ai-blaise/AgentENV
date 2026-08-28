@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use rand::RngExt;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use tonic::transport::{Channel, Endpoint as GrpcEndpoint};
+use tonic::transport::Channel;
 use tonic::Request;
 use tracing::{debug, info, trace, warn};
 
@@ -29,12 +29,16 @@ pub struct SchedulerPeerDiscovery {
 
 impl SchedulerPeerDiscovery {
     pub fn start(
-        scheduler_endpoint: String,
+        cluster_config: &crate::cfg::ClusterConfig,
         local_node_id: String,
         cluster_id: String,
         refresh_interval: Duration,
         backend: Option<String>,
     ) -> Arc<dyn P2pPeerDiscovery> {
+        let scheduler_endpoint = cluster_config
+            .scheduler_endpoint
+            .clone()
+            .unwrap_or_default();
         info!(
             scheduler_endpoint,
             local_node_id,
@@ -44,8 +48,8 @@ impl SchedulerPeerDiscovery {
             "starting scheduler P2P peer discovery"
         );
         let peers = Arc::new(RwLock::new(Vec::new()));
-        let channel = match GrpcEndpoint::from_shared(scheduler_endpoint.clone()) {
-            Ok(endpoint) => endpoint.connect_lazy(),
+        let channel = match crate::grpc::scheduler_channel(cluster_config) {
+            Ok(channel) => channel,
             Err(err) => {
                 warn!(
                     scheduler_endpoint,

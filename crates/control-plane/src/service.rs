@@ -420,6 +420,7 @@ where
                 service_instance_id: request.service_instance_id,
                 stream_id,
                 events,
+                now: Instant::now(),
             })
             .await
             .map_err(store_status)?;
@@ -666,6 +667,7 @@ fn store_status(error: StoreError) -> Status {
         StoreError::Invalid(_) => Status::invalid_argument(error.to_string()),
         StoreError::CapacityExhausted { .. } => Status::unavailable(error.to_string()),
         StoreError::OwnershipConflict { .. } => Status::failed_precondition(error.to_string()),
+        StoreError::Retired { .. } => Status::failed_precondition(error.to_string()),
         StoreError::SequenceConflict(_) => Status::failed_precondition(error.to_string()),
         StoreError::Invariant(_) => Status::internal(error.to_string()),
         StoreError::Backend(_) => Status::unavailable("assignment store unavailable"),

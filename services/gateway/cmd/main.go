@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -22,6 +25,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
@@ -32,10 +36,43 @@ const (
 	maxAPIKeyFileLen  = maxAPIKeyLen + 2
 )
 
-func newSchedulerConn(addr string) (*grpc.ClientConn, error) {
+func newSchedulerConn(addr string, cfg config.GatewayConfig) (*grpc.ClientConn, error) {
+	if cfg.AllowInsecureScheduler {
+		return grpc.NewClient(
+			addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+		)
+	}
+
+	caPEM, err := os.ReadFile(cfg.SchedulerTLS.CAPath)
+	if err != nil {
+		return nil, fmt.Errorf("read scheduler TLS CA: %w", err)
+	}
+	roots := x509.NewCertPool()
+	if !roots.AppendCertsFromPEM(caPEM) {
+		return nil, errors.New("scheduler TLS CA contains no valid PEM certificates")
+	}
+	identity, err := tls.LoadX509KeyPair(cfg.SchedulerTLS.CertPath, cfg.SchedulerTLS.KeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load scheduler TLS client identity: %w", err)
+	}
+	serverName := strings.TrimSpace(cfg.SchedulerTLS.ServerName)
+	if serverName == "" {
+		host, _, splitErr := net.SplitHostPort(addr)
+		if splitErr != nil || strings.TrimSpace(host) == "" {
+			return nil, errors.New("scheduler TLS server_name is required when scheduler_addr is not host:port")
+		}
+		serverName = strings.Trim(host, "[]")
+	}
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{identity},
+		MinVersion:   tls.VersionTLS13,
+		RootCAs:      roots,
+		ServerName:   serverName,
+	}
 	return grpc.NewClient(
 		addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
 	)
 }
 
@@ -122,7 +159,7 @@ func main() {
 	}
 	defer logger.Sync()
 
-	conn, err := newSchedulerConn(cfg.Gateway.SchedulerAddr)
+	conn, err := newSchedulerConn(cfg.Gateway.SchedulerAddr, cfg.Gateway)
 	if err != nil {
 		logger.Fatal("connect scheduler failed", zap.Error(err), zap.String("addr", cfg.Gateway.SchedulerAddr))
 	}
@@ -132,7 +169,7 @@ func main() {
 	queryOnlySchedulerClient := schedulerClient
 	var queryOnlyConn *grpc.ClientConn
 	if cfg.Gateway.QueryOnlySchedulerAddr != "" {
-		queryOnlyConn, err = newSchedulerConn(cfg.Gateway.QueryOnlySchedulerAddr)
+		queryOnlyConn, err = newSchedulerConn(cfg.Gateway.QueryOnlySchedulerAddr, cfg.Gateway)
 		if err != nil {
 			logger.Fatal("connect query-only scheduler failed", zap.Error(err), zap.String("addr", cfg.Gateway.QueryOnlySchedulerAddr))
 		}

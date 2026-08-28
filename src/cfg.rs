@@ -534,6 +534,28 @@ pub struct ClusterConfig {
         parse_env = parse_trimmed_string
     )]
     pub scheduler_endpoint: Option<String>,
+    #[config(env = "AENV_SCHEDULER_TLS_CA_PATH", parse_env = parse_required_path)]
+    pub scheduler_tls_ca_path: Option<PathBuf>,
+    #[config(
+        env = "AENV_SCHEDULER_TLS_CERT_PATH",
+        parse_env = parse_required_path
+    )]
+    pub scheduler_tls_cert_path: Option<PathBuf>,
+    #[config(
+        env = "AENV_SCHEDULER_TLS_KEY_PATH",
+        parse_env = parse_required_path
+    )]
+    pub scheduler_tls_key_path: Option<PathBuf>,
+    #[config(env = "AENV_SCHEDULER_TLS_DOMAIN_NAME", parse_env = parse_trimmed_string)]
+    pub scheduler_tls_domain_name: Option<String>,
+    /// Explicit development escape hatch for a plaintext scheduler endpoint.
+    #[config(default = false, env = "AENV_SCHEDULER_ALLOW_INSECURE_TRANSPORT")]
+    pub scheduler_allow_insecure_transport: bool,
+    /// Require the gateway's scheduler-issued fencing generation on every
+    /// request that addresses an existing sandbox. Enable after every gateway
+    /// forwards `x-agentenv-route-generation`.
+    #[config(default = false, env = "AENV_REQUIRE_ROUTE_GENERATION")]
+    pub require_route_generation: bool,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -1350,6 +1372,12 @@ impl ClusterConfig {
             .map(str::trim)
             .filter(|endpoint| !endpoint.is_empty())
             .map(ToOwned::to_owned);
+        self.scheduler_tls_domain_name = self
+            .scheduler_tls_domain_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(ToOwned::to_owned);
     }
 }
 
@@ -1958,12 +1986,24 @@ mod tests {
     fn cluster_normalize_trims_and_drops_blank_scheduler_endpoint() {
         let mut config = ClusterConfig {
             scheduler_endpoint: Some("  ".to_string()),
+            scheduler_tls_ca_path: None,
+            scheduler_tls_cert_path: None,
+            scheduler_tls_key_path: None,
+            scheduler_tls_domain_name: None,
+            scheduler_allow_insecure_transport: false,
+            require_route_generation: false,
         };
         config.normalize();
         assert_eq!(config.scheduler_endpoint, None);
 
         let mut config = ClusterConfig {
             scheduler_endpoint: Some("  http://scheduler:9090  ".to_string()),
+            scheduler_tls_ca_path: None,
+            scheduler_tls_cert_path: None,
+            scheduler_tls_key_path: None,
+            scheduler_tls_domain_name: None,
+            scheduler_allow_insecure_transport: false,
+            require_route_generation: false,
         };
         config.normalize();
         assert_eq!(

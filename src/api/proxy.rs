@@ -90,6 +90,9 @@ const E2B_SANDBOX_ID_HEADER: &str = "e2b-sandbox-id";
 const TARGET_PORT_HEADER: &str = "x-agentenv-target-port";
 /// E2B-compatible alias for the target port header.
 const E2B_TARGET_PORT_HEADER: &str = "e2b-sandbox-port";
+/// Scheduler-issued fencing token. Consumed by envd and never exposed to the
+/// sandbox workload.
+pub(crate) const ROUTE_GENERATION_HEADER: &str = "x-agentenv-route-generation";
 #[cfg(test)]
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
@@ -973,6 +976,7 @@ fn sanitize_request_headers(headers: &mut HeaderMap) {
     headers.remove(E2B_SANDBOX_ID_HEADER);
     headers.remove(TARGET_PORT_HEADER);
     headers.remove(E2B_TARGET_PORT_HEADER);
+    headers.remove(ROUTE_GENERATION_HEADER);
     headers.remove(TRAFFIC_ACCESS_TOKEN_HEADER);
     headers.remove(header::HOST);
     remove_hop_by_hop_headers(headers);
@@ -1763,7 +1767,6 @@ mod tests {
             HeaderValue::from_str(&sandbox_id).unwrap(),
         );
         headers.insert(E2B_TARGET_PORT_HEADER, HeaderValue::from_static("8080"));
-
         assert_eq!(
             parse_sandbox_id_header(&headers).unwrap().to_string(),
             sandbox_id
@@ -1781,6 +1784,10 @@ mod tests {
         );
         headers.insert(TARGET_PORT_HEADER, HeaderValue::from_static("8080"));
         headers.insert(E2B_TARGET_PORT_HEADER, HeaderValue::from_static("8080"));
+        headers.insert(
+            ROUTE_GENERATION_HEADER,
+            HeaderValue::from_static("18446744073709551615"),
+        );
         headers.insert(API_KEY_HEADER, HeaderValue::from_static("application-key"));
         headers.insert(
             TRAFFIC_ACCESS_TOKEN_HEADER,
@@ -1799,6 +1806,7 @@ mod tests {
         assert!(headers.get(E2B_SANDBOX_ID_HEADER).is_none());
         assert!(headers.get(TARGET_PORT_HEADER).is_none());
         assert!(headers.get(E2B_TARGET_PORT_HEADER).is_none());
+        assert!(headers.get(ROUTE_GENERATION_HEADER).is_none());
         assert_eq!(headers.get(API_KEY_HEADER).unwrap(), "application-key");
         assert!(headers.get(TRAFFIC_ACCESS_TOKEN_HEADER).is_none());
         assert!(headers.get(HOST).is_none());

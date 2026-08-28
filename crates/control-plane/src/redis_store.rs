@@ -22,6 +22,7 @@ pub struct RedisAssignmentStore {
     key_prefix: String,
     cluster_id: String,
     reservation_ttl: Duration,
+    lease_ttl: Duration,
 }
 
 impl RedisAssignmentStore {
@@ -29,9 +30,9 @@ impl RedisAssignmentStore {
         redis_url: &str,
         cluster_id: &str,
         reservation_ttl: Duration,
-        confirmed_ttl: Duration,
+        lease_ttl: Duration,
     ) -> Result<Self, StoreError> {
-        validate_ttls(reservation_ttl, confirmed_ttl)?;
+        validate_ttls(reservation_ttl, lease_ttl)?;
         validate_key_component(cluster_id, "cluster_id")?;
         let client = redis::Client::open(redis_url)
             .map_err(|error| StoreError::Backend(format!("parse Redis URL: {error}")))?;
@@ -43,6 +44,7 @@ impl RedisAssignmentStore {
             key_prefix: DEFAULT_KEY_PREFIX.to_string(),
             cluster_id: cluster_id.to_string(),
             reservation_ttl,
+            lease_ttl,
         };
         let mut connection = store.connection.clone();
         redis::cmd("PING")
@@ -55,6 +57,13 @@ impl RedisAssignmentStore {
     fn assignment_key(&self, sandbox_id: &str) -> String {
         format!(
             "{}:{{{}}}:assignment:{}",
+            self.key_prefix, self.cluster_id, sandbox_id
+        )
+    }
+
+    fn fence_key(&self, sandbox_id: &str) -> String {
+        format!(
+            "{}:{{{}}}:fence:{}",
             self.key_prefix, self.cluster_id, sandbox_id
         )
     }
@@ -73,6 +82,10 @@ impl RedisAssignmentStore {
 
     fn reservation_ttl_ms(&self) -> Result<u64, StoreError> {
         duration_millis(self.reservation_ttl, "reservation_ttl")
+    }
+
+    fn lease_ttl_ms(&self) -> Result<u64, StoreError> {
+        duration_millis(self.lease_ttl, "lease_ttl")
     }
 
     fn lifecycle_cursor_key(&self, node_id: &str) -> String {
@@ -148,6 +161,7 @@ impl AssignmentStore for RedisAssignmentStore {
             .key(totals_key)
             .key(expiry_key)
             .key(resources_key)
+            .key(self.fence_key(&request.sandbox_id))
             .arg(encoded)
             .arg(&request.sandbox_id)
             .arg(request.resources.cpu)
@@ -166,6 +180,7 @@ impl AssignmentStore for RedisAssignmentStore {
             .arg(reservation_ttl_ms)
             .arg(keys_ttl_ms)
             .arg(CLEANUP_BATCH)
+            .arg(&request.node.id)
             .invoke_async(&mut connection)
             .await
             .map_err(|error| StoreError::Backend(format!("claim assignment: {error}")))?;
@@ -175,6 +190,14 @@ impl AssignmentStore for RedisAssignmentStore {
             0 => Ok(ClaimOutcome::Existing(decode_assignment(&raw)?)),
             -1 => Err(StoreError::CapacityExhausted {
                 node_id: request.node.id,
+            }),
+            -3 => Err(StoreError::Retired {
+                sandbox_id: request.sandbox_id,
+            }),
+            -4 => Err(StoreError::OwnershipConflict {
+                sandbox_id: request.sandbox_id,
+                assigned_node: raw,
+                requested_node: request.node.id,
             }),
             _ => Err(StoreError::Invariant(format!(
                 "Redis claim script returned code {code}: {raw}"
@@ -210,23 +233,26 @@ impl AssignmentStore for RedisAssignmentStore {
             .key(expiry_key)
             .key(resources_key)
             .key(self.node_routes_key(&assignment.node.id))
+            .key(self.fence_key(sandbox_id))
             .arg(encoded)
             .arg(sandbox_id)
             .arg(&assignment.node.id)
+            .arg(self.lease_ttl_ms()?)
             .invoke_async(&mut connection)
             .await
             .map_err(|error| StoreError::Backend(format!("confirm assignment: {error}")))?;
 
         match code {
             1 => decode_assignment(&raw),
-            -1 => {
-                let existing = decode_assignment(&raw)?;
-                Err(StoreError::OwnershipConflict {
-                    sandbox_id: sandbox_id.to_string(),
-                    assigned_node: existing.node.id,
-                    requested_node: assignment.node.id,
-                })
-            }
+            -1 => Err(StoreError::OwnershipConflict {
+                sandbox_id: sandbox_id.to_string(),
+                assigned_node: ownership_node(&raw)?,
+                requested_node: assignment.node.id,
+            }),
+            -2 => Err(StoreError::Invariant(raw)),
+            -3 => Err(StoreError::Retired {
+                sandbox_id: sandbox_id.to_string(),
+            }),
             _ => Err(StoreError::Invariant(format!(
                 "Redis confirm script returned code {code}: {raw}"
             ))),
@@ -258,12 +284,16 @@ impl AssignmentStore for RedisAssignmentStore {
             validate_key_component(&event.sandbox_id, "sandbox_id")?;
             invocation.key(self.assignment_key(&event.sandbox_id));
         }
+        for event in &batch.events {
+            invocation.key(self.fence_key(&event.sandbox_id));
+        }
         invocation
             .arg(&batch.stream_id)
             .arg(&batch.service_instance_id)
             .arg(&batch.node.id)
             .arg(batch.events[0].sequence)
-            .arg(batch.events.len());
+            .arg(batch.events.len())
+            .arg(self.lease_ttl_ms()?);
         for event in &batch.events {
             let assignment = Assignment {
                 sandbox_id: event.sandbox_id.clone(),
@@ -288,16 +318,14 @@ impl AssignmentStore for RedisAssignmentStore {
             .map_err(|error| StoreError::Backend(format!("apply lifecycle events: {error}")))?;
         match code {
             1 | 0 => Ok(acknowledged),
-            -1 => {
-                let existing = decode_assignment(&detail)?;
-                Err(StoreError::OwnershipConflict {
-                    sandbox_id: existing.sandbox_id,
-                    assigned_node: existing.node.id,
-                    requested_node: batch.node.id,
-                })
-            }
+            -1 => Err(StoreError::OwnershipConflict {
+                sandbox_id: batch.events[0].sandbox_id.clone(),
+                assigned_node: ownership_node(&detail)?,
+                requested_node: batch.node.id,
+            }),
             -2 => Err(StoreError::Invariant(detail)),
             -3 => Err(StoreError::SequenceConflict(detail)),
+            -4 => Err(StoreError::Retired { sandbox_id: detail }),
             _ => Err(StoreError::Invariant(format!(
                 "Redis lifecycle script returned code {code}: {detail}"
             ))),
@@ -348,12 +376,16 @@ impl AssignmentStore for RedisAssignmentStore {
             .key(resources_key)
             .arg(&request.node.id)
             .arg(request.missing_heartbeat_threshold)
-            .arg(desired.len());
+            .arg(desired.len())
+            .arg(self.lease_ttl_ms()?);
         for sandbox_id in &desired {
             invocation.key(self.assignment_key(sandbox_id));
         }
         for sandbox_id in &current {
             invocation.key(self.assignment_key(sandbox_id));
+        }
+        for sandbox_id in &desired {
+            invocation.key(self.fence_key(sandbox_id));
         }
         for sandbox_id in &desired {
             let assignment = Assignment {
@@ -375,14 +407,11 @@ impl AssignmentStore for RedisAssignmentStore {
             .map_err(|error| StoreError::Backend(format!("reconcile node routes: {error}")))?;
         match code {
             1 => Ok(ReconcileResult { repaired, removed }),
-            -1 => {
-                let existing = decode_assignment(&detail)?;
-                Err(StoreError::OwnershipConflict {
-                    sandbox_id: existing.sandbox_id,
-                    assigned_node: existing.node.id,
-                    requested_node: request.node.id,
-                })
-            }
+            -1 => Err(StoreError::OwnershipConflict {
+                sandbox_id: desired.first().cloned().unwrap_or_default(),
+                assigned_node: ownership_node(&detail)?,
+                requested_node: request.node.id,
+            }),
             -2 => Err(StoreError::Invariant(detail)),
             _ => Err(StoreError::Invariant(format!(
                 "Redis reconciliation script returned code {code}: {detail}"
@@ -401,17 +430,17 @@ fn lifecycle_kind(kind: LifecycleEventKind) -> &'static str {
     }
 }
 
-fn validate_ttls(reservation_ttl: Duration, confirmed_ttl: Duration) -> Result<(), StoreError> {
+fn validate_ttls(reservation_ttl: Duration, lease_ttl: Duration) -> Result<(), StoreError> {
     if reservation_ttl.is_zero() {
         return Err(StoreError::Invalid("reservation_ttl must be non-zero"));
     }
-    if confirmed_ttl < reservation_ttl {
+    if lease_ttl < reservation_ttl {
         return Err(StoreError::Invalid(
-            "confirmed_ttl must be at least reservation_ttl",
+            "lease_ttl must be at least reservation_ttl",
         ));
     }
     duration_millis(reservation_ttl, "reservation_ttl")?;
-    duration_millis(confirmed_ttl, "confirmed_ttl")?;
+    duration_millis(lease_ttl, "lease_ttl")?;
     Ok(())
 }
 
@@ -444,11 +473,67 @@ fn decode_assignment(raw: &str) -> Result<Assignment, StoreError> {
         .map_err(|error| StoreError::Invariant(format!("decode assignment: {error}")))
 }
 
+fn ownership_node(raw: &str) -> Result<String, StoreError> {
+    if let Ok(assignment) = serde_json::from_str::<Assignment>(raw) {
+        return Ok(assignment.node.id);
+    }
+    if validate_key_component(raw, "fence owner").is_ok() {
+        return Ok(raw.to_string());
+    }
+    Err(StoreError::Invariant(
+        "assignment script returned invalid ownership detail".to_string(),
+    ))
+}
+
 const CLAIM_SCRIPT: &str = r#"
 local existing = redis.call('GET', KEYS[1])
 if existing then
+  local assignment_ok, assignment = pcall(cjson.decode, existing)
+  if not assignment_ok or not assignment or not assignment['node']
+      or not assignment['node']['id'] then
+    return {-2, 'corrupt assignment'}
+  end
+  local fence = redis.call('GET', KEYS[5])
+  if not fence then
+    redis.call('SET', KEYS[5], cjson.encode({
+      owner_node_id = assignment['node']['id'],
+      generation = tonumber(assignment['node']['generation'] or 1),
+      retired = false
+    }))
+  else
+    local fence_ok, decoded = pcall(cjson.decode, fence)
+    if not fence_ok or not decoded or decoded['retired']
+        or decoded['owner_node_id'] ~= assignment['node']['id']
+        or tonumber(decoded['generation']) ~= tonumber(assignment['node']['generation'] or 1) then
+      return {-2, 'assignment fence mismatch'}
+    end
+  end
   return {0, existing}
 end
+
+local owner_node_id = ARGV[19]
+local generation = 1
+local fence = redis.call('GET', KEYS[5])
+if fence then
+  local ok, decoded = pcall(cjson.decode, fence)
+  if not ok or not decoded or not decoded['owner_node_id'] or not decoded['generation'] then
+    return {-2, 'corrupt fence'}
+  end
+  if decoded['retired'] then
+    return {-3, 'retired'}
+  end
+  if decoded['owner_node_id'] ~= owner_node_id then
+    return {-4, decoded['owner_node_id']}
+  end
+  generation = tonumber(decoded['generation'])
+end
+
+local assignment_ok, assignment = pcall(cjson.decode, ARGV[1])
+if not assignment_ok or not assignment or not assignment['node'] then
+  return {-2, 'corrupt requested assignment'}
+end
+assignment['node']['generation'] = generation
+local encoded_assignment = cjson.encode(assignment)
 
 local redis_time = redis.call('TIME')
 local now_ms = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
@@ -489,7 +574,12 @@ for i = 1, 5 do
   end
 end
 
-redis.call('PSETEX', KEYS[1], ARGV[16], ARGV[1])
+redis.call('SET', KEYS[5], cjson.encode({
+  owner_node_id = owner_node_id,
+  generation = generation,
+  retired = false
+}))
+redis.call('PSETEX', KEYS[1], ARGV[16], encoded_assignment)
 redis.call('HINCRBY', KEYS[2], 'sandboxes', 1)
 redis.call('HINCRBY', KEYS[2], 'starting', 1)
 redis.call('HINCRBY', KEYS[2], 'cpu', ARGV[3])
@@ -500,32 +590,52 @@ redis.call('ZADD', KEYS[3], now_ms + tonumber(ARGV[16]), ARGV[2])
 redis.call('PEXPIRE', KEYS[2], ARGV[17])
 redis.call('PEXPIRE', KEYS[3], ARGV[17])
 redis.call('PEXPIRE', KEYS[4], ARGV[17])
-return {1, ARGV[1]}
+return {1, encoded_assignment}
 "#;
 
 const CONFIRM_SCRIPT: &str = r#"
 local existing = redis.call('GET', KEYS[1])
 local confirmed = ARGV[1]
+local owner_node_id = ARGV[3]
+local confirmed_ok, confirmed_decoded = pcall(cjson.decode, confirmed)
+if not confirmed_ok or not confirmed_decoded or not confirmed_decoded['node'] then
+  return {-2, 'corrupt confirmed assignment'}
+end
+local generation = math.max(tonumber(confirmed_decoded['node']['generation'] or 1), 1)
+local fence = redis.call('GET', KEYS[6])
+if fence then
+  local fence_ok, fence_decoded = pcall(cjson.decode, fence)
+  if not fence_ok or not fence_decoded or not fence_decoded['owner_node_id']
+      or not fence_decoded['generation'] then
+    return {-2, 'corrupt fence'}
+  end
+  if fence_decoded['retired'] then
+    return {-3, 'retired'}
+  end
+  if fence_decoded['owner_node_id'] ~= owner_node_id then
+    return {-1, fence_decoded['owner_node_id']}
+  end
+  generation = tonumber(fence_decoded['generation'])
+end
 if existing then
   local ok, decoded = pcall(cjson.decode, existing)
   if not ok or not decoded or not decoded['node'] or not decoded['node']['id'] then
     return {-2, 'corrupt assignment'}
   end
-  if decoded['node']['id'] ~= ARGV[3] then
-    return {-1, existing}
+  if decoded['node']['id'] ~= owner_node_id then
+    return {-1, decoded['node']['id']}
   end
-  local confirmed_ok, confirmed_decoded = pcall(cjson.decode, confirmed)
-  if not confirmed_ok or not confirmed_decoded or not confirmed_decoded['node'] then
-    return {-2, 'corrupt confirmed assignment'}
-  end
-  confirmed_decoded['node']['generation'] = math.max(
-    tonumber(decoded['node']['generation'] or 1),
-    tonumber(confirmed_decoded['node']['generation'] or 1)
-  )
-  confirmed = cjson.encode(confirmed_decoded)
+  generation = math.max(generation, tonumber(decoded['node']['generation'] or 1))
 end
 
-redis.call('SET', KEYS[1], confirmed)
+confirmed_decoded['node']['generation'] = generation
+confirmed = cjson.encode(confirmed_decoded)
+redis.call('SET', KEYS[6], cjson.encode({
+  owner_node_id = owner_node_id,
+  generation = generation,
+  retired = false
+}))
+redis.call('PSETEX', KEYS[1], ARGV[4], confirmed)
 redis.call('SADD', KEYS[5], ARGV[2])
 return {1, confirmed}
 "#;
@@ -536,7 +646,8 @@ local service_instance_id = ARGV[2]
 local node_id = ARGV[3]
 local first_sequence = tonumber(ARGV[4])
 local event_count = tonumber(ARGV[5])
-if not first_sequence or not event_count or event_count < 1 then
+local lease_ttl_ms = tonumber(ARGV[6])
+if not first_sequence or not event_count or event_count < 1 or not lease_ttl_ms then
   return {-2, 0, 'invalid lifecycle batch header'}
 end
 
@@ -552,7 +663,7 @@ end
 local already_applied = stream_changed and 0 or current_sequence
 
 for index = 1, event_count do
-  local base = 5 + (index - 1) * 6
+  local base = 6 + (index - 1) * 6
   local sequence = tonumber(ARGV[base + 1])
   local event_id = ARGV[base + 2]
   local kind = ARGV[base + 3]
@@ -581,7 +692,23 @@ for index = 1, event_count do
       end
       if (kind == 'create' or kind == 'resume' or kind == 'fork')
           and decoded['node']['id'] ~= node_id then
-        return {-1, current_sequence, existing}
+        return {-1, current_sequence, decoded['node']['id']}
+      end
+    end
+    local fence = redis.call('GET', KEYS[7 + event_count + index])
+    if fence then
+      local fence_ok, fence_decoded = pcall(cjson.decode, fence)
+      if not fence_ok or not fence_decoded or not fence_decoded['owner_node_id']
+          or not fence_decoded['generation'] then
+        return {-2, current_sequence, 'corrupt fence'}
+      end
+      if (kind == 'create' or kind == 'resume' or kind == 'fork')
+          and fence_decoded['retired'] then
+        return {-4, current_sequence, sandbox_id}
+      end
+      if (kind == 'create' or kind == 'resume' or kind == 'fork')
+          and fence_decoded['owner_node_id'] ~= node_id then
+        return {-1, current_sequence, fence_decoded['owner_node_id']}
       end
     end
   end
@@ -612,7 +739,7 @@ local function release_reservation(sandbox_id)
 end
 
 for index = 1, event_count do
-  local base = 5 + (index - 1) * 6
+  local base = 6 + (index - 1) * 6
   local sequence = tonumber(ARGV[base + 1])
   if sequence > already_applied then
     local event_id = ARGV[base + 2]
@@ -620,18 +747,27 @@ for index = 1, event_count do
     local assignment = ARGV[base + 4]
     local sandbox_id = ARGV[base + 5]
     local event_json = ARGV[base + 6]
+    local fence_key = KEYS[7 + event_count + index]
     if kind == 'create' or kind == 'resume' or kind == 'fork' then
       local existing = redis.call('GET', KEYS[index + 7])
+      local generation = 1
+      local fence = redis.call('GET', fence_key)
+      if fence then
+        generation = tonumber(cjson.decode(fence)['generation'])
+      end
+      local assignment_decoded = cjson.decode(assignment)
       if existing then
         local existing_decoded = cjson.decode(existing)
-        local assignment_decoded = cjson.decode(assignment)
-        assignment_decoded['node']['generation'] = math.max(
-          tonumber(existing_decoded['node']['generation'] or 1),
-          tonumber(assignment_decoded['node']['generation'] or 1)
-        )
-        assignment = cjson.encode(assignment_decoded)
+        generation = math.max(generation, tonumber(existing_decoded['node']['generation'] or 1))
       end
-      redis.call('SET', KEYS[index + 7], assignment)
+      assignment_decoded['node']['generation'] = generation
+      assignment = cjson.encode(assignment_decoded)
+      redis.call('SET', fence_key, cjson.encode({
+        owner_node_id = node_id,
+        generation = generation,
+        retired = false
+      }))
+      redis.call('PSETEX', KEYS[index + 7], lease_ttl_ms, assignment)
       redis.call('SADD', KEYS[6], sandbox_id)
       redis.call('HDEL', KEYS[7], sandbox_id)
     elseif kind == 'delete' then
@@ -645,9 +781,41 @@ for index = 1, event_count do
           return {-2, current_sequence, 'corrupt assignment'}
         end
         if decoded['node']['id'] == node_id then
+          local fence = redis.call('GET', fence_key)
+          local generation = tonumber(decoded['node']['generation'] or 1)
+          if fence then
+            generation = tonumber(cjson.decode(fence)['generation'])
+          end
+          redis.call('SET', fence_key, cjson.encode({
+            owner_node_id = node_id,
+            generation = generation,
+            retired = true
+          }))
           redis.call('DEL', KEYS[index + 7])
           redis.call('SREM', KEYS[6], sandbox_id)
           redis.call('HDEL', KEYS[7], sandbox_id)
+        end
+      end
+      local current_fence = redis.call('GET', fence_key)
+      if current_fence then
+        local fence_decoded = cjson.decode(current_fence)
+        if fence_decoded['owner_node_id'] == node_id then
+          fence_decoded['retired'] = true
+          redis.call('SET', fence_key, cjson.encode(fence_decoded))
+        end
+      elseif not existing then
+        redis.call('SET', fence_key, cjson.encode({
+          owner_node_id = node_id,
+          generation = 1,
+          retired = true
+        }))
+      end
+    elseif kind == 'pause' then
+      local existing = redis.call('GET', KEYS[index + 7])
+      if existing then
+        local decoded = cjson.decode(existing)
+        if decoded['node']['id'] == node_id then
+          redis.call('PEXPIRE', KEYS[index + 7], lease_ttl_ms)
         end
       end
     end
@@ -674,15 +842,24 @@ const RECONCILE_NODE_SCRIPT: &str = r#"
 local node_id = ARGV[1]
 local missing_threshold = tonumber(ARGV[2])
 local desired_count = tonumber(ARGV[3])
-if not missing_threshold or missing_threshold < 1 or not desired_count then
+local lease_ttl_ms = tonumber(ARGV[4])
+if not missing_threshold or missing_threshold < 1 or not desired_count or not lease_ttl_ms then
   return {-2, 0, 0, 'invalid reconciliation header'}
 end
 
+local current_count_offset = 4 + desired_count * 2
+local current_count = tonumber(ARGV[current_count_offset + 1])
+if not current_count then
+  return {-2, 0, 0, 'invalid current route count'}
+end
+
 local desired = {}
+local retired = {}
 for index = 1, desired_count do
-  local base = 3 + (index - 1) * 2
+  local base = 4 + (index - 1) * 2
   local sandbox_id = ARGV[base + 1]
   local assignment_key = KEYS[index + 5]
+  local fence_key = KEYS[5 + desired_count + current_count + index]
   local reservation = redis.call('HGET', KEYS[5], sandbox_id)
   if reservation and not string.match(reservation, '^(%d+):(%d+):(%d+)$') then
     return {-2, 0, 0, 'corrupt reservation'}
@@ -694,17 +871,25 @@ for index = 1, desired_count do
       return {-2, 0, 0, 'corrupt assignment'}
     end
     if decoded['node']['id'] ~= node_id then
-      return {-1, 0, 0, existing}
+      return {-1, 0, 0, decoded['node']['id']}
+    end
+  end
+  local fence = redis.call('GET', fence_key)
+  if fence then
+    local fence_ok, fence_decoded = pcall(cjson.decode, fence)
+    if not fence_ok or not fence_decoded or not fence_decoded['owner_node_id']
+        or not fence_decoded['generation'] then
+      return {-2, 0, 0, 'corrupt fence'}
+    end
+    if fence_decoded['retired'] then
+      retired[sandbox_id] = true
+    elseif fence_decoded['owner_node_id'] ~= node_id then
+      return {-1, 0, 0, fence_decoded['owner_node_id']}
     end
   end
   desired[sandbox_id] = true
 end
 
-local current_count_offset = 3 + desired_count * 2
-local current_count = tonumber(ARGV[current_count_offset + 1])
-if not current_count then
-  return {-2, 0, 0, 'invalid current route count'}
-end
 for index = 1, current_count do
   local existing = redis.call('GET', KEYS[desired_count + index + 5])
   if existing then
@@ -732,27 +917,40 @@ local function release_reservation(sandbox_id)
   redis.call('ZREM', KEYS[4], sandbox_id)
 end
 for index = 1, desired_count do
-  local base = 3 + (index - 1) * 2
+  local base = 4 + (index - 1) * 2
   local sandbox_id = ARGV[base + 1]
   local encoded = ARGV[base + 2]
   local assignment_key = KEYS[index + 5]
+  local fence_key = KEYS[5 + desired_count + current_count + index]
   local existing = redis.call('GET', assignment_key)
   release_reservation(sandbox_id)
-  if existing then
-    local existing_decoded = cjson.decode(existing)
+  if not retired[sandbox_id] then
+    local generation = 1
+    local fence = redis.call('GET', fence_key)
+    if fence then
+      generation = tonumber(cjson.decode(fence)['generation'])
+    elseif existing then
+      generation = tonumber(cjson.decode(existing)['node']['generation'] or 1)
+    end
     local encoded_decoded = cjson.decode(encoded)
-    encoded_decoded['node']['generation'] = math.max(
-      tonumber(existing_decoded['node']['generation'] or 1),
-      tonumber(encoded_decoded['node']['generation'] or 1)
-    )
+    encoded_decoded['node']['generation'] = generation
     encoded = cjson.encode(encoded_decoded)
+    if existing ~= encoded then
+      repaired = repaired + 1
+    end
+    redis.call('SET', fence_key, cjson.encode({
+      owner_node_id = node_id,
+      generation = generation,
+      retired = false
+    }))
+    redis.call('PSETEX', assignment_key, lease_ttl_ms, encoded)
+    redis.call('SADD', KEYS[1], sandbox_id)
+    redis.call('HDEL', KEYS[2], sandbox_id)
+  else
+    redis.call('DEL', assignment_key)
+    redis.call('SREM', KEYS[1], sandbox_id)
+    redis.call('HDEL', KEYS[2], sandbox_id)
   end
-  if existing ~= encoded then
-    redis.call('SET', assignment_key, encoded)
-    repaired = repaired + 1
-  end
-  redis.call('SADD', KEYS[1], sandbox_id)
-  redis.call('HDEL', KEYS[2], sandbox_id)
 end
 
 local removed = 0
@@ -911,6 +1109,7 @@ mod tests {
             service_instance_id: "instance-d".to_string(),
             stream_id: lifecycle_stream.clone(),
             events: vec![event(sequence, kind)],
+            now: Instant::now(),
         };
         assert_eq!(
             left.apply_lifecycle_batch(batch(1, LifecycleEventKind::Create))
@@ -951,6 +1150,20 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        let retired_inventory = left
+            .reconcile_node(ReconcileRequest {
+                node: Node::new("node-d", "https://node-d"),
+                sandbox_ids: vec![lifecycle_sandbox.clone()],
+                missing_heartbeat_threshold: 3,
+                now: Instant::now(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(retired_inventory.repaired, 0);
+        assert!(matches!(
+            left.claim(request(&lifecycle_sandbox, "node-d")).await,
+            Err(StoreError::Retired { .. })
+        ));
         let mut connection = left.connection.clone();
         let stream_length = redis::cmd("XLEN")
             .arg(left.lifecycle_stream_key())
@@ -959,6 +1172,7 @@ mod tests {
             .unwrap();
         assert!(stream_length >= 2);
 
+        let reconcile_sandbox = uuid::Uuid::now_v7().to_string();
         let reconcile = |sandbox_ids: Vec<String>| ReconcileRequest {
             node: Node::new("node-d", "https://node-d"),
             sandbox_ids,
@@ -966,7 +1180,7 @@ mod tests {
             now: Instant::now(),
         };
         let repaired = left
-            .reconcile_node(reconcile(vec![lifecycle_sandbox.clone()]))
+            .reconcile_node(reconcile(vec![reconcile_sandbox.clone()]))
             .await
             .unwrap();
         assert_eq!(repaired.repaired, 1);
@@ -974,7 +1188,7 @@ mod tests {
             let result = right.reconcile_node(reconcile(Vec::new())).await.unwrap();
             assert_eq!(result.removed, 0);
             assert!(left
-                .lookup(&lifecycle_sandbox, Instant::now())
+                .lookup(&reconcile_sandbox, Instant::now())
                 .await
                 .unwrap()
                 .is_some());
@@ -982,7 +1196,7 @@ mod tests {
         let removed = left.reconcile_node(reconcile(Vec::new())).await.unwrap();
         assert_eq!(removed.removed, 1);
         assert!(right
-            .lookup(&lifecycle_sandbox, Instant::now())
+            .lookup(&reconcile_sandbox, Instant::now())
             .await
             .unwrap()
             .is_none());
@@ -1011,6 +1225,41 @@ mod tests {
                 .generation,
             7
         );
+
+        let lease_cluster = format!("test-lease-{}", uuid::Uuid::now_v7());
+        let lease_store = RedisAssignmentStore::connect(
+            &redis_url,
+            &lease_cluster,
+            Duration::from_millis(50),
+            Duration::from_millis(150),
+        )
+        .await
+        .unwrap();
+        let lease_sandbox = uuid::Uuid::now_v7().to_string();
+        lease_store
+            .claim(request(&lease_sandbox, "node-lease"))
+            .await
+            .unwrap();
+        lease_store
+            .confirm(
+                &lease_sandbox,
+                Node::new("node-lease", "https://node-lease"),
+                Instant::now(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(175)).await;
+        assert!(lease_store
+            .lookup(&lease_sandbox, Instant::now())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            lease_store
+                .claim(request(&lease_sandbox, "different-node"))
+                .await,
+            Err(StoreError::OwnershipConflict { .. })
+        ));
     }
 
     fn assignment(outcome: &ClaimOutcome) -> &Assignment {
