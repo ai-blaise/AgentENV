@@ -181,6 +181,20 @@ pub struct FirecrackerSandbox {
     /// image.json path the memory device was opened with. Used as the device
     /// key to release held background downloads once envd is ready.
     mem_snapshot_image_config_path: Option<PathBuf>,
+    /// image.json path of the memory image the next capture must stack onto.
+    ///
+    /// Memory layers are diffs: `/snapshot/create` is issued with
+    /// `SnapshotType::Diff` and the layer is built from the dirty ranges
+    /// reported since the previous capture, which resets that bitmap. So each
+    /// capture is only meaningful stacked on the one before it.
+    ///
+    /// This deliberately does not read `launch`. `launch` describes how the VM
+    /// was started and is never reassigned — it has readers as far afield as
+    /// `startup_artifacts`, which feeds image-reference pinning, so moving it
+    /// forward would release a different artifact set than was pinned. It also
+    /// deliberately is not `mem_snapshot_image_config_path`, which is the ublk
+    /// device key and must keep pointing at the image backing the *live* VM.
+    mem_snapshot_parent_config_path: Option<PathBuf>,
     /// image.json path the rootfs device was opened with. Also released at
     /// envd ready so a rootfs background download (when enabled) never
     /// waits out the fallback with no notification.
@@ -670,7 +684,14 @@ impl FirecrackerSandbox {
 
         let snapshot_result = self.snapshot_to_dir(snapshot_dir).await;
         match snapshot_result {
-            Ok(snapshot) => Ok(snapshot),
+            Ok(snapshot) => {
+                // Advance the chain only once the capture has succeeded. A
+                // failed capture that resumes in place must leave the sandbox
+                // stacking onto the same parent it had before.
+                self.mem_snapshot_parent_config_path =
+                    Some(snapshot.0.mem_overlaybd_config.image_config_path.clone());
+                Ok(snapshot)
+            }
             Err(err) => {
                 Self::cleanup_failed_snapshot_dir(snapshot_dir).await;
                 Err(err)
@@ -693,14 +714,12 @@ impl FirecrackerSandbox {
         // Build the memory image config: collect parent layers, make runtime
         // lowers local to this snapshot dir, and compact only if the layer
         // count exceeds the configured maximum.
-        let resume_mem_image_config_path = match &self.launch {
-            LaunchMode::Resume(config) => {
-                Some(config.mem_overlaybd_config.image_config_path.as_path())
-            }
-            LaunchMode::Fresh(_) => None,
-        };
+        //
+        // The parent is the previous capture of *this* sandbox, not the image
+        // it launched from. A second capture that stacked on the launch-time
+        // config would omit the first capture's delta entirely.
         let mem_image_config = build_mem_snapshot_image_config(
-            resume_mem_image_config_path,
+            self.mem_snapshot_parent_config_path.as_deref(),
             &mem_layer_path,
             snapshot_dir,
             memory_output,
@@ -1162,6 +1181,14 @@ impl FirecrackerSandbox {
         let runtime_policy = launch.common().runtime_policy;
         let current_network_policy = launch.common().network_policy.clone();
         let current_custom_extension_params = launch.common().custom_extension_params.clone();
+        // A sandbox resumed from a snapshot continues that snapshot's memory
+        // chain; one booted fresh starts a new chain.
+        let mem_snapshot_parent_config_path = match &launch {
+            LaunchMode::Resume(config) => {
+                Some(config.mem_overlaybd_config.image_config_path.clone())
+            }
+            LaunchMode::Fresh(_) => None,
+        };
         debug!(work_dir = %work_dir.path().display(), "sandbox work directory prepared");
 
         Ok(Self {
@@ -1181,6 +1208,7 @@ impl FirecrackerSandbox {
             rootfs_runtime: None,
             mem_ublk_device: None,
             mem_snapshot_image_config_path: None,
+            mem_snapshot_parent_config_path,
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
             live_snapshot_root: None,
@@ -1929,6 +1957,20 @@ mod tests {
         config
     }
 
+    fn snapshot_config_with_mem_image(mem_image_path: &str) -> FirecrackerSnapshotConfig {
+        FirecrackerSnapshotConfig {
+            common: overlaybd_config().common,
+            vm_state_path: "snapshot/vm_state.bin".into(),
+            mem_overlaybd_config: OverlaybdConfig {
+                image_config_path: mem_image_path.into(),
+                read_only: true,
+                runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+            },
+            mem_virtual_size: 4096,
+            managed_snapshot_root: None,
+        }
+    }
+
     fn rate_limit_cfg() -> crate::cfg::DiskRateLimitConfig {
         crate::cfg::DiskRateLimitConfig {
             enabled: true,
@@ -2385,6 +2427,54 @@ mod tests {
         assert!(err
             .to_string()
             .contains("ensure start() was called before pause() or snapshot"));
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_launch_starts_a_new_memory_chain() -> Result<()> {
+        let sandbox = FirecrackerSandbox::new(overlaybd_config())?;
+        assert!(
+            sandbox.mem_snapshot_parent_config_path.is_none(),
+            "a freshly booted sandbox has no earlier capture to stack onto"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_launch_continues_the_snapshot_memory_chain() -> Result<()> {
+        let parent = PathBuf::from("/snapshots/parent/mem_image.json");
+        let snapshot = snapshot_config_with_mem_image("/snapshots/parent/mem_image.json");
+
+        let sandbox = FirecrackerSandbox::from_snapshot_config(&snapshot)?;
+
+        assert_eq!(
+            sandbox.mem_snapshot_parent_config_path.as_deref(),
+            Some(parent.as_path()),
+            "a resumed sandbox must stack its next capture onto the image it resumed from"
+        );
+        Ok(())
+    }
+
+    /// The memory layer written by each capture is a diff against the ranges
+    /// dirtied since the previous one, and `/snapshot/create` resets that
+    /// bitmap. Stacking a second capture onto the launch-time config instead of
+    /// onto the first capture silently drops the first capture's delta, so the
+    /// parent must be the live VM's most recent capture and must not be
+    /// confused with the device key of the image currently backing it.
+    #[test]
+    fn memory_chain_parent_is_distinct_from_the_live_device_key() -> Result<()> {
+        let resumed_from = PathBuf::from("/snapshots/resumed-from/mem_image.json");
+        let snapshot = snapshot_config_with_mem_image("/snapshots/resumed-from/mem_image.json");
+
+        let mut sandbox = FirecrackerSandbox::from_snapshot_config(&snapshot)?;
+        sandbox.mem_snapshot_image_config_path =
+            Some(PathBuf::from("/run/live-device/mem_image.json"));
+
+        assert_eq!(
+            sandbox.mem_snapshot_parent_config_path.as_deref(),
+            Some(resumed_from.as_path()),
+            "the live ublk device key must not be mistaken for the capture parent"
+        );
         Ok(())
     }
 }

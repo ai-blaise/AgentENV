@@ -757,3 +757,113 @@ fn unique_alias_for_test(prefix: &str) -> String {
             .unwrap_or(0)
     )
 }
+
+/// Repeated captures of a *live* sandbox must each stack onto the previous one.
+///
+/// Memory layers are diffs: `/snapshot/create` is issued with
+/// `SnapshotType::Diff` and the layer holds only the ranges dirtied since the
+/// last capture, which resets that bitmap. A second capture that stacked onto
+/// the launch-time config instead of onto the first capture would silently omit
+/// the first capture's delta.
+///
+/// The markers deliberately live on `/dev/shm`. Every other guest-state
+/// assertion in this file writes under `/tmp`, which is on the ext4 rootfs and
+/// is therefore carried by the rootfs restack — a path that was never broken.
+/// Only a tmpfs mount exercises the memory chain at all.
+#[tokio::test]
+async fn repeated_capture_preserves_memory_only_state() -> Result<()> {
+    common::setup().await;
+    let store = tempdir()?;
+    let (_, snapshot_manager, _) = common::snapshot_test_parts(store.path());
+
+    let mut sandbox_config = common::default_sandbox_config()?;
+    sandbox_config.vcpu_count = 1;
+    sandbox_config.mem_size_mib = 128;
+    let mut source = FirecrackerSandbox::new(sandbox_config)?;
+    source.start().await?;
+    let source_sandbox_id = SandboxId::new();
+
+    write_guest_file(&source, "/dev/shm/marker-a", "a").await?;
+    let first = SandboxBackend::snapshot(&mut source).await?;
+    let first_alias = unique_alias_for_test("mem_chain_first");
+    let _first_record = publish_captured_snapshot_for_test(
+        &snapshot_manager,
+        &first_alias,
+        source_sandbox_id,
+        first,
+    )
+    .await?;
+
+    // Dirtied only after the first capture, so it exists solely in the second
+    // capture's delta layer.
+    write_guest_file(&source, "/dev/shm/marker-b", "b").await?;
+    let second = SandboxBackend::snapshot(&mut source).await?;
+    let second_alias = unique_alias_for_test("mem_chain_second");
+    let second_record = publish_captured_snapshot_for_test(
+        &snapshot_manager,
+        &second_alias,
+        source_sandbox_id,
+        second,
+    )
+    .await?;
+
+    let runnable = snapshot_manager.resolve_runnable(second_record).await?;
+    let launch_config = SandboxLaunchConfig {
+        sandbox_id: SandboxId::new(),
+        snapshot_id: runnable.record().id.to_string(),
+        env_vars: None,
+        network: None,
+        extra_mmds: serde_json::Map::new(),
+        custom_extension_params: None,
+        envd_access_token: None,
+    };
+    let mut child = FirecrackerSandbox::from_snapshot(&runnable, &launch_config)?;
+    child.start().await?;
+
+    // marker-a lives only in the first capture's layer. If the second capture
+    // stacked onto the launch-time config rather than onto the first capture,
+    // that layer is not in the chain and this read fails.
+    assert_guest_file(&child, "/dev/shm/marker-a", "a").await?;
+    assert_guest_file(&child, "/dev/shm/marker-b", "b").await?;
+
+    child.stop().await?;
+    source.stop().await?;
+    Ok(())
+}
+
+/// Pausing after a capture must persist a memory chain that includes the
+/// capture, not one that skips back to launch.
+#[tokio::test]
+async fn pause_after_capture_preserves_memory_only_state() -> Result<()> {
+    common::setup().await;
+    let store = tempdir()?;
+    let (_, snapshot_manager, _) = common::snapshot_test_parts(store.path());
+
+    let mut sandbox_config = common::default_sandbox_config()?;
+    sandbox_config.vcpu_count = 1;
+    sandbox_config.mem_size_mib = 128;
+    let mut sandbox = FirecrackerSandbox::new(sandbox_config)?;
+    sandbox.start().await?;
+    let sandbox_id = SandboxId::new();
+
+    write_guest_file(&sandbox, "/dev/shm/marker-a", "a").await?;
+    let capture = SandboxBackend::snapshot(&mut sandbox).await?;
+    let alias = unique_alias_for_test("mem_chain_pause");
+    let _record =
+        publish_captured_snapshot_for_test(&snapshot_manager, &alias, sandbox_id, capture).await?;
+
+    write_guest_file(&sandbox, "/dev/shm/marker-b", "b").await?;
+
+    let paused = SandboxBackend::pause(&mut sandbox, None).await?;
+    let paused_state = paused
+        .downcast_ref::<agentenv::sandbox::FirecrackerPausedState>()
+        .ok_or_else(|| anyhow!("paused state is not a Firecracker paused state"))?;
+    let mut resumed = FirecrackerSandbox::from_snapshot_config(paused_state.snapshot_config())?;
+    resumed.start().await?;
+
+    assert_guest_file(&resumed, "/dev/shm/marker-a", "a").await?;
+    assert_guest_file(&resumed, "/dev/shm/marker-b", "b").await?;
+
+    resumed.stop().await?;
+    Ok(())
+}
