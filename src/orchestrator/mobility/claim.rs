@@ -55,12 +55,18 @@ use crate::types::SandboxId;
 /// short enough that a dead claimant does not park a sandbox for minutes.
 pub const DEFAULT_CLAIM_TTL: Duration = Duration::from_secs(30);
 
-/// Extra time the origin waits past expiry before resuming locally.
+/// Extra time any node waits past a claim's expiry before taking it over.
 ///
-/// This is the whole defence against a renewal that was in flight when the
-/// origin looked: it must exceed plausible clock skew plus one renewal round
-/// trip, and it is only ever paid on a path that is already failing.
-const ORIGIN_RESUME_GRACE: Duration = Duration::from_secs(15);
+/// The defence against a renewal that was in flight when the taker looked: it
+/// must exceed plausible clock skew plus one renewal round trip, and it is
+/// only ever paid on a path that is already failing.
+///
+/// Together with the holder's abandon margin this sets how much clock
+/// disagreement the protocol tolerates. `docs/specs/MobilityClaim.tla` checks
+/// that two live copies are impossible exactly while skew between any two
+/// nodes stays within `abandon_margin + TAKEOVER_GRACE`; with a 30s TTL that
+/// is 10s + 15s = 25s, against the sub-second skew NTP-managed hosts hold.
+const TAKEOVER_GRACE: Duration = Duration::from_secs(15);
 
 /// The result of trying to claim a sandbox.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -147,7 +153,7 @@ impl<S: MobilityStore> MobilityCoordinator<S> {
                 by_node_id,
                 at_unix_ms,
             } if by_node_id != &self.node_id => {
-                if let Some(expires_in) = self.remaining(*at_unix_ms, now) {
+                if let Some(expires_in) = self.remaining_with_grace(*at_unix_ms, now) {
                     return Ok(ClaimOutcome::AlreadyClaimed {
                         by_node_id: by_node_id.clone(),
                         expires_in,
@@ -211,46 +217,45 @@ impl<S: MobilityStore> MobilityCoordinator<S> {
         ))
     }
 
-    /// Whether this node may resume the sandbox itself.
+    /// Takes the sandbox for a local resume, or explains who has it.
+    ///
+    /// Taking, not checking. An earlier version only read the record before
+    /// resuming, and the TLA+ model in `docs/specs/MobilityClaim.tla` found
+    /// the consequence in four steps: reading is not taking, so a destination
+    /// claims in the gap between the read and the resume and both nodes end up
+    /// live. The origin therefore goes through the same claim as everyone
+    /// else, and the record has exactly one holder at a time.
     ///
     /// A sandbox with no record resumes freely: mobility is opt-in, and a node
-    /// that has never written a record for a sandbox is not in a handover.
-    pub async fn fence_local_resume(&self, sandbox_id: &SandboxId) -> Result<ResumeFence> {
-        self.fence_local_resume_at(sandbox_id, SystemTime::now())
+    /// that never wrote a record for a sandbox is not in a handover.
+    pub async fn claim_for_local_resume(&self, sandbox_id: &SandboxId) -> Result<ResumeFence> {
+        self.claim_for_local_resume_at(sandbox_id, SystemTime::now())
             .await
     }
 
-    async fn fence_local_resume_at(
+    async fn claim_for_local_resume_at(
         &self,
         sandbox_id: &SandboxId,
         now: SystemTime,
     ) -> Result<ResumeFence> {
-        let Some(record) = self.store.get(sandbox_id).await? else {
-            return Ok(ResumeFence::Allowed);
-        };
-        match &record.state {
-            MobilityState::Parked => Ok(ResumeFence::Allowed),
-            MobilityState::Evacuated { to_node_id, .. } => Ok(ResumeFence::Evacuated {
-                to_node_id: to_node_id.clone(),
-            }),
-            MobilityState::Claimed {
-                by_node_id,
-                at_unix_ms,
-            } => {
-                if by_node_id == &self.node_id {
-                    // This node is both origin and claimant, which is what a
-                    // restore-in-place looks like. Nothing to fence against.
-                    return Ok(ResumeFence::Allowed);
-                }
-                // The grace period, not the TTL, gates the origin. A claimant
-                // whose renewal was in flight when this ran is still inside it.
-                match self.remaining_with_grace(*at_unix_ms, now) {
-                    Some(_) => Ok(ResumeFence::ClaimedElsewhere {
-                        by_node_id: by_node_id.clone(),
-                    }),
-                    None => Ok(ResumeFence::Allowed),
-                }
+        // The grace period, not the bare TTL, gates a takeover — a claimant
+        // whose renewal was in flight when this ran is still inside it. That
+        // is `claim_at`'s own rule, applied here by asking it.
+        match self.claim_at(sandbox_id, now).await? {
+            // No record: not in a handover, resume freely.
+            ClaimOutcome::Unknown => Ok(ResumeFence::Allowed),
+            ClaimOutcome::Claimed(_) => Ok(ResumeFence::Allowed),
+            ClaimOutcome::AlreadyClaimed { by_node_id, .. } => {
+                Ok(ResumeFence::ClaimedElsewhere { by_node_id })
             }
+            ClaimOutcome::AlreadyEvacuated { to_node_id } => {
+                Ok(ResumeFence::Evacuated { to_node_id })
+            }
+            // Lost a write race. Refusing is the safe answer: the caller
+            // retries and gets a definitive one.
+            ClaimOutcome::Superseded => Ok(ResumeFence::ClaimedElsewhere {
+                by_node_id: "an unknown concurrent claimant".to_string(),
+            }),
         }
     }
 
@@ -261,16 +266,8 @@ impl<S: MobilityStore> MobilityCoordinator<S> {
         )
     }
 
-    fn remaining(&self, claimed_at_unix_ms: u64, now: SystemTime) -> Option<Duration> {
-        self.remaining_within(claimed_at_unix_ms, now, self.claim_ttl)
-    }
-
     fn remaining_with_grace(&self, claimed_at_unix_ms: u64, now: SystemTime) -> Option<Duration> {
-        self.remaining_within(
-            claimed_at_unix_ms,
-            now,
-            self.claim_ttl + ORIGIN_RESUME_GRACE,
-        )
+        self.remaining_within(claimed_at_unix_ms, now, self.claim_ttl + TAKEOVER_GRACE)
     }
 
     /// Remaining lifetime of a claim, or `None` once it has lapsed.
@@ -350,7 +347,9 @@ mod tests {
         MobilityCoordinator::new(store, node)
     }
 
-    fn seconds_ago(seconds: u64) -> SystemTime {
+    /// Advances the clock the coordinator is asked to reason with, rather than
+    /// sleeping for it.
+    fn seconds_from_now(seconds: u64) -> SystemTime {
         SystemTime::now() + Duration::from_secs(seconds)
     }
 
@@ -366,7 +365,7 @@ mod tests {
         ));
         assert_eq!(
             origin
-                .fence_local_resume(&f.sandbox_id)
+                .claim_for_local_resume(&f.sandbox_id)
                 .await
                 .expect("fence"),
             ResumeFence::ClaimedElsewhere {
@@ -378,7 +377,7 @@ mod tests {
         assert!(destination.complete(&f.sandbox_id).await.expect("complete"));
         assert_eq!(
             origin
-                .fence_local_resume(&f.sandbox_id)
+                .claim_for_local_resume(&f.sandbox_id)
                 .await
                 .expect("fence"),
             ResumeFence::Evacuated {
@@ -442,7 +441,10 @@ mod tests {
 
         let taker = coordinator(f.store.clone(), "node-c").with_claim_ttl(Duration::from_secs(1));
         let outcome = taker
-            .claim_at(&f.sandbox_id, seconds_ago(5))
+            .claim_at(
+                &f.sandbox_id,
+                seconds_from_now(1 + TAKEOVER_GRACE.as_secs() + 1),
+            )
             .await
             .expect("claim");
         assert!(
@@ -451,11 +453,11 @@ mod tests {
         );
     }
 
-    /// The window between claim expiry and origin resume is the one place two
-    /// live copies could appear. The grace period must keep the origin out of
-    /// it even after the TTL has passed.
+    /// The window between claim expiry and a takeover is the one place two
+    /// live copies could appear. The grace period must keep a rival out of it
+    /// even after the TTL has passed.
     #[tokio::test]
-    async fn the_origin_waits_out_the_grace_period_before_resuming() {
+    async fn a_rival_waits_out_the_grace_period_before_taking_over() {
         let f = fixture().await;
         let ttl = Duration::from_secs(1);
         coordinator(f.store.clone(), "node-b")
@@ -468,7 +470,7 @@ mod tests {
         // Past the TTL but inside the grace period: still fenced.
         assert!(matches!(
             origin
-                .fence_local_resume_at(&f.sandbox_id, seconds_ago(ttl.as_secs() + 1))
+                .claim_for_local_resume_at(&f.sandbox_id, seconds_from_now(ttl.as_secs() + 1))
                 .await
                 .expect("fence"),
             ResumeFence::ClaimedElsewhere { .. }
@@ -478,9 +480,9 @@ mod tests {
         // renewal cannot still be in flight.
         assert_eq!(
             origin
-                .fence_local_resume_at(
+                .claim_for_local_resume_at(
                     &f.sandbox_id,
-                    seconds_ago(ttl.as_secs() + ORIGIN_RESUME_GRACE.as_secs() + 1)
+                    seconds_from_now(ttl.as_secs() + TAKEOVER_GRACE.as_secs() + 1)
                 )
                 .await
                 .expect("fence"),
@@ -525,11 +527,65 @@ mod tests {
         assert!(claimant.release(&f.sandbox_id).await.expect("release"));
         assert_eq!(
             coordinator(f.store.clone(), "node-a")
-                .fence_local_resume(&f.sandbox_id)
+                .claim_for_local_resume(&f.sandbox_id)
                 .await
                 .expect("fence"),
             ResumeFence::Allowed,
             "a released sandbox is available again"
+        );
+        assert!(
+            matches!(
+                f.store
+                    .get(&f.sandbox_id)
+                    .await
+                    .expect("get")
+                    .expect("record")
+                    .state,
+                MobilityState::Claimed { ref by_node_id, .. } if by_node_id == "node-a"
+            ),
+            "resuming locally must take the record, not just read it"
+        );
+    }
+
+    /// The defect the TLA+ model found: a read-only fence lets a destination
+    /// claim in the gap between the origin's check and its resume, and both
+    /// end up live. Exactly one of the two must succeed.
+    #[tokio::test]
+    async fn a_local_resume_and_a_remote_claim_cannot_both_win() {
+        let f = fixture().await;
+        let origin = coordinator(f.store.clone(), "node-a");
+        let destination = coordinator(f.store.clone(), "node-b");
+
+        let resumed = origin
+            .claim_for_local_resume(&f.sandbox_id)
+            .await
+            .expect("resume");
+        let claimed = destination.claim(&f.sandbox_id).await.expect("claim");
+
+        assert_eq!(resumed, ResumeFence::Allowed, "the origin got there first");
+        match claimed {
+            ClaimOutcome::AlreadyClaimed { by_node_id, .. } => assert_eq!(by_node_id, "node-a"),
+            other => panic!("the destination must lose the race, got {other:?}"),
+        }
+    }
+
+    /// And the other way round.
+    #[tokio::test]
+    async fn a_remote_claim_blocks_a_local_resume() {
+        let f = fixture().await;
+        coordinator(f.store.clone(), "node-b")
+            .claim(&f.sandbox_id)
+            .await
+            .expect("claim");
+
+        assert_eq!(
+            coordinator(f.store.clone(), "node-a")
+                .claim_for_local_resume(&f.sandbox_id)
+                .await
+                .expect("resume"),
+            ResumeFence::ClaimedElsewhere {
+                by_node_id: "node-b".to_string()
+            }
         );
     }
 
@@ -562,7 +618,10 @@ mod tests {
         let origin = coordinator(f.store.clone(), "node-a");
 
         assert_eq!(
-            origin.fence_local_resume(&unknown).await.expect("fence"),
+            origin
+                .claim_for_local_resume(&unknown)
+                .await
+                .expect("fence"),
             ResumeFence::Allowed
         );
         assert_eq!(
@@ -580,7 +639,9 @@ mod tests {
         node.claim(&f.sandbox_id).await.expect("claim");
 
         assert_eq!(
-            node.fence_local_resume(&f.sandbox_id).await.expect("fence"),
+            node.claim_for_local_resume(&f.sandbox_id)
+                .await
+                .expect("fence"),
             ResumeFence::Allowed
         );
     }

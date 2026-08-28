@@ -144,20 +144,23 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
                 // already built.
                 Err(lost.to_string())
             }
-            result = self.steps.restore(&claimed) => {
-                guardian.release();
-                result.map_err(|error| error.to_string())
-            }
+            result = self.steps.restore(&claimed) => result.map_err(|error| error.to_string()),
         };
 
         if let Err(reason) = restored {
+            drop(guardian);
             self.roll_back(&claimed, &reason).await;
             return Ok(MigrationOutcome::RolledBack { reason });
         }
 
-        // Point of no return. From here the sandbox is live here, and the
-        // record must say so before anything else is attempted.
-        if !self.coordinator.complete(sandbox_id).await? {
+        // Point of no return. The guest is live here and the record does not
+        // say so yet, so the lease has to stay renewed across this write —
+        // releasing it when the restore returned would let the claim go stale
+        // during the commit, and a slow or wedged commit would then let the
+        // origin resume while this guest is already running.
+        let committed = self.coordinator.complete(sandbox_id).await;
+        guardian.release();
+        if !committed? {
             // The claim was lost while restoring — expired and taken, or the
             // record was superseded. The guest running here is now the second
             // copy, so it is the one that has to go.
@@ -217,13 +220,20 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
     /// are what make a restore slow.
     fn guard_claim(&self, sandbox_id: SandboxId) -> (LeaseGuardian, LeaseWatch) {
         let coordinator = Arc::clone(&self.coordinator);
+        let node_id = self.coordinator.node_id().to_string();
         LeaseGuardian::spawn(LeasePacing::new(self.claim_ttl), move || {
             let coordinator = Arc::clone(&coordinator);
+            let node_id = node_id.clone();
             Box::pin(async move {
                 match coordinator.claim(&sandbox_id).await {
                     Ok(ClaimOutcome::Claimed(_)) => RenewOutcome::Held,
                     Ok(ClaimOutcome::AlreadyClaimed { by_node_id, .. }) => {
                         RenewOutcome::Lost(LeaseLost::Taken { by: by_node_id })
+                    }
+                    // Our own completed handover, seen by a renewal that
+                    // raced the commit. We own it; that is not a loss.
+                    Ok(ClaimOutcome::AlreadyEvacuated { to_node_id }) if to_node_id == node_id => {
+                        RenewOutcome::Held
                     }
                     Ok(ClaimOutcome::AlreadyEvacuated { to_node_id }) => {
                         RenewOutcome::Lost(LeaseLost::Taken { by: to_node_id })
