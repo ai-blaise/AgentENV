@@ -432,7 +432,7 @@ impl AdmissionController {
 mod tests {
     use super::*;
 
-    fn resources(cpu: u32, memory_mib: u32) -> SandboxResources {
+    pub(super) fn resources(cpu: u32, memory_mib: u32) -> SandboxResources {
         SandboxResources {
             cpu_count: cpu,
             memory_mib,
@@ -440,7 +440,7 @@ mod tests {
         }
     }
 
-    fn config() -> AdmissionConfig {
+    pub(super) fn config() -> AdmissionConfig {
         AdmissionConfig {
             enabled: true,
             max_sandbox_count: None,
@@ -454,7 +454,7 @@ mod tests {
         }
     }
 
-    async fn empty_metrics() -> Option<OrchestratorMetrics> {
+    pub(super) async fn empty_metrics() -> Option<OrchestratorMetrics> {
         Some(OrchestratorMetrics::default())
     }
 
@@ -751,5 +751,188 @@ mod tests {
         assert_eq!(controller.pending.creates.load(Ordering::Acquire), 0);
         assert_eq!(controller.pending.cpu.load(Ordering::Acquire), 0);
         assert_eq!(controller.pending.memory_bytes.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod every_limit_tests {
+    use super::tests::{config, empty_metrics, resources};
+    use super::*;
+
+    fn capacity(slots: usize) -> NodeCapacityInputs {
+        NodeCapacityInputs {
+            available_network_slots: slots,
+        }
+    }
+
+    fn metrics(
+        sandboxes: u32,
+        starting: u32,
+        cpu: u32,
+        memory: u64,
+        paused: u32,
+    ) -> OrchestratorMetrics {
+        OrchestratorMetrics {
+            running_sandbox_count: sandboxes,
+            starting_sandbox_count: starting,
+            allocated_cpu: cpu,
+            allocated_memory_bytes: memory,
+            paused_sandbox_count: paused,
+            ..OrchestratorMetrics::default()
+        }
+    }
+
+    /// Mutation testing found four of the six limits never entered by any
+    /// test: the shared fixture leaves every limit `None`, so the comparison
+    /// inside each `if let Some(limit)` could be inverted or removed and
+    /// nothing would notice. A limit nobody exercises is a limit that does not
+    /// hold.
+    ///
+    /// Each case sits exactly on the boundary — at the limit must be admitted,
+    /// one past it must be refused — so an off-by-one is caught rather than
+    /// only a gross inversion.
+    #[tokio::test]
+    async fn every_configured_limit_admits_at_its_boundary_and_refuses_past_it() {
+        struct Case {
+            name: &'static str,
+            configure: fn(&mut AdmissionConfig),
+            at_limit: OrchestratorMetrics,
+            past_limit: OrchestratorMetrics,
+            reason: AdmissionRejectReason,
+            slots: usize,
+        }
+
+        // Each request below asks for one sandbox with 2 CPU and 128 MiB, so
+        // the "at limit" metrics are chosen to land exactly on the threshold
+        // once this request is counted.
+        let cases = [
+            Case {
+                name: "max_sandbox_count",
+                configure: |config| config.max_sandbox_count = Some(3),
+                at_limit: metrics(2, 0, 0, 0, 0),
+                past_limit: metrics(3, 0, 0, 0, 0),
+                reason: AdmissionRejectReason::SandboxCount,
+                slots: 64,
+            },
+            Case {
+                name: "max_sandbox_starting_count",
+                configure: |config| config.max_sandbox_starting_count = Some(2),
+                at_limit: metrics(0, 1, 0, 0, 0),
+                past_limit: metrics(0, 2, 0, 0, 0),
+                reason: AdmissionRejectReason::StartingSandboxCount,
+                slots: 64,
+            },
+            Case {
+                name: "max_allocated_cpu",
+                configure: |config| config.max_allocated_cpu = Some(8),
+                at_limit: metrics(0, 0, 6, 0, 0),
+                past_limit: metrics(0, 0, 7, 0, 0),
+                reason: AdmissionRejectReason::AllocatedCpu,
+                slots: 64,
+            },
+            Case {
+                name: "max_allocated_memory_bytes",
+                configure: |config| config.max_allocated_memory_bytes = Some(256 * 1024 * 1024),
+                at_limit: metrics(0, 0, 0, 128 * 1024 * 1024, 0),
+                past_limit: metrics(0, 0, 0, 129 * 1024 * 1024, 0),
+                reason: AdmissionRejectReason::AllocatedMemory,
+                slots: 64,
+            },
+            Case {
+                name: "max_sandbox_count_including_paused",
+                configure: |config| config.max_sandbox_count_including_paused = Some(4),
+                at_limit: metrics(1, 0, 0, 0, 2),
+                past_limit: metrics(1, 0, 0, 0, 3),
+                reason: AdmissionRejectReason::SandboxCountIncludingPaused,
+                slots: 64,
+            },
+            Case {
+                name: "min_free_network_slots",
+                configure: |config| config.min_free_network_slots = Some(2),
+                at_limit: metrics(0, 0, 0, 0, 0),
+                past_limit: metrics(0, 0, 0, 0, 0),
+                reason: AdmissionRejectReason::NetworkSlots,
+                // A floor, not a ceiling: the request's own slot is already
+                // reserved when the check runs, so "exactly at the limit"
+                // means floor + 1 available.
+                slots: 3,
+            },
+        ];
+
+        for case in cases {
+            let mut config = config();
+            (case.configure)(&mut config);
+
+            let controller = AdmissionController::new(config.clone());
+            let at_limit = case.at_limit.clone();
+            controller
+                .try_admit(1, resources(2, 128), capacity(case.slots), || async move {
+                    Some(at_limit)
+                })
+                .await
+                .unwrap_or_else(|reason| {
+                    panic!(
+                        "{}: exactly at the limit must be admitted, got {reason:?}",
+                        case.name
+                    )
+                });
+
+            // The network-slot case is a floor rather than a ceiling, so it is
+            // pushed past by removing slots rather than by adding load.
+            let past_slots = if case.name == "min_free_network_slots" {
+                2
+            } else {
+                case.slots
+            };
+            let controller = AdmissionController::new(config);
+            let past_limit = case.past_limit.clone();
+            let rejection = controller
+                .try_admit(1, resources(2, 128), capacity(past_slots), || async move {
+                    Some(past_limit)
+                })
+                .await
+                .expect_err(&format!(
+                    "{}: one past the limit must be refused",
+                    case.name
+                ));
+            assert_eq!(rejection, case.reason, "{}", case.name);
+        }
+    }
+
+    /// The guard's release tests all asserted post-drop state, which a no-op
+    /// `commit` satisfies just as well as a correct one. Asserting the
+    /// in-flight counters while the guard is alive is what distinguishes them.
+    #[tokio::test]
+    async fn a_committed_guard_hands_its_reservation_over_rather_than_releasing_it() {
+        let mut config = config();
+        config.max_sandbox_count = Some(2);
+        // No metrics caching: this test is about what the guard does to the
+        // pending counters, and a cached snapshot would answer the second
+        // admission from the first one's zeroed metrics and hide it.
+        config.snapshot_max_age_ms = 0;
+        let controller = AdmissionController::new(config);
+
+        let guard = controller
+            .try_admit(2, resources(1, 128), capacity(64), empty_metrics)
+            .await
+            .expect("first admit");
+
+        // Two creates are in flight, so the gate must already be full even
+        // though no metrics snapshot reflects them yet.
+        controller
+            .try_admit(1, resources(1, 128), capacity(64), empty_metrics)
+            .await
+            .expect_err("the pending reservation must count against the limit");
+
+        guard.commit();
+
+        // Committed, not released: the sandboxes now exist, so a metrics
+        // snapshot that reports them must still fill the gate.
+        controller
+            .try_admit(1, resources(1, 128), capacity(64), || async {
+                Some(metrics(2, 0, 0, 0, 0))
+            })
+            .await
+            .expect_err("committed creates must still occupy the limit");
     }
 }

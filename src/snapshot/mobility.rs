@@ -104,7 +104,14 @@ impl MigrationFingerprint {
                 host: host.tools_drive_version.clone(),
             });
         }
-        if self.memory_page_size != host.memory_page_size {
+        // Zero means the page size could not be read, on either side. Two
+        // unknowns are not a match: comparing them for equality would let a
+        // pair of hosts that both failed to answer migrate to each other on
+        // the strength of a value neither of them has.
+        if self.memory_page_size == 0
+            || host.memory_page_size == 0
+            || self.memory_page_size != host.memory_page_size
+        {
             return Some(Reason::MemoryPageSize {
                 snapshot: self.memory_page_size,
                 host: host.memory_page_size,
@@ -622,5 +629,48 @@ mod tests {
         )
         .expect_err("both halves are unsatisfied");
         assert_eq!(blocker.kind(), "kernel_version");
+    }
+}
+
+#[cfg(test)]
+mod unknown_page_size_tests {
+    use super::*;
+    use crate::snapshot::SnapshotRuntimeVersions;
+    use crate::virtualization::VirtualizationMode;
+
+    fn fingerprint(page_size: u32) -> MigrationFingerprint {
+        MigrationFingerprint::from_runtime(
+            &SnapshotRuntimeVersions {
+                kernel_version: "vmlinux-6.1.175".to_string(),
+                firecracker_version: "1.15.1".to_string(),
+                envd_version: "0.5.15".to_string(),
+                tools_drive_version: "0.1.0".to_string(),
+            },
+            "x86_64",
+            VirtualizationMode::Kvm,
+            Some("{}".to_string()),
+            page_size,
+        )
+    }
+
+    /// A page size nobody could read must refuse the move. Almost every host
+    /// really is 4 KiB, so a guessed 4096 would match the other side and
+    /// permit a migration decided on a value neither host actually measured.
+    #[test]
+    fn an_unknown_page_size_never_matches() {
+        for (snapshot, host) in [(0, 4096), (4096, 0), (0, 0)] {
+            let reason = fingerprint(snapshot)
+                .incompatibility_with(&fingerprint(host))
+                .unwrap_or_else(|| {
+                    panic!("page sizes {snapshot}/{host} must not be treated as compatible")
+                });
+            assert_eq!(reason.kind(), "memory_page_size");
+        }
+
+        // And a genuine match still is one.
+        assert_eq!(
+            fingerprint(4096).incompatibility_with(&fingerprint(4096)),
+            None
+        );
     }
 }

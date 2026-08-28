@@ -28,17 +28,24 @@ pub fn detect_cpu_architecture() -> String {
     std::env::consts::ARCH.to_string()
 }
 
-/// This host's page size.
+/// This host's page size, or `0` when it cannot be determined.
 ///
 /// Part of a snapshot's compatibility fingerprint: a memory image's layout and
 /// its dirty-page tracking are both expressed in pages, so a destination with
-/// a different size cannot restore it. Falls back to 4 KiB, which is what
-/// every platform AgentENV runs on actually uses — a wrong answer here makes
-/// migration refuse rather than misbehave.
+/// a different size cannot restore it.
+///
+/// A failure reports `0` rather than assuming 4 KiB. Assuming is the wrong
+/// direction: almost every host really is 4 KiB, so a guessed 4096 would match
+/// the other side and *permit* a migration decided on a value nobody actually
+/// read. `0` matches nothing and is rejected by the fingerprint, so an
+/// unreadable page size refuses the move instead of waving it through.
 pub fn host_page_size() -> u32 {
     // SAFETY: `sysconf` is a pure query with no preconditions.
     let size = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) };
-    u32::try_from(size).unwrap_or(4096).max(1)
+    if size <= 0 {
+        return 0;
+    }
+    u32::try_from(size).unwrap_or(0)
 }
 pub use reporter::ObservabilityReporter;
 pub use roster::{roster_digest, RosterDigestState, RosterReport};

@@ -669,7 +669,6 @@ mod arbitration_tests {
     use crate::orchestrator::store::SandboxMetadata;
     use crate::snapshot::{ArtifactReach, SnapshotRuntimeVersions};
     use crate::virtualization::VirtualizationMode;
-    use std::sync::Arc;
 
     async fn parked() -> (LocalMobilityStore, SandboxId, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -828,10 +827,4 @@ mod arbitration_tests {
             "expecting no record must fail when one exists"
         );
     }
-
-    use std::sync::Arc as _Arc;
-    const _: fn() = || {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<_Arc<LocalMobilityStore>>();
-    };
 }
