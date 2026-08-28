@@ -44,6 +44,10 @@ type bindingCacheEntry struct {
 type CachingSchedulerClient struct {
 	schedulerv1.SchedulerClient
 
+	// disabled makes every lookup pass through, for a deployment that would
+	// rather pay the scheduler round trip than ever serve a stale binding.
+	disabled bool
+
 	mu          sync.Mutex
 	entries     map[string]bindingCacheEntry
 	ttl         time.Duration
@@ -52,8 +56,16 @@ type CachingSchedulerClient struct {
 	now         func() time.Time
 }
 
+// A negative TTL disables caching, so every lookup reaches the scheduler.
+//
+// Zero cannot mean that: it is what an unset config field looks like, and an
+// operator who never touched the setting must get the default rather than
+// silently lose the cache. Disabling has to be something someone chose.
 func NewCachingSchedulerClient(delegate schedulerv1.SchedulerClient, ttl time.Duration) *CachingSchedulerClient {
-	if ttl <= 0 {
+	if ttl < 0 {
+		return &CachingSchedulerClient{SchedulerClient: delegate, disabled: true}
+	}
+	if ttl == 0 {
 		ttl = defaultBindingCacheTTL
 	}
 	negative := defaultBindingCacheNegativeTTL
@@ -76,7 +88,7 @@ func (c *CachingSchedulerClient) LookupNode(
 	opts ...grpc.CallOption,
 ) (*schedulerv1.LookupNodeResponse, error) {
 	sandboxID := req.GetSandboxId()
-	if sandboxID == "" {
+	if c.disabled || sandboxID == "" {
 		return c.SchedulerClient.LookupNode(ctx, req, opts...)
 	}
 

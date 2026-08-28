@@ -8,6 +8,8 @@ mod local_store;
 pub mod logging;
 mod managed_secret;
 pub mod observability;
+#[cfg(test)]
+mod offswitch;
 pub mod orchestrator;
 pub mod overlaybd;
 pub mod p2p;
