@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use nix::errno::Errno;
+use nix::fcntl::{Flock, FlockArg};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -15,8 +17,6 @@ use crate::snapshot::{
     SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };
 const FILE_LOCK_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
-const ALIAS_LOCK_STALE_AGE: Duration = Duration::from_secs(60);
-const RECORD_LOCK_STALE_AGE: Duration = Duration::from_secs(60);
 
 pub struct PosixFsCatalogStore {
     root: PathBuf,
@@ -27,15 +27,21 @@ pub(crate) struct PublishSession {
     pub(crate) snapshot_id: SnapshotId,
 }
 
+/// Holds an exclusive advisory lock on a catalog lock file.
+///
+/// Ownership is kernel-enforced: dropping the guard closes the descriptor,
+/// which releases the `flock`, and the kernel releases it just the same if the
+/// process dies. There is no staleness heuristic to get wrong, and no window in
+/// which two holders both believe they own the lock.
+///
+/// The lock file is deliberately never unlinked. Unlinking it would let one
+/// holder remove a file another holder already has open and locked, so the next
+/// contender would create a fresh inode and lock that instead, admitting two
+/// writers. The files are empty, bounded by the number of aliases and records,
+/// and reused on every acquire.
 #[derive(Debug)]
 struct PosixFileLockGuard {
-    path: PathBuf,
-}
-
-impl Drop for PosixFileLockGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+    _lock: Flock<fs::File>,
 }
 
 impl PosixFsCatalogStore {
@@ -518,11 +524,23 @@ impl PosixFsCatalogStore {
         self.read_json(&path).map(Some)
     }
 
+    /// Takes an exclusive advisory lock on `lock_path`, retrying until the
+    /// timeout and then deferring to `on_locked`.
+    ///
+    /// This previously used `create_new` as the mutex and treated any lock file
+    /// older than a fixed age as abandoned, deleting it and retrying. The age
+    /// came from an mtime written once at creation and never refreshed, so a
+    /// holder still inside its critical section past that age had its lock
+    /// deleted and both parties proceeded. The guard then unlinked on drop with
+    /// no ownership check, so the original holder removed the thief's lock and
+    /// admitted a third — the failure compounded rather than settling.
+    ///
+    /// `flock` removes the staleness question entirely: the kernel releases the
+    /// lock when the descriptor closes, including on process death.
     fn acquire_file_lock(
         &self,
         lock_path: PathBuf,
         contents: String,
-        stale_age: Duration,
         label: &'static str,
         on_locked: impl Fn() -> RepositoryResult<PosixFileLockGuard>,
     ) -> RepositoryResult<PosixFileLockGuard> {
@@ -537,34 +555,28 @@ impl PosixFsCatalogStore {
 
         let deadline = FILE_LOCK_TIMEOUT.map(|timeout| Instant::now() + timeout);
         loop {
-            match fs::OpenOptions::new()
-                .create_new(true)
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
                 .write(true)
                 .open(&lock_path)
-            {
-                Ok(mut file) => {
-                    let guard = PosixFileLockGuard {
-                        path: lock_path.clone(),
-                    };
-                    file.write_all(contents.as_bytes()).map_err(|error| {
-                        RepositoryError::backend(
-                            format!("write {label} lock '{}'", lock_path.display()),
-                            error,
-                        )
-                    })?;
-                    return Ok(guard);
+                .map_err(|error| {
+                    RepositoryError::backend(
+                        format!("open {label} lock '{}'", lock_path.display()),
+                        error,
+                    )
+                })?;
+
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(mut lock) => {
+                    // Contents are diagnostic only; ownership is the flock.
+                    let _ = lock
+                        .set_len(0)
+                        .and_then(|()| lock.write_all(contents.as_bytes()));
+                    let _ = lock.flush();
+                    return Ok(PosixFileLockGuard { _lock: lock });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let stale = fs::metadata(&lock_path)
-                        .ok()
-                        .and_then(|meta| meta.modified().ok())
-                        .and_then(|modified| modified.elapsed().ok())
-                        .map(|age| age > stale_age)
-                        .unwrap_or(false);
-                    if stale {
-                        let _ = fs::remove_file(&lock_path);
-                        continue;
-                    }
+                Err((_, Errno::EWOULDBLOCK | Errno::EINTR)) => {
                     if let Some(deadline) = deadline {
                         if Instant::now() < deadline {
                             thread::sleep(Duration::from_millis(25));
@@ -573,10 +585,10 @@ impl PosixFsCatalogStore {
                     }
                     return on_locked();
                 }
-                Err(error) => {
+                Err((_, errno)) => {
                     return Err(RepositoryError::backend(
-                        format!("create {label} lock '{}'", lock_path.display()),
-                        error,
+                        format!("lock {label} lock '{}'", lock_path.display()),
+                        std::io::Error::from(errno),
                     ));
                 }
             }
@@ -588,7 +600,6 @@ impl PosixFsCatalogStore {
         self.acquire_file_lock(
             lock_path.clone(),
             std::process::id().to_string(),
-            ALIAS_LOCK_STALE_AGE,
             "alias",
             || {
                 Err(RepositoryError::Backend {
@@ -604,7 +615,6 @@ impl PosixFsCatalogStore {
         self.acquire_file_lock(
             lock_path.clone(),
             std::process::id().to_string(),
-            RECORD_LOCK_STALE_AGE,
             "record",
             || {
                 Err(RepositoryError::Backend {
@@ -993,5 +1003,104 @@ mod tests {
             .get(&unknown.to_string())
             .expect("valid UUID lookup should not error");
         assert!(result.is_none(), "non-existent snapshot should return None");
+    }
+
+    /// Two holders must never both believe they own the lock, however long the
+    /// first one holds it.
+    ///
+    /// The previous implementation treated a lock file older than a fixed age
+    /// as abandoned and deleted it, so a slow-but-live holder lost its lock to
+    /// a contender. `flock` has no such window: the second acquire blocks until
+    /// the first guard drops.
+    #[test]
+    fn file_lock_is_exclusive_while_held() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = PosixFsCatalogStore::new(root.path().to_path_buf());
+        let alias = SnapshotAlias::parse("exclusive-alias").expect("alias");
+
+        let held = store.acquire_alias_lock(&alias).expect("first acquire");
+
+        let contended = store.acquire_alias_lock(&alias);
+        assert!(
+            contended.is_err(),
+            "a second holder acquired a lock that was still held"
+        );
+
+        drop(held);
+        store
+            .acquire_alias_lock(&alias)
+            .expect("lock should be acquirable once released");
+    }
+
+    /// Releasing one lock must not disturb another.
+    ///
+    /// The previous guard unlinked the lock file on drop with no ownership
+    /// check, so a holder that had already lost its lock to a stale-steal went
+    /// on to delete the new owner's file, admitting a third writer. Nothing is
+    /// unlinked now, so this cannot recur.
+    #[test]
+    fn releasing_one_lock_does_not_release_another() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = PosixFsCatalogStore::new(root.path().to_path_buf());
+        let first = SnapshotAlias::parse("alias-one").expect("alias");
+        let second = SnapshotAlias::parse("alias-two").expect("alias");
+
+        let first_guard = store.acquire_alias_lock(&first).expect("first acquire");
+        let second_guard = store.acquire_alias_lock(&second).expect("second acquire");
+
+        drop(first_guard);
+
+        assert!(
+            store.acquire_alias_lock(&second).is_err(),
+            "dropping an unrelated lock released a lock that was still held"
+        );
+        drop(second_guard);
+    }
+
+    /// Exactly one of many concurrent contenders may hold the lock at a time.
+    #[test]
+    fn concurrent_contenders_serialize_on_the_lock() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(PosixFsCatalogStore::new(root.path().to_path_buf()));
+        let inside = Arc::new(AtomicUsize::new(0));
+        let overlaps = Arc::new(AtomicUsize::new(0));
+        let acquired = Arc::new(AtomicUsize::new(0));
+
+        thread::scope(|scope| {
+            for _ in 0..8 {
+                let store = Arc::clone(&store);
+                let inside = Arc::clone(&inside);
+                let overlaps = Arc::clone(&overlaps);
+                let acquired = Arc::clone(&acquired);
+                scope.spawn(move || {
+                    let alias = SnapshotAlias::parse("contended-alias").expect("alias");
+                    let Ok(guard) = store.acquire_alias_lock(&alias) else {
+                        return;
+                    };
+                    acquired.fetch_add(1, Ordering::SeqCst);
+                    if inside.fetch_add(1, Ordering::SeqCst) != 0 {
+                        overlaps.fetch_add(1, Ordering::SeqCst);
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                    inside.fetch_sub(1, Ordering::SeqCst);
+                    drop(guard);
+                });
+            }
+        });
+
+        assert_eq!(
+            overlaps.load(Ordering::SeqCst),
+            0,
+            "two contenders were inside the critical section at once"
+        );
+        assert!(
+            acquired.load(Ordering::SeqCst) > 0,
+            "no contender ever acquired the lock"
+        );
     }
 }
