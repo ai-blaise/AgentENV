@@ -188,3 +188,14 @@ var (
 		},
 	)
 )
+
+// schedulerSandboxEventsLostTotal counts lifecycle events a node reported
+// emitting that never arrived. A persistently non-zero rate means the
+// scheduler's short-term view of that node is running behind reality.
+var schedulerSandboxEventsLostTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "agentenv_scheduler_sandbox_events_lost_total",
+		Help: "Sandbox lifecycle events a node emitted that the scheduler never received.",
+	},
+	[]string{"node_id"},
+)

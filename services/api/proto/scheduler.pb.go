@@ -1394,7 +1394,7 @@ func (x *ObservedNode) GetLastSeenUnixMs() int64 {
 //	12  p2p_artifacts           (reserved for the P2P index re-announce)
 //	13  roster_digest           (allocated, defined below)
 //	14  roster_full             (allocated, defined below)
-//	15  last_event_seq          (reserved for the sequenced worker outbox)
+//	15  emitted_event_count     (allocated, defined below)
 //	16  roster_generation       (reserved for the sequenced worker outbox)
 //
 // Observed-usage fields are allocated on NodeSnapshot (17-19), not here.
@@ -1438,9 +1438,21 @@ type HeartbeatRequest struct {
 	// node — asks for the roster back via HeartbeatResponse.request_full_roster
 	// rather than guessing, because an elided roster and an empty one are
 	// indistinguishable on the wire and mean opposite things.
-	RosterFull    bool `protobuf:"varint,14,opt,name=roster_full,json=rosterFull,proto3" json:"roster_full,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	RosterFull bool `protobuf:"varint,14,opt,name=roster_full,json=rosterFull,proto3" json:"roster_full,omitempty"`
+	// How many sandbox lifecycle events this node has emitted since it started.
+	//
+	// Event delivery is best effort and fire-and-forget, so a dropped batch
+	// skews the scheduler's short-term view of the node with nothing to say it
+	// happened. Comparing this against what the scheduler received turns silent
+	// loss into a number. It is not a sequence number and nothing is
+	// retransmitted: the reservation ledger is reset by every heartbeat anyway,
+	// so loss self-corrects within one interval — what was missing was any way
+	// to know it was happening.
+	//
+	// Zero means the node does not report one.
+	EmittedEventCount uint64 `protobuf:"varint,15,opt,name=emitted_event_count,json=emittedEventCount,proto3" json:"emitted_event_count,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *HeartbeatRequest) Reset() {
@@ -1562,6 +1574,13 @@ func (x *HeartbeatRequest) GetRosterFull() bool {
 		return x.RosterFull
 	}
 	return false
+}
+
+func (x *HeartbeatRequest) GetEmittedEventCount() uint64 {
+	if x != nil {
+		return x.EmittedEventCount
+	}
+	return 0
 }
 
 type HeartbeatResponse struct {
@@ -2667,7 +2686,7 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x06commit\x18\x06 \x01(\tR\x06commit\x12<\n" +
 	"\fmachine_info\x18\a \x01(\v2\x19.scheduler.v1.MachineInfoR\vmachineInfo\x126\n" +
 	"\bsnapshot\x18\b \x01(\v2\x1a.scheduler.v1.NodeSnapshotR\bsnapshot\x12)\n" +
-	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\xb6\x04\n" +
+	"\x11last_seen_unix_ms\x18\t \x01(\x03R\x0elastSeenUnixMs\"\xe0\x04\n" +
 	"\x10HeartbeatRequest\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1d\n" +
 	"\n" +
@@ -2685,7 +2704,8 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x15heartbeat_interval_ms\x18\v \x01(\x04R\x13heartbeatIntervalMs\x12#\n" +
 	"\rroster_digest\x18\r \x01(\tR\frosterDigest\x12\x1f\n" +
 	"\vroster_full\x18\x0e \x01(\bR\n" +
-	"rosterFullJ\x04\b\f\x10\rJ\x04\b\x0f\x10\x10J\x04\b\x10\x10\x11\"\xa1\x01\n" +
+	"rosterFull\x12.\n" +
+	"\x13emitted_event_count\x18\x0f \x01(\x04R\x11emittedEventCountJ\x04\b\f\x10\rJ\x04\b\x10\x10\x11\"\xa1\x01\n" +
 	"\x11HeartbeatResponse\x12&\n" +
 	"\x0fcpu_config_json\x18\x01 \x01(\tR\rcpuConfigJson\x12.\n" +
 	"\x13request_full_roster\x18\x02 \x01(\bR\x11requestFullRoster\x124\n" +

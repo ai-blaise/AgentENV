@@ -1,5 +1,5 @@
 use std::cmp;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -97,6 +97,10 @@ impl ObservabilityReporter {
         let mut sandbox_event_rx = event_service.subscribe_sandbox_events();
 
         let kill_switch = super::global_kill_switch();
+        // Shared because production and reporting run in separate tasks: the
+        // event loop counts, the heartbeat loop reports.
+        let emitted_events = Arc::new(AtomicU64::new(0));
+        let heartbeat_emitted = Arc::clone(&emitted_events);
         let heartbeat_join = tokio::spawn(async move {
             let mut backoff = config.interval;
             let mut wait = Duration::from_millis(100);
@@ -123,6 +127,7 @@ impl ObservabilityReporter {
                     &mut pending_cpu_config_json,
                     p2p_endpoint.as_ref(),
                     &mut rosters,
+                    heartbeat_emitted.load(Ordering::Relaxed),
                 )
                 .await
                 {
@@ -175,7 +180,7 @@ impl ObservabilityReporter {
                             return;
                         }
                     }
-                    events = Self::recv_sandbox_event_batch(&mut sandbox_event_rx) => {
+                    events = Self::recv_sandbox_event_batch(&mut sandbox_event_rx, &emitted_events) => {
                         let Some(events) = events else {
                             return;
                         };
@@ -269,6 +274,7 @@ impl ObservabilityReporter {
         cpu_config_json: &mut Option<String>,
         p2p_endpoint: Option<&P2pEndpoint>,
         rosters: &mut RosterDigestState,
+        emitted_events: u64,
     ) -> Result<()> {
         let mut snapshot = service
             .node_snapshot()
@@ -278,8 +284,14 @@ impl ObservabilityReporter {
         let node_id = snapshot.node_id.clone();
         let now_ms = chrono::Utc::now().timestamp_millis();
         let roster = rosters.report(&snapshot.sandbox_ids);
-        let req =
-            Self::build_heartbeat_request(snapshot, now_ms, p2p_endpoint, config.interval, roster);
+        let req = Self::build_heartbeat_request(
+            snapshot,
+            now_ms,
+            p2p_endpoint,
+            config.interval,
+            roster,
+            emitted_events,
+        );
 
         let mut request = Request::new(req);
         request.set_timeout(GRPC_CALL_TIMEOUT);
@@ -317,14 +329,24 @@ impl ObservabilityReporter {
         Ok(())
     }
 
+    /// Drains a batch of lifecycle events, counting every event the node
+    /// produced — including ones dropped before they could be batched.
+    ///
+    /// `emitted` is what the heartbeat reports so the scheduler can compare it
+    /// against what arrived. It counts production rather than successful
+    /// delivery, because both ways an event goes missing — a lagged receiver
+    /// here, a failed RPC later — leave the scheduler's view of this node
+    /// behind reality, and only the node can see the first.
     async fn recv_sandbox_event_batch(
         rx: &mut broadcast::Receiver<SandboxLifecycleEvent>,
+        emitted: &AtomicU64,
     ) -> Option<Vec<SandboxLifecycleEvent>> {
         let first = loop {
             match rx.recv().await {
                 Ok(event) => break event,
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     warn!(skipped, "observability sandbox event receiver lagged");
+                    emitted.fetch_add(skipped, Ordering::Relaxed);
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     debug!("observability sandbox event channel closed");
@@ -341,6 +363,7 @@ impl ObservabilityReporter {
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                     warn!(skipped, "observability sandbox event receiver lagged");
+                    emitted.fetch_add(skipped, Ordering::Relaxed);
                 }
                 Err(broadcast::error::TryRecvError::Closed) => {
                     debug!("observability sandbox event channel closed");
@@ -349,6 +372,7 @@ impl ObservabilityReporter {
             }
         }
 
+        emitted.fetch_add(events.len() as u64, Ordering::Relaxed);
         Some(events)
     }
 
@@ -386,6 +410,7 @@ impl ObservabilityReporter {
         p2p_endpoint: Option<&P2pEndpoint>,
         interval: Duration,
         roster: super::RosterReport,
+        emitted_events: u64,
     ) -> scheduler::HeartbeatRequest {
         scheduler::HeartbeatRequest {
             node_id: snapshot.node_id,
@@ -439,6 +464,7 @@ impl ObservabilityReporter {
             roster_full: roster.sandbox_ids.is_some(),
             sandbox_ids: roster.sandbox_ids.unwrap_or_default(),
             roster_digest: roster.digest,
+            emitted_event_count: emitted_events,
             p2p_endpoint: p2p_endpoint.map(|endpoint| scheduler::P2pEndpoint {
                 backend: endpoint.backend.clone(),
                 address: endpoint.address.clone(),

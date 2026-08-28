@@ -39,6 +39,8 @@ type Service struct {
 	candidateSampleSize int
 	// rosters lets a node skip resending an unchanged sandbox roster.
 	rosters *rosterCache
+	// eventLoss turns silently dropped lifecycle event batches into a number.
+	eventLoss *eventLossTracker
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -57,6 +59,7 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		ledger:              NewReservationLedger(0),
 		candidateSampleSize: defaultCandidateSampleSize,
 		rosters:             newRosterCache(),
+		eventLoss:           newEventLossTracker(),
 		store:               store,
 		artifacts:           NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
 	}
@@ -369,6 +372,14 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 	// carrying for this node is now either included in it or lost.
 	s.ledger.Reset(nodeID)
 
+	if missed := s.eventLoss.observeEmitted(nodeID, req.GetEmittedEventCount()); missed > 0 {
+		s.logger.Warn("scheduler did not receive every sandbox event a node emitted",
+			zap.String("node_id", nodeID),
+			zap.Uint64("missed_events", missed),
+		)
+		schedulerSandboxEventsLostTotal.WithLabelValues(nodeID).Add(float64(missed))
+	}
+
 	completeness := RosterIncomplete
 	if req.GetRosterComplete() {
 		completeness = RosterComplete
@@ -455,6 +466,7 @@ func (s *Service) ReportSandboxEvent(_ context.Context, req *schedulerv1.ReportS
 	}
 
 	s.ledger.Apply(nodeID, req.GetEvents(), time.Now())
+	s.eventLoss.observeReceived(nodeID, len(req.GetEvents()))
 	s.logger.Debug("scheduler applied sandbox event batch",
 		zap.String("node_id", nodeID),
 		zap.String("service_instance_id", req.GetServiceInstanceId()),
@@ -583,8 +595,10 @@ func (s *Service) UnregisterNode(_ context.Context, req *schedulerv1.UnregisterN
 	now := time.Now()
 	s.ledger.Forget(nodeID)
 	// A node that comes back is asked for a fresh roster rather than
-	// reconciled against whatever it had before it left.
+	// reconciled against whatever it had before it left, and is not credited
+	// with the events of the process that left.
 	s.rosters.forget(nodeID)
+	s.eventLoss.forget(nodeID)
 	if err := s.store.ReconcileNodeRoster(Node{ID: nodeID}, nil, RosterFinal, now); err != nil {
 		s.logger.Warn("scheduler unregister binding reconcile failed",
 			zap.String("node_id", nodeID),

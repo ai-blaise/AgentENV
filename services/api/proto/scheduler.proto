@@ -197,7 +197,7 @@ message ObservedNode {
 //   12  p2p_artifacts           (reserved for the P2P index re-announce)
 //   13  roster_digest           (allocated, defined below)
 //   14  roster_full             (allocated, defined below)
-//   15  last_event_seq          (reserved for the sequenced worker outbox)
+//   15  emitted_event_count     (allocated, defined below)
 //   16  roster_generation       (reserved for the sequenced worker outbox)
 //
 // Observed-usage fields are allocated on NodeSnapshot (17-19), not here.
@@ -246,7 +246,20 @@ message HeartbeatRequest {
   // indistinguishable on the wire and mean opposite things.
   bool roster_full = 14;
 
-  reserved 12, 15, 16;
+  // How many sandbox lifecycle events this node has emitted since it started.
+  //
+  // Event delivery is best effort and fire-and-forget, so a dropped batch
+  // skews the scheduler's short-term view of the node with nothing to say it
+  // happened. Comparing this against what the scheduler received turns silent
+  // loss into a number. It is not a sequence number and nothing is
+  // retransmitted: the reservation ledger is reset by every heartbeat anyway,
+  // so loss self-corrects within one interval — what was missing was any way
+  // to know it was happening.
+  //
+  // Zero means the node does not report one.
+  uint64 emitted_event_count = 15;
+
+  reserved 12, 16;
 }
 
 message HeartbeatResponse {
