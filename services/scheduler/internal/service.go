@@ -34,6 +34,9 @@ type Service struct {
 	// snapshot, closing the window in which a burst of creates all read the
 	// same stale numbers. Advisory only; see ReservationLedger.
 	ledger *ReservationLedger
+	// candidateSampleSize bounds how many nodes one placement inspects. Zero
+	// disables sampling and restores whole-fleet evaluation.
+	candidateSampleSize int
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -44,14 +47,15 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		nodes = NewAtomicNodeRegistry(nil, defaultObservedReportTTL)
 	}
 	s := &Service{
-		logger:            logger,
-		nodes:             nodes,
-		strategy:          strategy,
-		reportTTL:         defaultObservedReportTTL,
-		healthGateEnabled: true,
-		ledger:            NewReservationLedger(0),
-		store:             store,
-		artifacts:         NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
+		logger:              logger,
+		nodes:               nodes,
+		strategy:            strategy,
+		reportTTL:           defaultObservedReportTTL,
+		healthGateEnabled:   true,
+		ledger:              NewReservationLedger(0),
+		candidateSampleSize: defaultCandidateSampleSize,
+		store:               store,
+		artifacts:           NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -81,6 +85,16 @@ func WithReportTTL(ttl time.Duration) ServiceOption {
 	return func(s *Service) {
 		if ttl > 0 {
 			s.reportTTL = ttl
+		}
+	}
+}
+
+// WithCandidateSampleSize bounds how many nodes one placement inspects. Zero
+// evaluates the whole fleet, which is what the pre-sampling behaviour did.
+func WithCandidateSampleSize(size int) ServiceOption {
+	return func(s *Service) {
+		if size >= 0 {
+			s.candidateSampleSize = size
 		}
 	}
 }
@@ -118,7 +132,12 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	}()
 
 	now := time.Now()
-	discovered := s.nodes.Snapshot( /* allowLingering */ false)
+	// Inspect a bounded sample rather than the whole fleet. The decision does
+	// not need the full list: it already runs against a view up to a heartbeat
+	// interval stale and is corrected by the node's own admission decision.
+	// Sampling inside the registry avoids copying and sorting the fleet just to
+	// discard almost all of it.
+	discovered := s.nodes.SampleNodes(s.candidateSampleSize /* allowLingering */, false)
 	rich := make([]RichNode, 0, len(discovered))
 	for _, n := range discovered {
 		snapshot, health := s.nodes.PeekObservedHealth(n.ID)

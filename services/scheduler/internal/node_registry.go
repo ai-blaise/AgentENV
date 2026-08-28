@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"errors"
+	"math/rand"
 	"sort"
 	"strings"
 	"sync"
@@ -29,6 +30,9 @@ type NodeRegistry interface {
 	// PeekObservedHealth returns the same snapshot alongside the liveness facts
 	// scheduling needs to decide whether the node should receive new work.
 	PeekObservedHealth(nodeID string) (*schedulerv1.NodeSnapshot, ObservedHealth)
+	// SampleNodes returns at most `size` schedulable nodes without
+	// materializing the whole fleet. Zero means no bound.
+	SampleNodes(size int, allowLingering bool) []Node
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
 }
 
@@ -91,6 +95,43 @@ func (r *AtomicNodeRegistry) Snapshot(allowLingering bool) []Node {
 		return result[i].ID < result[j].ID
 	})
 	return result
+}
+
+// SampleNodes returns at most `size` schedulable nodes chosen uniformly at
+// random, without materializing or sorting the whole fleet.
+//
+// Snapshot exists to give callers a stable, sorted view; placement wants
+// neither. Going through it meant every request copied and sorted the entire
+// node list before discarding all but a handful, which is what kept placement
+// linear in fleet size even once per-node snapshot cloning was bounded.
+//
+// A size of zero means "no bound" and falls back to Snapshot, preserving the
+// previous whole-fleet behaviour exactly.
+func (r *AtomicNodeRegistry) SampleNodes(size int, allowLingering bool) []Node {
+	if size <= 0 {
+		return r.Snapshot(allowLingering)
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	sampled := make([]Node, 0, size)
+	seen := 0
+	for _, node := range r.nodesByID {
+		if r.lingeringIDs[node.ID] && !allowLingering {
+			continue
+		}
+		// Reservoir sampling over the map's iteration order. Go randomizes that
+		// order per iteration, but relying on it would be relying on an
+		// implementation detail, so the reservoir does the work.
+		if len(sampled) < size {
+			sampled = append(sampled, node)
+		} else if j := rand.Intn(seen + 1); j < size {
+			sampled[j] = node
+		}
+		seen++
+	}
+	return sampled
 }
 
 func (r *AtomicNodeRegistry) Contains(node Node) bool {
