@@ -560,6 +560,37 @@ pub struct OrchestratorConfig {
         parse_env = parse_required_path
     )]
     pub persisted_sandbox_store_path: PathBuf,
+    #[config(nested)]
+    pub admission: OrchestratorAdmissionConfig,
+}
+
+#[derive(Debug, Config, Clone)]
+pub struct OrchestratorAdmissionConfig {
+    /// Maximum number of VMs that may be booting or resuming concurrently.
+    /// Zero disables this individual limit.
+    #[config(default = 64u64, env = "AENV_ADMISSION_MAX_STARTING_SANDBOXES")]
+    pub max_starting_sandboxes: u64,
+    /// Maximum number of non-paused sandboxes. Zero disables this individual limit.
+    #[config(default = 0u64, env = "AENV_ADMISSION_MAX_ACTIVE_SANDBOXES")]
+    pub max_active_sandboxes: u64,
+    /// Maximum number of active plus paused sandboxes. Zero disables this individual limit.
+    #[config(default = 0u64, env = "AENV_ADMISSION_MAX_TOTAL_SANDBOXES")]
+    pub max_total_sandboxes: u64,
+    /// Maximum aggregate vCPU reservation for non-paused sandboxes.
+    /// Zero disables this individual limit.
+    #[config(default = 0u64, env = "AENV_ADMISSION_MAX_ALLOCATED_VCPUS")]
+    pub max_allocated_vcpus: u64,
+    /// Maximum aggregate memory reservation, in MiB, for non-paused sandboxes.
+    /// Zero disables this individual limit.
+    #[config(default = 0u64, env = "AENV_ADMISSION_MAX_ALLOCATED_MEMORY_MIB")]
+    pub max_allocated_memory_mib: u64,
+    /// Maximum aggregate rootfs virtual size, in MiB, including paused sandboxes.
+    /// Zero disables this individual limit.
+    #[config(default = 0u64, env = "AENV_ADMISSION_MAX_ALLOCATED_DISK_MIB")]
+    pub max_allocated_disk_mib: u64,
+    /// Conservative rootfs reservation used while a fresh image's virtual size is unresolved.
+    #[config(default = 8192u32, env = "AENV_ADMISSION_UNKNOWN_DISK_RESERVATION_MIB")]
+    pub unknown_disk_reservation_mib: u32,
 }
 
 /// Custom extension service integration.
@@ -636,6 +667,7 @@ impl_config_default!(
     ClusterConfig,
     NodeIdentityConfig,
     OrchestratorConfig,
+    OrchestratorAdmissionConfig,
     P2pConfig,
     CustomExtensionConfig,
 );
@@ -930,6 +962,18 @@ impl AppConfig {
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
+        self.validate_orchestrator_admission()?;
+        Ok(())
+    }
+
+    fn validate_orchestrator_admission(&self) -> Result<()> {
+        let admission = &self.orchestrator.admission;
+        if admission.max_allocated_disk_mib != 0 && admission.unknown_disk_reservation_mib == 0 {
+            bail!(
+                "orchestrator.admission.unknown_disk_reservation_mib must be > 0 when the disk \
+                 limit is enabled"
+            );
+        }
         Ok(())
     }
 
@@ -1465,6 +1509,20 @@ mod tests {
         config
             .validate()
             .expect("disabled disk rate limit config is not validated");
+    }
+
+    #[test]
+    fn admission_disk_limit_requires_unknown_size_reservation() {
+        let mut config = AppConfig::default();
+        config.orchestrator.admission.max_allocated_disk_mib = 1024;
+        config.orchestrator.admission.unknown_disk_reservation_mib = 0;
+
+        let error = config
+            .validate()
+            .expect_err("enabled disk admission must account for unresolved images");
+        assert!(error
+            .to_string()
+            .contains("unknown_disk_reservation_mib must be > 0"));
     }
 
     #[test]

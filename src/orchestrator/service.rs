@@ -23,6 +23,7 @@ use crate::sandbox::{
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
 
+use super::admission::{AdmissionController, AdmissionLimits};
 use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
@@ -107,6 +108,7 @@ pub struct Orchestrator<
     shutdown_outcome: OnceCell<ShutdownOutcome>,
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
+    admission: AdmissionController,
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
@@ -178,9 +180,28 @@ where
                     .map(|paused_state| (metadata.id, Arc::clone(paused_state)))
             })
             .collect();
+        let paused_admission_allocations = persisted
+            .iter()
+            .filter(|metadata| metadata.state == SandboxState::Paused)
+            .map(|metadata| (metadata.id, metadata.resources))
+            .collect::<Vec<_>>();
         for metadata in persisted {
             store.add(metadata).await?;
         }
+
+        let admission_config = &config.admission;
+        let admission = AdmissionController::new(
+            AdmissionLimits {
+                max_active_sandboxes: admission_config.max_active_sandboxes,
+                max_starting_sandboxes: admission_config.max_starting_sandboxes,
+                max_total_sandboxes: admission_config.max_total_sandboxes,
+                max_allocated_vcpus: admission_config.max_allocated_vcpus,
+                max_allocated_memory_mib: admission_config.max_allocated_memory_mib,
+                max_allocated_disk_mib: admission_config.max_allocated_disk_mib,
+                unknown_disk_reservation_mib: admission_config.unknown_disk_reservation_mib,
+            },
+            paused_admission_allocations,
+        );
 
         let orchestrator = Arc::new(Self {
             store,
@@ -197,6 +218,7 @@ where
             shutdown_outcome: OnceCell::new(),
             image_refs,
             access_tokens,
+            admission,
         });
 
         // Start the auto-evict task.
@@ -576,6 +598,26 @@ where
             })
             .collect::<Vec<_>>();
 
+        let mut admission_reservation = match self.admission.reserve_creates(
+            children_spec
+                .iter()
+                .map(|child| (child.sandbox_id, source_metadata.resources)),
+        ) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                let _ = self
+                    .store
+                    .update_state_if_state(
+                        &source_sandbox_id,
+                        SandboxState::Running,
+                        &[SandboxState::Forking],
+                    )
+                    .await;
+                self.counters.record_create_fail(u64::from(count));
+                return Err(OrchestratorError::from(error));
+            }
+        };
+
         // Start to fork the sandbox.
         // This is a single operation that will return a list of results for each child sandbox.
         let fork_result = {
@@ -595,6 +637,7 @@ where
                         sandbox.stop().await
                     };
                     self.store.remove(&source_sandbox_id).await?;
+                    self.admission.remove(&source_sandbox_id);
                 } else {
                     let _ = self
                         .store
@@ -636,6 +679,7 @@ where
                 Ok(backend) => backend,
                 Err(err) => {
                     warn!(%sandbox_id, error = ?err, "failed to start forked sandbox");
+                    admission_reservation.rollback_one(sandbox_id);
                     outcomes.push(Err(Self::fork_child_error(sandbox_id, err)));
                     continue;
                 }
@@ -652,6 +696,7 @@ where
                 Ok(proxy_target) => proxy_target,
                 Err(err) => {
                     Self::stop_failed_fork(backend, sandbox_id).await;
+                    admission_reservation.rollback_one(sandbox_id);
                     outcomes.push(Err(Self::fork_child_error(
                         sandbox_id,
                         anyhow::Error::new(err),
@@ -662,6 +707,7 @@ where
             if let Err(err) = self.store.add(metadata.clone()).await {
                 warn!(%sandbox_id, error = ?err, "failed to register forked sandbox");
                 Self::stop_failed_fork(backend, sandbox_id).await;
+                admission_reservation.rollback_one(sandbox_id);
                 outcomes.push(Err(Self::fork_child_error(
                     sandbox_id,
                     anyhow::Error::new(err),
@@ -673,6 +719,7 @@ where
                 .await
                 .insert(metadata.id, Arc::new(Mutex::new(backend)));
             self.upsert_proxy_route(metadata.id, proxy_target).await;
+            admission_reservation.commit_active(metadata.id, metadata.resources);
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Fork,
                 metadata.id,
@@ -1059,6 +1106,7 @@ where
         }
         self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
             .await;
+        self.admission.remove(&sandbox_id);
         info!("sandbox deleted");
 
         Ok(())
@@ -1199,6 +1247,7 @@ where
             self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                 .await;
             self.store.remove(&sandbox_id).await?;
+            self.admission.remove(&sandbox_id);
             return Err(OrchestratorError::SandboxNotFound(sandbox_id));
         };
 
@@ -1226,6 +1275,7 @@ where
                         warn!(error = ?stop_err, "failed to stop sandbox after terminal pause failure");
                     }
                     self.store.remove(&sandbox_id).await?;
+                    self.admission.remove(&sandbox_id);
                 } else {
                     self.sandboxes.write().await.insert(sandbox_id, handle);
                     self.restore_proxy_route(sandbox_id, removed_proxy_route)
@@ -1285,6 +1335,7 @@ where
                 if let Err(error) = self.store.remove(&sandbox_id).await {
                     warn!(error = ?error, "failed to remove sandbox after pause failure");
                 }
+                self.admission.remove(&sandbox_id);
             } else {
                 self.sandboxes.write().await.insert(sandbox_id, handle);
                 self.restore_proxy_route(sandbox_id, removed_proxy_route)
@@ -1314,6 +1365,8 @@ where
         };
         if let Err(err) = stop_result {
             warn!(error = ?err, "failed to stop sandbox after pausing");
+        } else {
+            self.admission.mark_paused(sandbox_id, resources);
         }
         self.publish_sandbox_event(SandboxLifecycleEventType::Pause, sandbox_id, resources);
         info!("sandbox paused");
@@ -2046,6 +2099,18 @@ where
 
         let sandbox_id = plan.sandbox_id();
         let transitional_state = plan.transitional_state();
+        let admission_result = match &plan {
+            LaunchPlan::Create(_) => self.admission.reserve_create(sandbox_id, plan.resources()),
+            LaunchPlan::Resume(_) => self.admission.reserve_resume(sandbox_id, plan.resources()),
+        };
+        let mut admission_reservation = match admission_result {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.rollback_failed_launch_metadata(&plan, transitional_state)
+                    .await;
+                return Err(OrchestratorError::from(error));
+            }
+        };
 
         // Build and start the sandbox first, before making any state changes, so that we don't
         // have to roll back any persisted state if the build fails.
@@ -2209,6 +2274,7 @@ where
             }
         }
 
+        admission_reservation.commit_active(sandbox_id, final_metadata.resources);
         info!("sandbox launch completed");
         Ok(final_metadata)
     }

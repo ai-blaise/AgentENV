@@ -203,6 +203,18 @@ auto_resume_min_sandbox_timeout_secs = 300
 # Durable paused-sandbox metadata restored after a server restart.
 # persisted_sandbox_store_path = "$AENV_HOME/persisted-sandboxes"
 
+[orchestrator.admission]
+# Concurrent boot/resume cap. Set any admission limit to 0 to disable that
+# individual dimension.
+max_starting_sandboxes = 64
+# max_active_sandboxes = 0
+# max_total_sandboxes = 0
+# max_allocated_vcpus = 0
+# max_allocated_memory_mib = 0
+# max_allocated_disk_mib = 0
+# Conservative reservation while a fresh image's virtual size is unresolved.
+unknown_disk_reservation_mib = 8192
+
 [snapshot]
 # Node-local cache for snapshot artifacts.
 # local_cache_path = "$AENV_HOME/snapshot-local-cache"

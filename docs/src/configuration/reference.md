@@ -274,6 +274,22 @@ Sandbox lifecycle management.
 | `auto_resume_min_sandbox_timeout_secs` | integer | `300` | When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration |
 | `persisted_sandbox_store_path` | string | `"$AENV_HOME/persisted-sandboxes"` | Directory for persisted sandbox state |
 
+### `[orchestrator.admission]`
+
+Host-local admission limits are enforced atomically across create, fork, and resume operations.
+Paused sandboxes retain total-sandbox and disk reservations but release active-sandbox, vCPU, and
+memory reservations. A value of `0` disables only that limit.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `max_starting_sandboxes` | integer | `64` | Maximum concurrent creates and resumes |
+| `max_active_sandboxes` | integer | `0` | Maximum non-paused sandboxes |
+| `max_total_sandboxes` | integer | `0` | Maximum active plus paused sandboxes |
+| `max_allocated_vcpus` | integer | `0` | Maximum aggregate active vCPU reservation |
+| `max_allocated_memory_mib` | integer | `0` | Maximum aggregate active memory reservation in MiB |
+| `max_allocated_disk_mib` | integer | `0` | Maximum aggregate rootfs virtual size in MiB, including paused sandboxes |
+| `unknown_disk_reservation_mib` | integer | `8192` | Temporary rootfs reservation for fresh images whose virtual size is not known until device creation |
+
 ## `[pool]`
 
 Shared process-wide warm-pool defaults used by network slots, block devices, and pre-spawned Firecracker processes. Pools prewarm to the low watermark, then grow the refill target geometrically toward the high watermark when real acquisitions drain the pool.

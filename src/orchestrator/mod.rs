@@ -1,3 +1,4 @@
+mod admission;
 mod launch_plan;
 mod metrics;
 mod persistence;
@@ -8,6 +9,8 @@ mod types;
 
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
+
+use admission::AdmissionError;
 
 pub use metrics::OrchestratorMetrics;
 pub use persistence::{
@@ -59,6 +62,16 @@ pub enum OrchestratorError {
     #[error("orchestrator is shutting down")]
     ShuttingDown,
 
+    #[error(
+        "sandbox admission denied: {resource} limit {limit}, currently used {used}, requested {requested}"
+    )]
+    AdmissionDenied {
+        resource: &'static str,
+        limit: u64,
+        used: u64,
+        requested: u64,
+    },
+
     #[error("sandbox {0} not found")]
     SandboxNotFound(SandboxId),
 
@@ -96,6 +109,25 @@ pub enum OrchestratorError {
 
     #[error("internal error: {0}")]
     InternalError(String),
+}
+
+impl From<AdmissionError> for OrchestratorError {
+    fn from(value: AdmissionError) -> Self {
+        match value {
+            AdmissionError::Denied {
+                resource,
+                limit,
+                used,
+                requested,
+            } => Self::AdmissionDenied {
+                resource,
+                limit,
+                used,
+                requested,
+            },
+            error => Self::InternalError(error.to_string()),
+        }
+    }
 }
 
 impl From<store::StoreError> for OrchestratorError {

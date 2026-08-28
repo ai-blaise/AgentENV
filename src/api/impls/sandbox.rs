@@ -52,6 +52,7 @@ impl From<OrchestratorError> for models::Error {
             OrchestratorError::ShuttingDown => {
                 Self::new(503, "orchestrator is shutting down".to_string())
             }
+            OrchestratorError::AdmissionDenied { .. } => Self::new(503, err.to_string()),
             OrchestratorError::SandboxNotFound(id) => sandbox_not_found(id),
             OrchestratorError::InvalidSandboxState { .. } => Self::new(400, err.to_string()),
             OrchestratorError::SandboxOperationFailed {

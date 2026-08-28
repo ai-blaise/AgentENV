@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
+use super::super::admission::AdmissionUsage;
 use super::super::launch_plan::LaunchPlan;
 use super::super::persistence::{
     DisabledSandboxPersister, RecordingCall, RecordingPersister, SandboxPersister,
@@ -101,6 +102,24 @@ fn make_orchestrator_without_background_with_factory_and_persister<
     factory: F,
     persister: P,
 ) -> Arc<TestOrchestrator<S, F, P>> {
+    make_orchestrator_without_background_with_admission(
+        store,
+        factory,
+        persister,
+        AdmissionLimits::default(),
+    )
+}
+
+fn make_orchestrator_without_background_with_admission<
+    S: MetadataStore + 'static,
+    F: SandboxBackendFactory,
+    P: SandboxPersister + 'static,
+>(
+    store: S,
+    factory: F,
+    persister: P,
+    admission_limits: AdmissionLimits,
+) -> Arc<TestOrchestrator<S, F, P>> {
     let (sandbox_event_tx, _sandbox_event_rx) =
         tokio::sync::broadcast::channel(SANDBOX_EVENT_CHANNEL_CAPACITY);
     Arc::new(Orchestrator {
@@ -118,6 +137,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         shutdown_outcome: tokio::sync::OnceCell::new(),
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
+        admission: AdmissionController::new(admission_limits, []),
     })
 }
 
@@ -1171,6 +1191,103 @@ fn create_request(
         auto_resume: false,
         secure: false,
     }
+}
+
+#[tokio::test]
+async fn admission_tracks_create_pause_resume_and_delete() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_without_background_with_admission(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        AdmissionLimits {
+            max_active_sandboxes: 1,
+            ..Default::default()
+        },
+    );
+
+    let first = orchestrator
+        .create_sandbox(create_request(Some(60), &[("case", "first")]))
+        .await?;
+    let rejected = orchestrator
+        .create_sandbox(create_request(Some(60), &[("case", "rejected")]))
+        .await
+        .expect_err("the active sandbox limit should reject a second create");
+    assert!(matches!(
+        rejected,
+        OrchestratorError::AdmissionDenied {
+            resource: "active sandboxes",
+            ..
+        }
+    ));
+
+    orchestrator.pause_sandbox(first.id).await?;
+    let second = orchestrator
+        .create_sandbox(create_request(Some(60), &[("case", "second")]))
+        .await?;
+    let rejected = orchestrator
+        .resume_sandbox(first.id, NewTimeout::UseExisting)
+        .await
+        .expect_err("resume should preserve paused accounting when capacity is exhausted");
+    assert!(matches!(
+        rejected,
+        OrchestratorError::AdmissionDenied { .. }
+    ));
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&first.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        SandboxState::Paused
+    );
+
+    orchestrator.delete_sandbox(second.id).await?;
+    orchestrator
+        .resume_sandbox(first.id, NewTimeout::UseExisting)
+        .await?;
+    orchestrator.delete_sandbox(first.id).await?;
+    assert_eq!(orchestrator.admission.usage(), AdmissionUsage::default());
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_admission_rejects_the_whole_batch_without_mutating_source() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_without_background_with_admission(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        AdmissionLimits {
+            max_active_sandboxes: 3,
+            ..Default::default()
+        },
+    );
+    let source = orchestrator
+        .create_sandbox(create_request(Some(60), &[("case", "fork-admission")]))
+        .await?;
+
+    let rejected = orchestrator
+        .fork_sandbox(source.id, 3, NewTimeout::UseExisting)
+        .await
+        .expect_err("a fork batch must be admitted atomically");
+    assert!(matches!(
+        rejected,
+        OrchestratorError::AdmissionDenied { .. }
+    ));
+    assert_eq!(
+        orchestrator.get_sandbox(&source.id).await?.unwrap().state,
+        SandboxState::Running
+    );
+    assert_eq!(orchestrator.admission.usage().active_sandboxes, 1);
+
+    let outcomes = orchestrator
+        .fork_sandbox(source.id, 2, NewTimeout::UseExisting)
+        .await?;
+    assert!(outcomes.iter().all(Result::is_ok));
+    assert_eq!(orchestrator.admission.usage().active_sandboxes, 3);
+    Ok(())
 }
 
 fn write_local_commit_image_config(path: &Path, file: &Path, digest: &str, size: u64) {
