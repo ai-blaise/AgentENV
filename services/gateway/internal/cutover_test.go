@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -193,4 +194,61 @@ func newCutoverTestServer(t *testing.T, client schedulerv1.SchedulerClient) http
 	// rather than whichever entry a previous lookup happened to leave behind.
 	server := newTestServer(t, client, 5*time.Second, 1<<20)
 	return authenticatedTestHandler(server)
+}
+
+// The cutover path is the default for every ordinary sandbox request, and it
+// holds the whole response in memory. Without a ceiling one large upstream
+// body is a memory vector on the busiest path in the process.
+func TestALargeResponseIsNotHeldInMemoryByTheCutoverPath(t *testing.T) {
+	const limit = 64 * 1024
+	body := bytes.Repeat([]byte("x"), limit*4)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	defer upstream.Close()
+
+	var lookups atomic.Int32
+	client := &countingLookupClient{endpoint: upstream.URL, lookups: &lookups}
+	server := newTestServer(t, client, 5*time.Second, int64(len(body))+1, func(o *ServerOptions) {
+		o.BindingCacheTTL = time.Minute
+	})
+	handler := authenticatedTestHandler(server)
+
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+	request.Header.Set(headerSandboxID, "00000000-0000-7000-8000-0000000000cc")
+	request.Header.Set(headerTargetPort, "8000")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	// The oversized response must still reach the client intact — the bound
+	// changes how it is carried, not whether it is delivered.
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("expected the response to be delivered, got %d", recorder.Code)
+	}
+	if recorder.Body.Len() != len(body) {
+		t.Fatalf("body truncated: got %d bytes, want %d", recorder.Body.Len(), len(body))
+	}
+}
+
+// ReverseProxy forwards Early Hints by calling WriteHeader with a 1xx and then
+// again with the real status. Latching the first would report 103 as the
+// terminal status and drop the one the client was actually given.
+func TestAnInformationalStatusDoesNotLatch(t *testing.T) {
+	buffered := newBufferedResponse()
+	buffered.WriteHeader(http.StatusEarlyHints)
+	buffered.WriteHeader(http.StatusCreated)
+
+	if buffered.status != http.StatusCreated {
+		t.Fatalf("terminal status = %d, want %d", buffered.status, http.StatusCreated)
+	}
+
+	// And a genuine 200 must not be overwritten by anything that follows.
+	second := newBufferedResponse()
+	second.WriteHeader(http.StatusOK)
+	second.WriteHeader(http.StatusInternalServerError)
+	if second.status != http.StatusOK {
+		t.Fatalf("first terminal status should win, got %d", second.status)
+	}
 }

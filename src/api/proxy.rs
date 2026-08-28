@@ -1105,6 +1105,13 @@ fn map_upstream_response(response: Response<Incoming>) -> Response<Body> {
     // Mirror the request-side filtering on the way back so connection-scoped
     // headers from the upstream do not leak through this proxy hop.
     remove_hop_by_hop_headers(&mut parts.headers);
+    // The disown header is a control signal this node emits, and the gateway
+    // acts on it by dropping a cached binding and re-resolving. A guest can
+    // put any header it likes on its own responses, so one that set this could
+    // make every request it serves cost a scheduler round trip. Strip it here:
+    // anything arriving from inside the sandbox is guest output, never a
+    // statement about what this node owns.
+    parts.headers.remove(SANDBOX_DISOWNED_HEADER);
     Response::from_parts(parts, Body::new(body.map_err(axum::Error::new)))
 }
 

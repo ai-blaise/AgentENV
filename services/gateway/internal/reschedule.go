@@ -25,23 +25,58 @@ const maxScheduleAttempts = 3
 type bufferedResponse struct {
 	header http.Header
 	status int
-	body   bytes.Buffer
+	// wroteHeader distinguishes "nobody set a status" from "somebody set 200".
+	// Comparing against http.StatusOK cannot: a handler that legitimately
+	// writes 200 would then be overwritten by whatever came next.
+	wroteHeader bool
+	body        bytes.Buffer
+	// limit bounds what is held in memory. Zero means unbounded.
+	limit int64
+	// overflowed records that the body outgrew the limit, so the caller can
+	// fall back instead of silently truncating the client's response.
+	overflowed bool
 }
 
 func newBufferedResponse() *bufferedResponse {
 	return &bufferedResponse{header: make(http.Header), status: http.StatusOK}
 }
 
+// newBoundedBufferedResponse caps what will be held in memory.
+func newBoundedBufferedResponse(limit int64) *bufferedResponse {
+	return &bufferedResponse{
+		header: make(http.Header),
+		status: http.StatusOK,
+		limit:  limit,
+	}
+}
+
 func (b *bufferedResponse) Header() http.Header { return b.header }
 
 func (b *bufferedResponse) WriteHeader(status int) {
-	if b.status != http.StatusOK {
+	// 1xx is informational: ReverseProxy forwards Early Hints by calling
+	// WriteHeader with a 1xx and then again with the real status. Latching the
+	// first one would report 103 as the terminal status and drop the response
+	// the client was actually given.
+	if status >= 100 && status < 200 {
 		return
 	}
+	if b.wroteHeader {
+		return
+	}
+	b.wroteHeader = true
 	b.status = status
 }
 
 func (b *bufferedResponse) Write(p []byte) (int, error) {
+	// A buffered response is held whole in memory, so without a ceiling one
+	// large upstream body is a memory vector — and this is the default path
+	// for every ordinary proxied request, not a rare one. Past the limit the
+	// bytes are dropped and the caller replays nothing; it retries directly
+	// instead.
+	if b.limit > 0 && int64(b.body.Len())+int64(len(p)) > b.limit {
+		b.overflowed = true
+		return len(p), nil
+	}
 	return b.body.Write(p)
 }
 

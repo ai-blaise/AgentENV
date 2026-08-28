@@ -115,12 +115,21 @@ func (s *Server) proxyWithCutover(
 		attemptReq := r.Clone(upstreamCtx)
 		setReplayableBody(attemptReq, body)
 
-		buffered := newBufferedResponse()
+		// Bounded: this is the default path for every ordinary sandbox
+		// request, and an unbounded buffer here means one large upstream
+		// response is a memory vector.
+		buffered := newBoundedBufferedResponse(s.maxRespSize)
 		disowned := false
 		attemptOptions := options
 		attemptOptions.onDisown = func() { disowned = true }
 		s.proxyRequest(buffered, attemptReq, r.Context(), upstreamURL, current, attemptOptions)
 
+		if buffered.overflowed {
+			// Too large to have held, so there is nothing to replay. Hand the
+			// request back to the direct path, which streams it: correctness
+			// beats following a cutover for a response this size.
+			return false
+		}
 		if !disowned || attempt >= maxCutoverRetries {
 			buffered.replay(w)
 			return true
