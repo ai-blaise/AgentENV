@@ -4,7 +4,6 @@ pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;
 mod firecracker;
-#[cfg(test)]
 pub(crate) mod mock;
 mod network;
 mod process;
@@ -34,6 +33,7 @@ pub use firecracker::{
     FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
     FirecrackerSandboxFactory, FirecrackerSnapshotConfig, FirecrackerSnapshotManifest,
 };
+pub use mock::MockBackendFactory;
 pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
 pub use network::{
     BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
@@ -125,5 +125,150 @@ impl SandboxLaunchConfig {
                 .insert("imageConfigs".to_string(), image_configs.to_value());
         }
         self
+    }
+}
+
+/// Which backend the node builds sandboxes with.
+///
+/// `Firecracker` is the product: a microVM per sandbox, which needs `/dev/kvm`
+/// and `ublk_drv` on the host and refuses to start without them. `Mock` is the
+/// same node — API, orchestrator, scheduler protocol, observability, mobility
+/// records — with an in-process backend that runs no guest at all. It exists
+/// so the control plane can be deployed, scaled, and exercised on hosts that
+/// cannot virtualize, and it is never a fallback: a node asked for
+/// `firecracker` on such a host stops rather than degrading into it.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxBackendKind {
+    #[default]
+    Firecracker,
+    Mock,
+}
+
+impl std::fmt::Display for SandboxBackendKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Firecracker => "firecracker",
+            Self::Mock => "mock",
+        })
+    }
+}
+
+impl std::str::FromStr for SandboxBackendKind {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "firecracker" => Ok(Self::Firecracker),
+            "mock" => Ok(Self::Mock),
+            other => Err(format!(
+                "unsupported sandbox backend {other:?}; expected \"firecracker\" or \"mock\""
+            )),
+        }
+    }
+}
+
+/// The factory a node runs with, chosen once at startup from `[machine].backend`.
+///
+/// An enum rather than a `Box<dyn SandboxBackendFactory>` so the orchestrator
+/// stays monomorphic over it, exactly as it is over the Firecracker factory
+/// today.
+pub enum NodeBackendFactory {
+    Firecracker(FirecrackerSandboxFactory),
+    Mock(MockBackendFactory),
+}
+
+impl NodeBackendFactory {
+    /// Every build in mock mode says so, because a mock sandbox looks like a
+    /// real one from every API and it must never be mistaken for isolation.
+    fn warn_mock_build(sandbox: &str) {
+        tracing::warn!(
+            target: "agentenv",
+            sandbox,
+            "building a MOCK sandbox: no guest runs and nothing is isolated; \
+             this node is configured with [machine].backend = \"mock\""
+        );
+    }
+}
+
+impl SandboxBackendFactory for NodeBackendFactory {
+    fn build(
+        &self,
+        build_spec: FreshSandboxBuildSpec,
+        launch_config: SandboxLaunchConfig,
+    ) -> anyhow::Result<Box<dyn SandboxBackend>> {
+        match self {
+            Self::Firecracker(factory) => factory.build(build_spec, launch_config),
+            Self::Mock(factory) => {
+                Self::warn_mock_build("fresh");
+                factory.build(build_spec, launch_config)
+            }
+        }
+    }
+
+    fn build_from_snapshot(
+        &self,
+        snapshot: &crate::snapshot::RunnableSnapshot,
+        launch_config: SandboxLaunchConfig,
+    ) -> anyhow::Result<Box<dyn SandboxBackend>> {
+        match self {
+            Self::Firecracker(factory) => factory.build_from_snapshot(snapshot, launch_config),
+            Self::Mock(factory) => {
+                Self::warn_mock_build("from-snapshot");
+                factory.build_from_snapshot(snapshot, launch_config)
+            }
+        }
+    }
+
+    fn decode_paused_state(
+        &self,
+        artifact_root: PathBuf,
+        state: serde_json::Value,
+    ) -> anyhow::Result<std::sync::Arc<dyn PausedSandboxState>> {
+        match self {
+            Self::Firecracker(factory) => factory.decode_paused_state(artifact_root, state),
+            Self::Mock(factory) => factory.decode_paused_state(artifact_root, state),
+        }
+    }
+
+    fn build_from_paused_state(
+        &self,
+        sandbox_id: crate::types::SandboxId,
+        state: &dyn PausedSandboxState,
+        envd_access_token: Option<EnvdAccessToken>,
+    ) -> anyhow::Result<Box<dyn SandboxBackend>> {
+        match self {
+            Self::Firecracker(factory) => {
+                factory.build_from_paused_state(sandbox_id, state, envd_access_token)
+            }
+            Self::Mock(factory) => {
+                Self::warn_mock_build("from-paused-state");
+                factory.build_from_paused_state(sandbox_id, state, envd_access_token)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod backend_kind_tests {
+    use super::SandboxBackendKind;
+
+    #[test]
+    fn defaults_to_firecracker_and_parses_both_values() {
+        assert_eq!(
+            SandboxBackendKind::default(),
+            SandboxBackendKind::Firecracker
+        );
+        assert_eq!(
+            "Firecracker".parse::<SandboxBackendKind>().unwrap(),
+            SandboxBackendKind::Firecracker
+        );
+        assert_eq!(
+            "mock".parse::<SandboxBackendKind>().unwrap(),
+            SandboxBackendKind::Mock
+        );
+        assert!("qemu".parse::<SandboxBackendKind>().is_err());
     }
 }

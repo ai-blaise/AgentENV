@@ -9,6 +9,9 @@ pub struct MachineInfo {
     pub cpu_model_name: String,
     pub cpu_architecture: String,
     pub cpu_config_json: Option<String>,
+    /// Which backend builds sandboxes here, as reported to the scheduler and
+    /// shown by `GET /nodes`. A mock node must be visible as one.
+    pub sandbox_backend: String,
 }
 
 /// Node-level metrics projected from orchestrator runtime counters and the

@@ -1684,7 +1684,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let orchestrator = Orchestrator::new(
             crate::orchestrator::InMemoryMetadataStore::new(),
-            crate::sandbox::FirecrackerSandboxFactory::new(),
+            crate::sandbox::NodeBackendFactory::Firecracker(
+                crate::sandbox::FirecrackerSandboxFactory::new(),
+            ),
             FileBackedSandboxPersister::new_for_test(root.path().to_path_buf()),
         )
         .await

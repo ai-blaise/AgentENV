@@ -93,7 +93,7 @@ impl FailedLaunchStage {
 
 pub struct Orchestrator<
     S: MetadataStore = InMemoryMetadataStore,
-    F: SandboxBackendFactory = FirecrackerSandboxFactory,
+    F: SandboxBackendFactory = crate::sandbox::NodeBackendFactory,
     P: SandboxPersister = FileBackedSandboxPersister,
 > {
     store: S,

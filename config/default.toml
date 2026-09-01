@@ -165,6 +165,13 @@ host_interaction_cidr = "10.11.0.0/16"
 veth_cidr = "10.12.0.0/16"
 
 [machine]
+# Which backend builds sandboxes. "firecracker" is the product and needs
+# /dev/kvm and ublk_drv on the host; the node refuses to start without them.
+# "mock" runs the whole node — API, orchestrator, scheduler protocol,
+# observability — with an in-process backend that runs NO guest and isolates
+# NOTHING. It is for deploying and exercising the control plane on hosts that
+# cannot virtualize, and every sandbox it builds is logged as a mock.
+backend = "firecracker"
 # Default guest memory in MiB (1024 = 1 GiB).
 mem_size_mib = 1024
 # Default number of guest vCPUs.

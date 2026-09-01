@@ -972,8 +972,12 @@ type MachineInfo struct {
 	CpuModelName    string                 `protobuf:"bytes,3,opt,name=cpu_model_name,json=cpuModelName,proto3" json:"cpu_model_name,omitempty"`
 	CpuArchitecture string                 `protobuf:"bytes,4,opt,name=cpu_architecture,json=cpuArchitecture,proto3" json:"cpu_architecture,omitempty"`
 	CpuConfigJson   string                 `protobuf:"bytes,5,opt,name=cpu_config_json,json=cpuConfigJson,proto3" json:"cpu_config_json,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Which backend the node builds sandboxes with: "firecracker" or "mock".
+	// Absent (older nodes) means firecracker. A mock node runs no guests and
+	// must be visible as such wherever nodes are listed.
+	SandboxBackend string `protobuf:"bytes,6,opt,name=sandbox_backend,json=sandboxBackend,proto3" json:"sandbox_backend,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *MachineInfo) Reset() {
@@ -1037,6 +1041,13 @@ func (x *MachineInfo) GetCpuArchitecture() string {
 func (x *MachineInfo) GetCpuConfigJson() string {
 	if x != nil {
 		return x.CpuConfigJson
+	}
+	return ""
+}
+
+func (x *MachineInfo) GetSandboxBackend() string {
+	if x != nil {
+		return x.SandboxBackend
 	}
 	return ""
 }
@@ -3232,14 +3243,15 @@ const file_api_proto_scheduler_proto_rawDesc = "" +
 	"\x16RecordAssignmentResult\x12\x1d\n" +
 	"\n" +
 	"sandbox_id\x18\x01 \x01(\tR\tsandboxId\x12\x14\n" +
-	"\x05error\x18\x02 \x01(\tR\x05error\"\xc2\x01\n" +
+	"\x05error\x18\x02 \x01(\tR\x05error\"\xeb\x01\n" +
 	"\vMachineInfo\x12\x1d\n" +
 	"\n" +
 	"cpu_family\x18\x01 \x01(\tR\tcpuFamily\x12\x1b\n" +
 	"\tcpu_model\x18\x02 \x01(\tR\bcpuModel\x12$\n" +
 	"\x0ecpu_model_name\x18\x03 \x01(\tR\fcpuModelName\x12)\n" +
 	"\x10cpu_architecture\x18\x04 \x01(\tR\x0fcpuArchitecture\x12&\n" +
-	"\x0fcpu_config_json\x18\x05 \x01(\tR\rcpuConfigJson\"\xae\x01\n" +
+	"\x0fcpu_config_json\x18\x05 \x01(\tR\rcpuConfigJson\x12'\n" +
+	"\x0fsandbox_backend\x18\x06 \x01(\tR\x0esandboxBackend\"\xae\x01\n" +
 	"\n" +
 	"DiskMetric\x12\x1f\n" +
 	"\vmount_point\x18\x01 \x01(\tR\n" +

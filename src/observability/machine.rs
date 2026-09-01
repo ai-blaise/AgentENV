@@ -7,7 +7,7 @@ use super::MachineInfo;
 ///
 /// This is evaluated once during observability service construction rather than
 /// on every API request.
-pub(crate) fn detect_machine_info() -> MachineInfo {
+pub(crate) fn detect_machine_info(backend: crate::sandbox::SandboxBackendKind) -> MachineInfo {
     let cpuinfo = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
 
     MachineInfo {
@@ -19,6 +19,7 @@ pub(crate) fn detect_machine_info() -> MachineInfo {
             .unwrap_or_else(|| "unknown".to_string()),
         cpu_architecture: std::env::consts::ARCH.to_string(),
         cpu_config_json: None,
+        sandbox_backend: backend.to_string(),
     }
 }
 

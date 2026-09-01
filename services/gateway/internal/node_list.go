@@ -27,6 +27,8 @@ type nodeListMachineInfo struct {
 	CPUModel        string `json:"cpuModel"`
 	CPUModelName    string `json:"cpuModelName"`
 	CPUArchitecture string `json:"cpuArchitecture"`
+	// SandboxBackend is "firecracker" or "mock". A mock node runs no guests.
+	SandboxBackend string `json:"sandboxBackend"`
 }
 
 type nodeListDiskMetrics struct {
@@ -132,6 +134,7 @@ func (s *Server) handleNodeList(w http.ResponseWriter, r *http.Request, routingC
 				CPUModel:        observed.GetMachineInfo().GetCpuModel(),
 				CPUModelName:    observed.GetMachineInfo().GetCpuModelName(),
 				CPUArchitecture: observed.GetMachineInfo().GetCpuArchitecture(),
+				SandboxBackend:  sandboxBackendOrDefault(observed.GetMachineInfo().GetSandboxBackend()),
 			},
 			Status:       nodeStatusToString(snapshot.GetStatus()),
 			SandboxCount: snapshot.GetSandboxCount(),
@@ -202,4 +205,13 @@ func (s *Server) handleNodeDetail(
 		&schedulerv1.Node{NodeId: resolved.GetNodeId(), Endpoint: resolved.GetEndpoint()},
 		proxyRequestOptions{flushImmediately: longLived},
 	)
+}
+
+// sandboxBackendOrDefault reads a node's reported backend, treating absence as
+// firecracker: nodes older than the field could only ever have been that.
+func sandboxBackendOrDefault(reported string) string {
+	if reported == "" {
+		return "firecracker"
+	}
+	return reported
 }

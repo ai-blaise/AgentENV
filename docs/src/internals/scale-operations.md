@@ -166,6 +166,29 @@ attached to the change it explains. Re-run the conformance harness and the
 version-skew matrix after every rebase: both exist to catch a behaviour that
 was quietly restored.
 
+## Control-plane-only nodes: the mock backend
+
+`[machine].backend = "mock"` (or `AENV_SANDBOX_BACKEND=mock`) starts the whole
+node — HTTP API, orchestrator, scheduler heartbeats, mobility records,
+observability — with an in-process sandbox backend that runs **no guest and
+isolates nothing**. It exists so the control plane can be deployed, scaled and
+exercised on hosts that cannot virtualize: every scheduler, gateway, binding,
+roster and mobility behaviour is real, only the sandbox is not.
+
+It is never a fallback. A node configured for `firecracker` on a host without
+`/dev/kvm` or `ublk_drv` refuses to start, exactly as before; only an explicit
+`mock` makes those checks advisory. A mock node logs a warning at startup and
+on every sandbox it builds, reports `sandbox_backend = "mock"` in every
+heartbeat, and is shown as such by the gateway's `GET /nodes`
+(`machineInfo.sandboxBackend`), so a fleet can be audited for one at a glance.
+Older nodes that predate the field are read as `firecracker`, which is the
+only thing they could have been.
+
+Mock mode skips the ublk daemon, the warm VM pool, the warm slot pool and the
+runtime dependency downloads, all of which exist to start guests. It still
+generates the overlaybd runtime configuration the orchestrator reads at
+construction, and still honours every off switch above.
+
 ## Known findings not yet fixed
 
 A verification campaign — supply-chain scanning, fuzzing, mutation testing,

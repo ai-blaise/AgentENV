@@ -63,6 +63,10 @@ pub struct ImageResolver {
     allowed_registries: Option<Vec<String>>,
     try_referrers_overlaybd_prefixes: Vec<String>,
     convert_standard_oci: bool,
+    /// Set when the node's sandbox backend is `mock`: every image reference
+    /// resolves to an empty placeholder without touching a registry, because
+    /// nothing will ever mount it.
+    mock_image_root: Option<PathBuf>,
 }
 
 impl ImageResolver {
@@ -74,6 +78,8 @@ impl ImageResolver {
             overlaybd_convert_global_config: config.resolved_overlaybd_convert_global_config_path(),
             overlaybd_oci_converter_id: config.resolved_overlaybd_oci_converter_id(),
             regctl_binary: config.resolved_regctl_binary(),
+            mock_image_root: (config.machine.backend == crate::sandbox::SandboxBackendKind::Mock)
+                .then(|| config.home_path.join("mock-images")),
             default_image: config.image.resolver.default_image.clone(),
             search_registries: config.image.resolver.search_registries.clone(),
             allowed_registries: config.image.resolver.allowed_registries.clone(),
@@ -90,7 +96,42 @@ impl ImageResolver {
         &self.default_image
     }
 
+    /// The mock backend's answer to every image: a valid, empty overlaybd
+    /// config that no guest will read. The reference is kept verbatim so the
+    /// sandbox's recorded image is still what the caller asked for, and the
+    /// warning is per request so a mock node never resolves quietly.
+    async fn resolve_mock(
+        &self,
+        root: &std::path::Path,
+        image_ref: &str,
+    ) -> ImageResult<ResolvedBlockImage> {
+        warn!(
+            image = image_ref,
+            "mock backend: image resolved to an empty placeholder"
+        );
+        let path = root.join("image.json");
+        if tokio::fs::metadata(&path).await.is_err() {
+            tokio::fs::create_dir_all(root)
+                .await
+                .with_context(|| format!("create mock image root {}", root.display()))?;
+            let empty = serde_json::to_vec(&overlaybd::config::ImageConfig::default())
+                .context("serialize empty overlaybd config")?;
+            tokio::fs::write(&path, empty)
+                .await
+                .with_context(|| format!("write mock image config {}", path.display()))?;
+        }
+        Ok(ResolvedBlockImage {
+            image_ref: image_ref.to_string(),
+            overlaybd_config_path: path,
+            base_context: ImageBaseContext::default(),
+            raw_config: None,
+        })
+    }
+
     pub async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {
+        if let Some(root) = &self.mock_image_root {
+            return self.resolve_mock(root, image_ref).await;
+        }
         let candidates = image_ref_candidates(
             image_ref,
             &self.search_registries,
@@ -1118,5 +1159,38 @@ mod tests {
             Some(expected_layer_dir.as_str())
         );
         assert!(config["lowers"][0].get("cacheFile").is_none());
+    }
+}
+
+#[cfg(test)]
+mod mock_resolve_tests {
+    use super::ImageResolver;
+    use crate::cfg::AppConfig;
+    use crate::sandbox::SandboxBackendKind;
+
+    /// A mock node must resolve any reference without a registry, a regctl
+    /// binary, or a network, and must say what it did not do.
+    #[tokio::test]
+    async fn mock_backend_resolves_any_image_to_an_empty_placeholder() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let mut config = AppConfig {
+            home_path: home.path().to_path_buf(),
+            ..AppConfig::default()
+        };
+        config.machine.backend = SandboxBackendKind::Mock;
+        let resolver = ImageResolver::new(&config);
+
+        let resolved = resolver
+            .resolve("registry.invalid/never/pulled:latest")
+            .await
+            .expect("mock resolution must not touch a registry");
+
+        assert_eq!(resolved.image_ref, "registry.invalid/never/pulled:latest");
+        assert!(resolved.raw_config.is_none());
+        assert!(resolved.overlaybd_config_path.starts_with(home.path()));
+        let written = std::fs::read(&resolved.overlaybd_config_path).expect("placeholder written");
+        let parsed: overlaybd::config::ImageConfig =
+            serde_json::from_slice(&written).expect("placeholder is a valid image config");
+        assert!(parsed.lowers.is_empty());
     }
 }

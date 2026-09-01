@@ -186,6 +186,12 @@ See [P2P Artifact Transport](./p2p-design.md) for the detailed design.
 - `POST /sandboxes/{id}/pause` pause (snapshot) a sandbox
 - `POST /sandboxes/{id}/resume` resume from snapshot
 - `GET /nodes` return node-level observability snapshots
+
+Each node's `machineInfo` carries `sandboxBackend` (`"firecracker"` or `"mock"`);
+nodes older than the field report nothing and are shown as `firecracker`. A
+`mock` node runs no guests — see the scale-operations page for what that mode
+is for.
+
 - `GET /nodes/{id}` return node details plus currently running sandboxes
 - `ANY /proxy`, `ANY /proxy/{path}`, routing-header fallback, and configured
   sandbox proxy hosts reverse proxy to sandbox services

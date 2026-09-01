@@ -7,7 +7,10 @@ use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::Orchestrator;
 use agentenv::overlaybd::OverlaybdP2pRuntime;
-use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
+use agentenv::sandbox::{
+    FirecrackerPool, FirecrackerSandboxFactory, MockBackendFactory, NodeBackendFactory,
+    SandboxBackendKind, UblkDeviceManager,
+};
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
 use axum::serve::ListenerExt;
@@ -77,7 +80,16 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    agentenv::privileges::require_runtime_capabilities()?;
+    // The capabilities exist for network namespaces, veths and ublk devices,
+    // none of which a mock node touches; demanding them would force a
+    // privileged container for nothing.
+    let backend = config.machine.backend;
+    match backend {
+        SandboxBackendKind::Firecracker => agentenv::privileges::require_runtime_capabilities()?,
+        SandboxBackendKind::Mock => {
+            warn!(target: "agentenv", "mock backend: runtime capabilities are not required");
+        }
+    }
     agentenv::privileges::clear_ambient_capabilities()?;
 
     let api_key = ApiKey::resolve(config)?;
@@ -91,23 +103,39 @@ async fn main() -> anyhow::Result<()> {
 
     agentenv::setup::ensure_environment(config, overlaybd_p2p.read_facade_address()).await?;
 
-    // Initialize the global ublk device manager (spawns daemon if configured).
-    UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
-        config,
-        overlaybd_p2p.publish_address(),
-    )
-    .await?;
-
-    if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
-        warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
+    if backend == SandboxBackendKind::Mock {
+        warn!(
+            target: "agentenv",
+            "starting with [machine].backend = \"mock\": every sandbox on this node is a \
+             MOCK that runs no guest and isolates nothing"
+        );
     }
 
-    // Beside the Firecracker pool rather than after it: a warm VM process with
-    // no warm slot to attach still pays full slot cost on the first burst.
-    if let Err(err) =
-        agentenv::sandbox::prime_network_slots(std::time::Duration::from_secs(10)).await
-    {
-        warn!(target: "agentenv", error = %err, "network slot prime failed; continuing startup");
+    // The ublk daemon, the warm VM pool and the warm slot pool all exist to
+    // make a guest start fast. A mock node starts no guest, and priming slots
+    // would write host veths and iptables for nothing.
+    if backend == SandboxBackendKind::Firecracker {
+        // Initialize the global ublk device manager (spawns daemon if configured).
+        UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
+            config,
+            overlaybd_p2p.publish_address(),
+        )
+        .await?;
+    }
+
+    if backend == SandboxBackendKind::Firecracker {
+        if let Err(err) = FirecrackerPool::prime(std::time::Duration::from_secs(10)).await {
+            warn!(target: "agentenv", error = %err, "firecracker pool prime failed; continuing startup");
+        }
+
+        // Beside the Firecracker pool rather than after it: a warm VM process
+        // with no warm slot to attach still pays full slot cost on the first
+        // burst.
+        if let Err(err) =
+            agentenv::sandbox::prime_network_slots(std::time::Duration::from_secs(10)).await
+        {
+            warn!(target: "agentenv", error = %err, "network slot prime failed; continuing startup");
+        }
     }
 
     // Installed before the snapshot manager, which decides at publish time
@@ -136,7 +164,12 @@ async fn main() -> anyhow::Result<()> {
     )));
     let image_resolver = Arc::new(ImageResolver::new(config));
 
-    let factory = FirecrackerSandboxFactory::with_cpu_config(Arc::clone(&cluster_cpu_arc));
+    let factory = match backend {
+        SandboxBackendKind::Firecracker => NodeBackendFactory::Firecracker(
+            FirecrackerSandboxFactory::with_cpu_config(Arc::clone(&cluster_cpu_arc)),
+        ),
+        SandboxBackendKind::Mock => NodeBackendFactory::Mock(MockBackendFactory::new()),
+    };
     let orchestrator = Orchestrator::with_file_backed_store_and_factory(factory).await?;
 
     // Mobility is installed after the orchestrator exists and before it serves
@@ -203,6 +236,7 @@ async fn main() -> anyhow::Result<()> {
                 Arc::clone(&orchestrator),
                 config.resolved_cpu_template_helper(),
                 cluster_cpu_arc,
+                backend,
             )
             .await,
         ))

@@ -247,6 +247,9 @@ pub struct MockSandboxBackend {
 }
 
 impl MockSandboxBackend {
+    /// Production builds reach the mock only through its factory, which
+    /// always supplies a host IP; this shape is for tests.
+    #[cfg(test)]
     pub fn new(behavior: Arc<MockBehavior>) -> Self {
         Self::new_with_host_ip(behavior, Some(std::net::Ipv4Addr::new(127, 0, 0, 1)))
     }

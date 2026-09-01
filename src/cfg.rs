@@ -345,6 +345,11 @@ impl std::fmt::Debug for SandboxConfig {
 
 #[derive(Debug, Config, Clone)]
 pub struct MachineConfig {
+    /// Which backend builds sandboxes: `firecracker` (the product) or `mock`
+    /// (a control-plane-only node that runs no guest; see
+    /// [`crate::sandbox::SandboxBackendKind`]).
+    #[config(default = "firecracker", env = "AENV_SANDBOX_BACKEND")]
+    pub backend: crate::sandbox::SandboxBackendKind,
     #[config(default = 2u32)]
     pub vcpu_count: u32,
     #[config(default = 1024u32)]

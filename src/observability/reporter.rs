@@ -449,6 +449,7 @@ impl ObservabilityReporter {
                 cpu_model_name: snapshot.machine_info.cpu_model_name,
                 cpu_architecture: snapshot.machine_info.cpu_architecture,
                 cpu_config_json: snapshot.machine_info.cpu_config_json.unwrap_or_default(),
+                sandbox_backend: snapshot.machine_info.sandbox_backend,
             }),
             snapshot: Some(scheduler::NodeSnapshot {
                 // Report the node's real disposition. A draining node that

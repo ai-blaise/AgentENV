@@ -12,12 +12,52 @@ use std::fs;
 use tracing::{info, warn};
 
 use crate::cfg::AppConfig;
+use crate::sandbox::SandboxBackendKind;
 
 /// Provision runtime dependencies into the configured deps path.
 pub async fn ensure_dependencies(config: &AppConfig) -> Result<()> {
     let deps_path = config.deps_path.clone();
     info!(path = %deps_path.display(), "ensuring dependencies");
     deps::ensure(config, &deps_path).await
+}
+
+/// Checks that the host can run the configured sandbox backend.
+///
+/// In `firecracker` mode every failure is fatal. A node that cannot reach
+/// `/dev/kvm` or `ublk_drv` cannot run a single sandbox, and starting anyway
+/// would advertise capacity it does not have to a scheduler that would place
+/// on it. In `mock` mode the same checks run and are reported, but nothing in
+/// the node depends on them, so they only warn: running where they fail is the
+/// point of that mode, and hiding the result would make a mock node look like
+/// a virtualizing one in the logs.
+pub fn preflight_hypervisor(config: &AppConfig) -> Result<()> {
+    match config.machine.backend {
+        SandboxBackendKind::Firecracker => {
+            packages::check_runtime()?;
+            info!(virtualization_mode = %config.virtualization_mode, "checking virtualization availability");
+            kvm::check(config.virtualization_mode)?;
+            info!("checking ublk module and permissions");
+            ublk::check()?;
+            Ok(())
+        }
+        SandboxBackendKind::Mock => {
+            warn!(
+                "sandbox backend is \"mock\": this node runs NO guests and isolates NOTHING; \
+                 it exists to run the control plane where the host cannot virtualize"
+            );
+            let checks = [
+                ("runtime packages", packages::check_runtime()),
+                ("kvm", kvm::check(config.virtualization_mode)),
+                ("ublk", ublk::check()),
+            ];
+            for (check, result) in checks {
+                if let Err(error) = result {
+                    warn!(check, error = %error, "host check failed; advisory under the mock backend");
+                }
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Provision host runtime packages and downloaded runtime assets without
@@ -113,19 +153,15 @@ pub async fn ensure_environment(
     crate::sandbox::prepare_network_runtime(&config.runtime_path)
         .context("prepare AENV network namespace runtime directory")?;
 
-    // 1. Validate runtime OS packages without attempting elevation.
-    packages::check_runtime()?;
+    // 1-3. What the configured backend needs from this host.
+    preflight_hypervisor(config)?;
 
-    // 2. Selected virtualization mode and /dev/kvm check.
-    info!(virtualization_mode = %config.virtualization_mode, "checking virtualization availability");
-    kvm::check(config.virtualization_mode)?;
-
-    // 3. ublk setup
-    info!("checking ublk module and permissions");
-    ublk::check()?;
-
-    // 4. Download dependencies and generate overlaybd runtime configs.
-    ensure_dependencies(config).await?;
+    // 4. Download dependencies and generate overlaybd runtime configs. The
+    // generated configs are read at orchestrator construction whatever the
+    // backend; the downloads are only for guests, which mock mode has none of.
+    if config.machine.backend == SandboxBackendKind::Firecracker {
+        ensure_dependencies(config).await?;
+    }
     deps::write_generated_overlaybd_global_configs(config, p2p_facade_address)?;
 
     // 5. set nofile limit to a relative large value
@@ -139,7 +175,17 @@ pub async fn ensure_environment(
     let ip_forward = fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
         .context("read host IPv4 forwarding setting")?;
     if ip_forward.trim() != "1" {
-        anyhow::bail!("host IPv4 forwarding is disabled; run `server --setup-host` as root");
+        match config.machine.backend {
+            SandboxBackendKind::Firecracker => {
+                anyhow::bail!(
+                    "host IPv4 forwarding is disabled; run `server --setup-host` as root"
+                );
+            }
+            // No guest traffic to forward.
+            SandboxBackendKind::Mock => {
+                warn!("host IPv4 forwarding is disabled; advisory in mock mode")
+            }
+        }
     }
 
     network_capacity::check();
@@ -161,5 +207,36 @@ mod tests {
         for name in ["", "Aenv", "a.env", "-aenv", "aenv service"] {
             assert!(!is_valid_runtime_account_name(name), "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod preflight_tests {
+    use super::preflight_hypervisor;
+    use crate::cfg::AppConfig;
+    use crate::sandbox::SandboxBackendKind;
+    use std::path::Path;
+
+    /// The property the mock backend must never erode: a node asked for
+    /// Firecracker on a host that cannot provide it stops. Only meaningful
+    /// where the check can fail, so it stands down on a host with `/dev/kvm`.
+    #[test]
+    fn firecracker_mode_refuses_a_host_it_cannot_run_on() {
+        if Path::new("/dev/kvm").exists() {
+            return;
+        }
+        let mut config = AppConfig::default();
+        config.machine.backend = SandboxBackendKind::Firecracker;
+        assert!(
+            preflight_hypervisor(&config).is_err(),
+            "a firecracker node without /dev/kvm must refuse to start"
+        );
+    }
+
+    #[test]
+    fn mock_mode_starts_on_a_host_without_kvm() {
+        let mut config = AppConfig::default();
+        config.machine.backend = SandboxBackendKind::Mock;
+        preflight_hypervisor(&config).expect("mock mode must not depend on the hypervisor");
     }
 }

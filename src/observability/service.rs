@@ -36,8 +36,9 @@ impl ObservabilityService {
         orchestrator: Arc<Orchestrator>,
         cpu_template_helper: Option<PathBuf>,
         cluster_cpu_arc: Arc<RwLock<Option<String>>>,
+        sandbox_backend: crate::sandbox::SandboxBackendKind,
     ) -> Self {
-        let machine_info = detect_machine_info();
+        let machine_info = detect_machine_info(sandbox_backend);
         let host_metrics = HostMetricsCollector::new();
         let cpu_config_json = if let Some(p) = cpu_template_helper {
             super::machine::dump_cpu_config(p).await
