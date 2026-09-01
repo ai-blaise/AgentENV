@@ -75,6 +75,10 @@ impl LayerMetadata {
         }
     }
 
+    /// Test-only since the uuid publication path was removed: the facade's
+    /// uuid route still validates metadata of this shape, and the tests that
+    /// pin that validation build it here.
+    #[cfg(test)]
     pub(crate) fn from_uuid(uuid: Uuid, size: Option<u64>) -> Self {
         let canonical = CanonicalBlobIdentity::from_uuid(&uuid);
         Self {

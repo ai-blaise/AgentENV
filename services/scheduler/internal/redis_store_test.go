@@ -174,6 +174,31 @@ func startRedisServerForTest(t *testing.T) string {
 		}
 	}
 
+	// A free port is found by binding and releasing it, which leaves a window
+	// in which another test process on the same host takes it first. Under
+	// -count=2 with the package's other redis fixtures that window is hit,
+	// so a bind failure is retried on a fresh port rather than failing the
+	// test. Only startup is retried: a server that came up and then died is
+	// reported as such.
+	const attempts = 5
+	var lastOutput string
+	for attempt := 1; attempt <= attempts; attempt++ {
+		addr, output, ok := tryStartRedisServer(t, bin)
+		if ok {
+			return addr
+		}
+		lastOutput = output
+	}
+	t.Fatalf("redis-server did not start on %d attempts; last output: %s", attempts, lastOutput)
+	return ""
+}
+
+// tryStartRedisServer starts one redis-server on a freshly chosen port and
+// waits for it to answer PING. It reports false when the process exited
+// before readiness, which is what a lost port race looks like.
+func tryStartRedisServer(t *testing.T, bin string) (addr string, output string, ok bool) {
+	t.Helper()
+
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("allocate redis test port failed: %v", err)
@@ -185,7 +210,7 @@ func startRedisServerForTest(t *testing.T) string {
 	}
 	_ = listener.Close()
 
-	var output bytes.Buffer
+	var buf bytes.Buffer
 	cmd := exec.Command(
 		bin,
 		"--bind", "127.0.0.1",
@@ -195,40 +220,54 @@ func startRedisServerForTest(t *testing.T) string {
 		"--dir", t.TempDir(),
 		"--loglevel", "warning",
 	)
-	cmd.Stdout = &output
-	cmd.Stderr = &output
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start redis-server failed: %v", err)
 	}
-	t.Cleanup(func() {
+
+	// ProcessState is only populated by Wait, so polling it from the
+	// readiness loop below could never observe an exit: the old check was
+	// dead code and a bind failure burned the whole deadline. Reap in the
+	// background and let the loop select on the result instead.
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+	reap := func() {
 		if cmd.Process != nil {
 			_ = cmd.Process.Kill()
 		}
-		_ = cmd.Wait()
-	})
+		<-waitCh
+	}
 
-	addr := net.JoinHostPort("127.0.0.1", port)
+	addr = net.JoinHostPort("127.0.0.1", port)
 	client := redis.NewClient(&redis.Options{Addr: addr})
 	defer client.Close()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
+		select {
+		case <-waitCh:
+			// Exited before answering: almost always the port race. The
+			// caller picks another port; the output is returned in case the
+			// last attempt has to be reported.
+			return "", buf.String(), false
+		default:
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		err := client.Ping(ctx).Err()
 		cancel()
 		if err == nil {
-			return addr
-		}
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-			t.Fatalf("redis-server exited before readiness: %s", output.String())
+			t.Cleanup(reap)
+			return addr, "", true
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
+	reap()
 	pid := 0
 	if cmd.Process != nil {
 		pid = cmd.Process.Pid
 	}
-	t.Fatalf("redis-server pid %s did not become ready; output: %s", strconv.Itoa(pid), output.String())
-	return ""
+	t.Fatalf("redis-server pid %s did not become ready; output: %s", strconv.Itoa(pid), buf.String())
+	return "", "", false
 }
 
 func writeRawRedisBinding(t *testing.T, store *RedisBindingStore, sandboxID string, node Node) {

@@ -1352,8 +1352,12 @@ mod tests {
         let digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
         let canonical = CanonicalBlobIdentity::from_digest(digest);
         let key = layer_artifact_key(&canonical);
+        // The delay only has to exceed the 10 ms fetch_range_timeout below.
+        // 50 ms did that with a margin a loaded 224-core host closed often
+        // enough to flake; an hour cannot be closed, and the timeout drops
+        // the sleep, so nothing actually waits.
         let transport = Arc::new(MockTransport {
-            fetch_range_delay: Some(Duration::from_millis(50)),
+            fetch_range_delay: Some(Duration::from_secs(3600)),
             ..Default::default()
         });
         transport.descriptors.write().await.insert(

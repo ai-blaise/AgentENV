@@ -21,11 +21,25 @@ yanked = "warn"
 # directly, where a swap is actually within reach; ignore the transitive ones
 # rather than pretend a permanently red gate is a gate.
 unmaintained = "workspace"
+# Unsoundness is a correctness bug reachable through any crate in the graph,
+# not a maintenance signal, so it is not scoped the way `unmaintained` is:
+# every unsound advisory fails the gate until it has a reachability entry
+# below. The default ("workspace") let transitive ones land silently, which
+# is exactly what this file's header says it exists to stop.
+unsound = "all"
 ignore = [
   # Every entry needs a reachability finding, not just an id. "Unreachable" is
   # not "harmless": re-check each on every rebase, and delete the entry the
   # moment the dependency can move.
 
+  # lru 0.12.5 is reachable only through aws-sdk-s3 -> agentenv-test-support,
+  # a dev-dependency of overlaybd: it is never linked into a shipped binary,
+  # and no workspace crate calls the lru API at all (`lru::` has zero
+  # occurrences outside Cargo.lock). Both advisories are fixed in lru 0.18.2+,
+  # which every production edge already uses; 0.12 has no fixed release and
+  # moves only when aws-sdk-s3 moves. Re-check on every aws-sdk bump.
+  { id = "RUSTSEC-2026-0002", reason = "lru 0.12 IterMut unsoundness; dev-only via aws-sdk-s3 -> agentenv-test-support, no workspace lru calls" },
+  { id = "RUSTSEC-2026-0253", reason = "lru 0.12 LruCache::pop panic-safety UAF; dev-only via aws-sdk-s3 -> agentenv-test-support, no workspace lru calls" },
   { id = "RUSTSEC-2026-0190", reason = "anyhow Error::downcast_mut unsoundness. `downcast_mut` has zero occurrences anywhere in the workspace, so the unsound API is never called" },
 
   { id = "RUSTSEC-2025-0111", reason = "tokio-tar PAX header smuggling. Archived crate, no fixed version exists. Enters only via testcontainers -> agentenv-test-support, a dev-dependency that is never linked into a shipped binary" },
