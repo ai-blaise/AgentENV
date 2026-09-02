@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
     let p2p_transport = agentenv::p2p::transport_from_config(config, &identity).await?;
     let p2p_local_endpoint = p2p_transport.local_endpoint();
     let overlaybd_p2p =
-        OverlaybdP2pRuntime::start_from_app_config(config, Arc::clone(&p2p_transport)).await;
+        OverlaybdP2pRuntime::start_from_app_config(config, Arc::clone(&p2p_transport)).await?;
 
     agentenv::setup::ensure_environment(config, overlaybd_p2p.read_facade_address()).await?;
 

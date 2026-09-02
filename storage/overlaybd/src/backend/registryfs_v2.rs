@@ -698,6 +698,18 @@ impl RegistryFSImplV2 {
         if addr.is_empty() {
             return None;
         }
+        // Never accelerate a request that already points at the accelerator.
+        //
+        // The `/p2p-uuid` opens hand this the facade's own URL. Prefixing it
+        // yields `<facade>/p2p-http/<facade>/p2p-uuid/<uuid>`, which loops back
+        // into the facade's own handler and canonicalises to a `url/...` key
+        // that can never match the `overlaybd-layer/v1/uuid/...` key the layer
+        // was published under. The lookup misses, the read falls through to the
+        // origin, and the peer fetch this path exists to perform silently never
+        // happens.
+        if points_at(&addr, actual_url) {
+            return None;
+        }
         Some(format!("{}/{}", addr.trim_end_matches('/'), actual_url))
     }
 
@@ -1886,6 +1898,22 @@ fn address_matches(addr: &str, seg: &[String]) -> bool {
     false
 }
 
+/// Whether `url` addresses the same host and port as `accelerate_address`.
+///
+/// Compared on origin rather than by string prefix because the accelerate
+/// address carries a path (`.../p2p-http`) that the URL being tested does not.
+/// A URL that cannot be parsed is treated as pointing elsewhere: refusing to
+/// accelerate on a parse failure would silently disable acceleration for every
+/// caller whose URL this function does not understand.
+fn points_at(accelerate_address: &str, url: &str) -> bool {
+    let (Ok(accelerator), Ok(candidate)) = (Url::parse(accelerate_address), Url::parse(url)) else {
+        return false;
+    };
+    accelerator.scheme() == candidate.scheme()
+        && accelerator.host_str() == candidate.host_str()
+        && accelerator.port_or_known_default() == candidate.port_or_known_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2790,5 +2818,91 @@ mod tests {
             "bytes 0-0/12345".parse().expect("header value"),
         );
         assert_eq!(parse_content_range_total(&headers), Some(12345));
+    }
+}
+
+#[cfg(test)]
+mod accelerate_target_tests {
+    use super::*;
+
+    fn backend_accelerated_by(facade: &str) -> RegistryFsV2 {
+        let backend = RegistryFsV2::with_static_credentials(
+            RegistryFsV2Options {
+                timeout: Duration::from_secs(3),
+                retry_count: 1,
+                user_agent: "accelerate-test".to_string(),
+                credential: CredentialConfig::default(),
+                accelerate_address: facade.to_string(),
+                cert_file: String::new(),
+                key_file: String::new(),
+            },
+            "user",
+            "password",
+        )
+        .expect("build registryfs");
+        backend.set_accelerate_address(facade);
+        backend
+    }
+
+    /// The facade's own URL must not be routed back through the facade.
+    ///
+    /// `open_ro_p2p_uuid` builds `http://127.0.0.1:P/p2p-uuid/<uuid>` and opens
+    /// it through the same registryfs whose accelerate address is
+    /// `http://127.0.0.1:P/p2p-http`. Accelerating it produced
+    /// `<facade>/p2p-http/<facade>/p2p-uuid/<uuid>`, which loops back into the
+    /// facade's own handler and canonicalises to a `url/...` key that can never
+    /// match the `overlaybd-layer/v1/uuid/...` key the layer was published
+    /// under -- so every peer read quietly became an origin read.
+    ///
+    /// Driven through `with_accelerate_url` rather than the origin predicate it
+    /// calls: a test of the predicate alone passes with the predicate wired to
+    /// nothing, which is exactly the state this fixes.
+    #[test]
+    fn the_facades_own_url_is_not_accelerated() {
+        let facade = "http://127.0.0.1:9731/p2p-http";
+        let backend = backend_accelerated_by(facade);
+
+        assert_eq!(
+            backend
+                .inner
+                .with_accelerate_url("http://127.0.0.1:9731/p2p-uuid/0193-uuid"),
+            None,
+            "a p2p-uuid open addresses the facade itself and must not be accelerated"
+        );
+        assert_eq!(
+            backend
+                .inner
+                .with_accelerate_url("http://127.0.0.1:9731/p2p-http/http://o/blob"),
+            None,
+            "an already-accelerated URL must not be accelerated again"
+        );
+    }
+
+    /// A real origin still gets accelerated, or the fix would disable P2P.
+    #[test]
+    fn a_registry_origin_is_still_accelerated() {
+        let facade = "http://127.0.0.1:9731/p2p-http";
+        let backend = backend_accelerated_by(facade);
+
+        assert_eq!(
+            backend
+                .inner
+                .with_accelerate_url("https://registry.example.com/v2/blobs/sha256:ab"),
+            Some(format!(
+                "{facade}/https://registry.example.com/v2/blobs/sha256:ab"
+            )),
+            "a registry origin is what acceleration exists for"
+        );
+        assert!(
+            backend
+                .inner
+                .with_accelerate_url("http://127.0.0.1:9999/p2p-uuid/x")
+                .is_some(),
+            "a different port is a different service"
+        );
+        assert!(
+            backend.inner.with_accelerate_url("not a url").is_some(),
+            "an unparseable URL must not silently disable acceleration"
+        );
     }
 }

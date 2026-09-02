@@ -24,15 +24,32 @@ impl OverlaybdP2pRuntime {
         Self { facade: None }
     }
 
+    /// Starts the overlaybd P2P facade, or explains why it will not run.
+    ///
+    /// Failing to start is only tolerable standalone, where P2P is an
+    /// optimisation and the origin serves every read. In a cluster it is a
+    /// load-bearing path -- a resume pulls its memory pages from the node that
+    /// paused the sandbox -- so a node that silently disabled it would come up
+    /// healthy and serve every page from the origin instead, which is slower
+    /// than a cold start and shows up as nothing but latency.
     pub async fn start_from_app_config(
         config: &AppConfig,
         transport: Arc<dyn P2pTransport>,
-    ) -> Self {
+    ) -> anyhow::Result<Self> {
         if !config.p2p.enabled {
-            return OverlaybdP2pRuntime::disabled();
+            return Ok(OverlaybdP2pRuntime::disabled());
         }
+        let clustered = config.cluster.scheduler_endpoint.is_some();
         if transport.local_endpoint().is_none() {
-            return OverlaybdP2pRuntime::disabled();
+            if clustered {
+                anyhow::bail!(
+                    "p2p is enabled and this node is clustered, but the transport has no local \
+                     endpoint; peers cannot reach this node, so every cross-node resume would \
+                     fall back to the origin"
+                );
+            }
+            warn!("p2p transport has no local endpoint; continuing with overlaybd p2p disabled");
+            return Ok(OverlaybdP2pRuntime::disabled());
         }
 
         let overlaybd_config = &config.ublk.overlaybd;
@@ -70,13 +87,14 @@ impl OverlaybdP2pRuntime {
                     publish_address = %facade.publish_address(),
                     "enabled p2p http facade for overlaybd"
                 );
-                OverlaybdP2pRuntime {
+                Ok(OverlaybdP2pRuntime {
                     facade: Some(facade),
-                }
+                })
             }
+            Err(err) if clustered => Err(err.context("start p2p http facade for a clustered node")),
             Err(err) => {
                 warn!(error = %err, "failed to start p2p http facade; continuing with overlaybd p2p disabled");
-                OverlaybdP2pRuntime::disabled()
+                Ok(OverlaybdP2pRuntime::disabled())
             }
         }
     }
