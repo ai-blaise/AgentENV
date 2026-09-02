@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
 
@@ -54,7 +55,54 @@ func (s *Service) UpsertMobilityRecord(
 		)
 		return nil, status.Error(codes.Unavailable, "mobility store unavailable")
 	}
+	if applied {
+		s.bindEvacuatedSandbox(record)
+	}
 	return &schedulerv1.UpsertMobilityRecordResponse{Applied: applied}, nil
+}
+
+// bindEvacuatedSandbox routes a migrated sandbox to the node that took it.
+//
+// This is the one thing the scheduler reads out of a record rather than
+// storing verbatim, and the exception is narrow on purpose. The comment above
+// is about compatibility: whether a node can run a sandbox is a judgement only
+// a candidate node can make. Which node is running it is not that judgement --
+// it is the scheduler's own routing table, and the record is where the answer
+// already lives.
+//
+// It is needed because a roster cannot supply it. A node's roster may
+// establish a binding and refresh one it owns, but not take one from another
+// node, or a handover would oscillate forever between the two nodes that both
+// list the sandbox. That rule leaves the origin refreshing its own stale
+// binding, so something has to say the origin lost, and only the record knows.
+//
+// `evacuated` and not `claimed`: a claim is a destination that intends to
+// restore, and routing to it before it has would send traffic to a node that
+// is not serving the sandbox yet.
+func (s *Service) bindEvacuatedSandbox(record MobilityRecord) {
+	if record.State != MobilityEvacuated {
+		return
+	}
+	holder := strings.TrimSpace(record.HolderNodeID)
+	if holder == "" {
+		return
+	}
+	node, known := s.nodes.Resolve(holder)
+	if !known {
+		return
+	}
+	if err := s.store.Record(record.SandboxID, node, time.Now()); err != nil {
+		// Not fatal to the write that just succeeded: the record is the
+		// durable statement of ownership and the binding is a routing cache
+		// rebuilt from it on the next lookup miss.
+		s.logger.Warn("scheduler could not rebind an evacuated sandbox",
+			zap.String("sandbox_id", record.SandboxID),
+			zap.String("node_id", holder),
+			zap.Error(err),
+		)
+		return
+	}
+	recordSchedulerMobilityLookup("evacuated")
 }
 
 func (s *Service) GetMobilityRecord(

@@ -29,6 +29,11 @@ const (
 	reconcileOutcomeMoved    = "moved"
 	reconcileOutcomeAbsent   = "absent"
 	reconcileOutcomeUnknown  = "unknown"
+	// A roster named a sandbox the scheduler believes another node still holds.
+	// Counted rather than logged per occurrence: during a handover it is the
+	// expected outcome for one heartbeat, and it is only a problem if it does
+	// not stop.
+	reconcileOutcomeRefused = "refused"
 )
 
 // schedulerReconcileBindingsTotal counts what reconcile did with each binding a
@@ -377,9 +382,13 @@ func (s *InMemoryBindingStore) ReconcileNodeRoster(node Node, sandboxIDs []strin
 	}
 
 	expiresAt := now.Add(s.bindingTTL)
+	stolen := 0
 	for sandboxID := range normalized {
-		s.upsertLockedWithExpiry(sandboxID, node, expiresAt, now)
+		if !s.refreshFromRosterLocked(sandboxID, node, expiresAt, now) {
+			stolen++
+		}
 	}
+	recordReconcileOutcome(node.ID, reconcileOutcomeRefused, stolen)
 
 	current := s.nodeBinding[node.ID]
 	if len(current) == 0 {
@@ -435,6 +444,45 @@ func (s *InMemoryBindingStore) recordedWithinGraceLocked(sandboxID string, now t
 
 func (s *InMemoryBindingStore) upsertLocked(sandboxID string, node Node, now time.Time) {
 	s.upsertLockedWithExpiry(sandboxID, node, now.Add(s.bindingTTL), now)
+}
+
+// refreshFromRosterLocked writes a binding a node's roster claims, unless the
+// scheduler already believes another node holds it.
+//
+// A roster says "I am running these", and for a sandbox that has never moved
+// that is the last word. It stops being the last word the moment a paused
+// sandbox can be handed to another node: after a handover, the origin keeps
+// listing the sandbox until its own record is dropped, and dropping it is
+// explicitly allowed to fail -- `MigrationSteps::release_origin_state` reports
+// a failure there and does not undo the migration, because the sandbox really
+// is live elsewhere. An unfenced roster then takes the binding back on the
+// origin's next heartbeat, the destination's next heartbeat takes it again,
+// and the two alternate for as long as both are up.
+//
+// So a roster may establish a binding that is absent and refresh one it already
+// owns, but it may not move one. Moving is left to the deliberate acts that
+// have a reason to: recording an assignment, and placing from a mobility
+// record, which is the arbiter of who owns a paused sandbox in the first place.
+//
+// A binding pointing at a departed node is not stranded by this: bindings carry
+// a TTL, and once it lapses the entry is absent and the next roster establishes
+// it. Recovery is bounded by the TTL instead of being immediate, which is the
+// price of not letting a stale roster overrule a live handover.
+//
+// Reports whether the write happened.
+func (s *InMemoryBindingStore) refreshFromRosterLocked(
+	sandboxID string,
+	node Node,
+	expiresAt time.Time,
+	now time.Time,
+) bool {
+	if existing, ok := s.bindings[sandboxID]; ok &&
+		existing.node.ID != node.ID &&
+		existing.expiresAt.After(now) {
+		return false
+	}
+	s.upsertLockedWithExpiry(sandboxID, node, expiresAt, now)
+	return true
 }
 
 func (s *InMemoryBindingStore) upsertLockedWithExpiry(sandboxID string, node Node, expiresAt time.Time, recordedAt time.Time) {

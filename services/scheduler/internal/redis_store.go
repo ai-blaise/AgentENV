@@ -249,7 +249,11 @@ func clusterOptions(addrs []string, opts *redis.Options) *redis.ClusterOptions {
 // key hashed elsewhere.
 func (s *RedisBindingStore) loadScripts(ctx context.Context) error {
 	load := func(ctx context.Context, target redis.Scripter) error {
-		for _, script := range []*redis.Script{redisSetBindingScript, redisDeleteBindingScript} {
+		for _, script := range []*redis.Script{
+			redisSetBindingScript,
+			redisRefreshBindingScript,
+			redisDeleteBindingScript,
+		} {
 			if err := script.Load(ctx, target).Err(); err != nil {
 				return err
 			}
@@ -464,12 +468,16 @@ func (s *RedisBindingStore) ReconcileNodeRoster(node Node, sandboxIDs []string, 
 		return err
 	}
 
-	previous, err := s.refreshRoster(ctx, desired, value, node.ID)
+	written, refused, err := s.refreshRoster(ctx, desired, value, node.ID)
 	if err != nil {
 		return err
 	}
+	recordReconcileOutcome(node.ID, reconcileOutcomeRefused, len(refused))
 
-	return s.updateNodeIndex(ctx, nodeKey, node.ID, desired, removed, previous, retained)
+	// Only what was actually written joins this node's index. A refused entry
+	// belongs to whoever the binding names, and adding it here would leave two
+	// nodes' indexes claiming it with neither having written the binding.
+	return s.updateNodeIndex(ctx, nodeKey, written, removed, retained)
 }
 
 // deleteDeparted removes bindings the node no longer reports.
@@ -548,20 +556,25 @@ func reconcileOutcomeLabel(result string) string {
 
 // refreshRoster writes every binding the node reports and returns, per
 // sandbox, whichever node previously owned it.
+// refreshRoster writes the bindings a roster claims, and reports which of them
+// another node still holds.
+//
+// The refusal is the point: see InMemoryBindingStore.refreshFromRosterLocked
+// for why a roster may establish and refresh a binding but not move one.
 func (s *RedisBindingStore) refreshRoster(
 	ctx context.Context,
 	desired []string,
 	value string,
 	nodeID string,
-) (map[string]string, error) {
+) (written []string, refused []string, err error) {
 	if len(desired) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	commands, err := s.runPipeline(ctx, func(pipe redis.Pipeliner) []*redis.Cmd {
 		commands := make([]*redis.Cmd, len(desired))
 		for i, sandboxID := range desired {
-			commands[i] = redisSetBindingScript.Run(ctx, pipe,
+			commands[i] = redisRefreshBindingScript.Run(ctx, pipe,
 				[]string{s.bindingKey(sandboxID)},
 				value,
 				nodeID,
@@ -571,26 +584,28 @@ func (s *RedisBindingStore) refreshRoster(
 		return commands
 	})
 	if err != nil {
-		return nil, fmt.Errorf("redis refresh node bindings: %w", err)
+		return nil, nil, fmt.Errorf("redis refresh node bindings: %w", err)
 	}
 
-	previous := make(map[string]string, len(desired))
+	written = make([]string, 0, len(desired))
 	for i, cmd := range commands {
+		// The script returns the current owner when it declined to write, and
+		// an empty string when it wrote.
 		if owner := commandString(cmd); owner != "" && owner != nodeID {
-			previous[desired[i]] = owner
+			refused = append(refused, desired[i])
+			continue
 		}
+		written = append(written, desired[i])
 	}
-	return previous, nil
+	return written, refused, nil
 }
 
 // updateNodeIndex brings the reverse index in line with what was just written.
 func (s *RedisBindingStore) updateNodeIndex(
 	ctx context.Context,
 	nodeKey string,
-	nodeID string,
 	desired []string,
 	removed []string,
-	previous map[string]string,
 	retained int,
 ) error {
 	pipe := s.client.Pipeline()
@@ -599,14 +614,6 @@ func (s *RedisBindingStore) updateNodeIndex(
 	}
 	if len(desired) > 0 {
 		pipe.SAdd(ctx, nodeKey, toAny(desired)...)
-	}
-	// A sandbox that moved here from another node has to leave that node's
-	// index, or its old owner would keep trying to reconcile a binding it no
-	// longer holds.
-	for sandboxID, owner := range previous {
-		if owner != nodeID {
-			pipe.SRem(ctx, s.nodeKey(owner), sandboxID)
-		}
 	}
 	if len(desired) > 0 || retained > 0 {
 		pipe.PExpire(ctx, nodeKey, s.nodeIndexTTL())
@@ -827,5 +834,37 @@ redis.call("DEL", KEYS[1])
 return "deleted"
 `
 
+// redisRefreshBindingScript is redisSetBindingScript for a roster refresh: it
+// writes only when nothing is stored or the reporting node already owns the
+// entry.
+//
+// The reasoning is with InMemoryBindingStore.refreshFromRosterLocked; the two
+// stores answer the same question and have to answer it the same way. Redis
+// needs its own script rather than a read-then-write because two replicas
+// reconcile concurrently, and a check outside the write is not a check.
+const redisRefreshBindingScriptSource = redisLuaHelpers + `
+-- KEYS[1]: sandbox binding key
+-- ARGV[1]: node object JSON ({"node_id":"...","endpoint":"..."})
+-- ARGV[2]: reporting node ID
+-- ARGV[3]: binding TTL in milliseconds
+local raw = redis.call("GET", KEYS[1])
+local old_node_id = parse_node_id(raw)
+
+if old_node_id and old_node_id ~= ARGV[2] then
+  -- Another node holds it. Say who, so the caller can count the refusal and
+  -- leave the reverse index alone.
+  return old_node_id
+end
+
+local recorded_at = now_ms()
+if old_node_id == ARGV[2] then
+  recorded_at = parse_recorded_at(raw) or recorded_at
+end
+
+redis.call("SET", KEYS[1], build_value(ARGV[1], recorded_at), "PX", ARGV[3])
+return ""
+`
+
 var redisSetBindingScript = redis.NewScript(redisSetBindingScriptSource)
+var redisRefreshBindingScript = redis.NewScript(redisRefreshBindingScriptSource)
 var redisDeleteBindingScript = redis.NewScript(redisDeleteBindingScriptSource)

@@ -96,24 +96,32 @@ func TestRedisBindingStoreReconcileCases(t *testing.T) {
 	nodeB := Node{ID: "node-b", Endpoint: "http://node-b"}
 	nodeC := Node{ID: "node-c", Endpoint: "http://node-c"}
 
-	// Build initial state with a stale binding for node-a, two active node-b bindings,
-	// and one node-c binding that will be moved by ReconcileNode.
+	// Build initial state with a stale binding for node-a, two active node-b
+	// bindings, and one node-c binding that node-b's roster will name but must
+	// not take.
 	store.Record("stale-a", nodeA, time.Now())
 	store.Record("keep-b", nodeB, time.Now())
 	store.Record("drop-b", nodeB, time.Now())
-	store.Record("move-c-to-b", nodeC, time.Now())
+	store.Record("held-by-c", nodeC, time.Now())
 
-	store.ReconcileNode(Node{ID: " node-b ", Endpoint: " http://node-b "}, []string{"keep-b", "new-b", "move-c-to-b", "keep-b", ""}, time.Now())
+	store.ReconcileNode(Node{ID: " node-b ", Endpoint: " http://node-b "}, []string{"keep-b", "new-b", "held-by-c", "keep-b", ""}, time.Now())
 
 	assertRedisBinding(t, store, "keep-b", nodeB)
 	assertRedisBinding(t, store, "new-b", nodeB)
-	assertRedisBinding(t, store, "move-c-to-b", nodeB)
+	// A roster establishes and refreshes, but does not take. This used to
+	// resolve to node-b, which is the behaviour that let a handed-over sandbox
+	// oscillate between the two nodes that both listed it -- see
+	// TestRedisARosterDoesNotTakeBackAHandedOverBinding.
+	assertRedisBinding(t, store, "held-by-c", nodeC)
 	assertRedisMissing(t, store, "drop-b")
 	assertRedisBinding(t, store, "stale-a", nodeA)
-	assertRedisSetEqual(t, store, store.nodeKey("node-b"), []string{"keep-b", "new-b", "move-c-to-b"})
-	assertRedisSetEqual(t, store, store.nodeKey("node-c"), nil)
+	assertRedisSetEqual(t, store, store.nodeKey("node-b"), []string{"keep-b", "new-b"})
+	// node-c keeps both the binding and its index entry: a refused roster write
+	// must not half-apply, or the sandbox would still be routable while its
+	// owner had stopped reconciling it.
+	assertRedisSetEqual(t, store, store.nodeKey("node-c"), []string{"held-by-c"})
 	assertRedisSetEqual(t, store, store.nodeKey("node-a"), []string{"stale-a"})
-	for _, sandboxID := range []string{"keep-b", "new-b", "move-c-to-b"} {
+	for _, sandboxID := range []string{"keep-b", "new-b"} {
 		assertRedisBindingHasPositiveTTL(t, store, sandboxID)
 	}
 	assertRedisKeyHasPositiveTTL(t, store, store.nodeKey("node-b"))
@@ -128,7 +136,7 @@ func TestRedisBindingStoreReconcileCases(t *testing.T) {
 	assertRedisMissing(t, store, "stale-a")
 	assertRedisBinding(t, store, "foreign", nodeB)
 	assertRedisSetEqual(t, store, store.nodeKey("node-a"), nil)
-	assertRedisSetEqual(t, store, store.nodeKey("node-b"), []string{"keep-b", "new-b", "move-c-to-b", "foreign"})
+	assertRedisSetEqual(t, store, store.nodeKey("node-b"), []string{"keep-b", "new-b", "foreign"})
 
 	// Invalid node inputs should be ignored.
 	store.ReconcileNode(Node{Endpoint: "http://missing-id"}, []string{"ignored"}, time.Now())
