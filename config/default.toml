@@ -462,6 +462,19 @@ startup_prewarm = true
 # RTNL-serialized netlink work, so this does not scale linearly.
 fill_concurrency = 4
 # Per-pool overrides of the shared watermarks above. Omit to follow [pool].
+#
+# What a slot costs, measured by `make bench-network-slot` on a 224-core
+# a3-ultragpu-8g (Rocky 9.7, kernel 5.14), building and fully tearing down real
+# namespaces: 53.8 ms for one, 53.4 ms/slot at a batch of 4, 49.6 ms/slot at 16
+# -- linear, amortising slightly. So a pool of depth B costs roughly 50 ms x B
+# to fill, serialised on RTNL, and that is what `startup_prewarm` spends before
+# the node serves; the same 50 ms is what a create pays when it misses the pool.
+# At the shared high_watermark of 64 that is about 3.4 s of startup.
+#
+# Deepening the bank past that is a real trade and the number above is only its
+# cost side. What it buys -- creates that never pay the 50 ms -- depends on the
+# arrival pattern of sandbox creates, which cannot be measured on a host without
+# KVM, so no watermark is raised here on the strength of the cost alone.
 # low_watermark = 2
 # high_watermark = 64
 

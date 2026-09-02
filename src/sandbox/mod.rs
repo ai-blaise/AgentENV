@@ -70,6 +70,22 @@ pub async fn prime_network_slots(timeout: std::time::Duration) -> anyhow::Result
     network::NetworkManager::prime(timeout).await
 }
 
+/// Builds `count` network slots and tears them all down again.
+///
+/// Exposed for the same reason as [`prime_network_slots`]: the manager is crate
+/// private, and this is what an out-of-crate caller needs to measure the slot
+/// path. The round trip happens here rather than handing out a `Slot` so the
+/// slot's lifetime stays inside the crate that knows how to release it -- a
+/// leaked slot is a leaked netns, veth pair and tap device, and the index is
+/// not reused until the process restarts.
+///
+/// Deliberately bypasses the warm pool: releasing into it would recycle one
+/// slot rather than building `count` of them. See
+/// `NetworkManager::build_and_destroy_slots`.
+pub fn network_slot_batch_round_trip(count: usize) -> anyhow::Result<()> {
+    network::NetworkManager::global().build_and_destroy_slots(count)
+}
+
 pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
 
 #[derive(Clone, Debug)]

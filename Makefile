@@ -176,6 +176,9 @@ bench-ublk:
 	$(MAKE) install-ublk PROFILE=release
 	$(CAPABILITY_RUNNER) $(CARGO) bench -p agentenv-benchmarks --bench ublk_overlaybd
 
+bench-network-slot:
+	$(CAPABILITY_RUNNER) $(CARGO) bench -p agentenv-benchmarks --bench network_slot
+
 bench-orchestrator-store:
 	$(CARGO) bench -p agentenv-benchmarks --bench orchestrator_store
 

@@ -647,6 +647,51 @@ impl NetworkManager {
         self.cleanup_slot_and_release_bit_inner(slot, sync_cleanup)
     }
 
+    /// Builds `count` slots and tears them all down, never touching the pool.
+    ///
+    /// The measurement path. `release` returns a slot to the warm pool while
+    /// the pool is under its high watermark -- that is its job -- so a loop of
+    /// `allocate_any`/`release` builds one slot and then recycles it, and times
+    /// a queue pop rather than a netns, a veth pair and a tap device. Four
+    /// orders of magnitude, and it looks like an answer.
+    ///
+    /// Slots are held until the whole batch is built so the cost measured is
+    /// `count` slots coexisting, which is the shape a bank fills in.
+    pub(crate) fn build_and_destroy_slots(&self, count: usize) -> Result<()> {
+        let mut slots = Vec::with_capacity(count);
+        let mut first_error = None;
+        for _ in 0..count {
+            match self.allocate_fresh_slot() {
+                Ok(slot) => slots.push(slot),
+                Err(error) => {
+                    first_error = Some(error);
+                    break;
+                }
+            }
+        }
+        // Tear down whatever was built, including on the failing path: a slot
+        // dropped here is a leaked netns, veth pair and tap device, and its
+        // index is not reused until the process restarts.
+        //
+        // Synchronously, unlike the release path. Asynchronous teardown frees
+        // the slot *index* immediately and removes the devices afterwards, so
+        // the next allocation can be handed an index whose veth still exists
+        // and fail adding its default route. The warm pool normally hides that
+        // -- a released slot is held, not rebuilt -- but a loop that rebuilds
+        // every time walks straight into it. It is also what makes the number
+        // honest: a measurement that returns before teardown finishes is
+        // timing half the work.
+        for slot in slots {
+            if let Err(error) = self.cleanup_allocated_slot(slot, /* sync_cleanup */ true) {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Find and allocate the next available slot.
     /// Slot 0 is reserved at init, so returned indices are always >= 1.
     ///
@@ -2074,9 +2119,33 @@ mod tests {
         assert!(!second_batch.contains(&0));
     }
 
+    /// Serializes the tests that build real slots on the host.
+    ///
+    /// They share one machine: slot indices, the host routing table, the
+    /// `veth-N` namespace and the global iptables chains are all process-wide,
+    /// so two of them running at once fail each other in ways that look like
+    /// product bugs -- a slot whose default route "already exists", built by
+    /// the other test a millisecond earlier.
+    ///
+    /// This never bit before because only one such test actually ran: the
+    /// others guard on `geteuid() == 0` and skip under the capability runner,
+    /// which grants CAP_NET_ADMIN without root. That made the guard look like a
+    /// permission check when it was also, accidentally, the serialization.
+    ///
+    /// Poison is ignored: a panicking test has already failed, and refusing to
+    /// run every later one because of it turns one failure into a cascade.
+    static HOST_NETWORK_TESTS: Mutex<()> = Mutex::new(());
+
+    fn lock_host_network() -> std::sync::MutexGuard<'static, ()> {
+        HOST_NETWORK_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     #[ignore = "requires CAP_NET_ADMIN/CAP_SYS_ADMIN and intentionally crashes a child process"]
     fn panic_exit_with_pooled_slot_is_cleaned_by_exit_hook() {
+        let _host_network = lock_host_network();
         const CHILD_ENV: &str = "AENV_NETWORK_PANIC_CHILD";
         const TEST_NAME: &str =
             "sandbox::network::manager::tests::panic_exit_with_pooled_slot_is_cleaned_by_exit_hook";
@@ -2218,9 +2287,57 @@ mod tests {
     /// ```text
     /// sudo -E cargo test -p agentenv --lib network_slot_creation_throughput -- --ignored --nocapture
     /// ```
+    /// The measurement path must not quietly become a pool pop.
+    ///
+    /// `release` returns a slot to the warm pool while the pool is under its
+    /// high watermark, so a build/teardown loop written on `allocate_any` +
+    /// `release` builds one slot and then recycles it forever. That is not a
+    /// slow measurement, it is a wrong one: it reported 418ns where a slot
+    /// actually costs about 53ms, and nothing about the number said so.
+    ///
+    /// The property that keeps it honest is that a batch leaves nothing behind
+    /// -- no pooled slot to hand back on the next call, and no allocated bits.
+    #[test]
+    #[ignore = "mutates host network state; needs CAP_NET_ADMIN"]
+    fn build_and_destroy_slots_leaves_nothing_pooled() {
+        let _host_network = lock_host_network();
+        // A pool that would happily cache what is released into it, so the test
+        // fails if the batch path ever starts using it.
+        let manager = NetworkManager::new(
+            /* maintenance_enabled */ false, /* low_watermark */ 2,
+            /* high_watermark */ 64,
+        );
+
+        // Slot 0 is reserved at construction, so the interesting quantity is
+        // the change, not the absolute.
+        let allocated_before = manager.allocated_count.load(Ordering::Acquire);
+
+        // Probed rather than guarded on uid: the capability runner grants
+        // CAP_NET_ADMIN without being root, and a uid check would skip exactly
+        // where this is meant to run.
+        if let Err(error) = manager.build_and_destroy_slots(2) {
+            eprintln!("skipping: this host cannot build network slots: {error:#}");
+            return;
+        }
+
+        assert_eq!(
+            manager.pool.len(),
+            0,
+            "the measurement path released slots into the warm pool, so a loop over \
+             it recycles one slot instead of building any"
+        );
+        assert_eq!(
+            manager.allocated_count.load(Ordering::Acquire),
+            allocated_before,
+            "slots were built and not torn down; each one is a leaked netns, veth \
+             pair and tap device, and its index is never reused"
+        );
+    }
+
     #[test]
     #[ignore = "requires root and mutates host network state"]
     fn network_slot_creation_throughput() {
+        let _host_network = lock_host_network();
         // SAFETY: geteuid has no preconditions.
         if unsafe { libc::geteuid() } != 0 {
             eprintln!("skipping: network slot creation requires root");

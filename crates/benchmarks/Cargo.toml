@@ -40,3 +40,8 @@ harness = false
 name = "oci_conversion_pipeline"
 path = "benches/oci_conversion_pipeline_benchmark.rs"
 harness = false
+
+[[bench]]
+name = "network_slot"
+path = "benches/network_slot_benchmark.rs"
+harness = false
