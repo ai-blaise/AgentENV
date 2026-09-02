@@ -54,9 +54,9 @@ type ServerOptions struct {
 	// MaxIdleConnsPerHost bounds pooled idle connections per node. Zero uses
 	// defaultMaxIdleConnsPerHost.
 	MaxIdleConnsPerHost int
-	// BindingCacheTTL bounds how long a sandbox-to-node lookup is reused. Zero
-	// uses defaultBindingCacheTTL.
-	BindingCacheTTL time.Duration
+	// BindingCache configures how sandbox-to-node lookups are reused. See
+	// BindingCacheOptions for what each field's zero means.
+	BindingCache BindingCacheOptions
 	// MaxInFlightCreates bounds concurrent create placements. Zero uses
 	// defaultMaxInFlightCreates.
 	MaxInFlightCreates int
@@ -127,7 +127,7 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 	// Wrap the data-plane lookup path only. Scheduling and assignment writes
 	// keep talking to the scheduler directly; caching those would cache
 	// decisions rather than facts.
-	bindingCache := NewCachingSchedulerClient(queryOnlyScheduler, options.BindingCacheTTL)
+	bindingCache := NewCachingSchedulerClient(queryOnlyScheduler, options.BindingCache)
 	queryOnlyScheduler = bindingCache
 
 	upstreamTransport := newUpstreamTransport(options.MaxIdleConnsPerHost)
@@ -380,7 +380,7 @@ func (s *Server) proxyScheduledCreate(
 		s.logger.Warn("gateway shedding create; too many placements in flight",
 			zap.Int64("in_flight", s.createLimiter.currentInFlight()),
 		)
-		writeRefusal(w, refusalGatewayShed, 1)
+		writeRefusal(w, refusalGatewayShed, gatewayShedRetryAfterSecs)
 		return
 	}
 	defer release()
@@ -399,15 +399,7 @@ func (s *Server) proxyScheduledCreate(
 		})
 		recordGatewaySchedulerRPC("Schedule", rpcStart, err)
 		if err != nil {
-			// Exhausting the candidate set after some nodes refused is a
-			// different answer from "the fleet has no capacity at all", but
-			// both mean this create cannot be placed right now.
-			if status.Code(err) == codes.Unavailable {
-				recordGatewayRefusal(refusalFleetExhausted)
-				writeRefusal(w, refusalFleetExhausted, 2)
-				return
-			}
-			s.writeSchedulerError(w, err)
+			s.writePlacementError(w, err)
 			return
 		}
 		node := resp.GetNode()
@@ -433,12 +425,6 @@ func (s *Server) proxyScheduledCreate(
 			flushImmediately: longLived,
 		}
 
-		if lastAttempt {
-			s.proxyRequest(w, proxyReq, r.Context(), upstreamURL, node, options)
-			cancelUpstream()
-			return
-		}
-
 		// Bounded for the same reason the cutover buffer is: a create response
 		// is small, but the bound is what makes that an assumption the gateway
 		// can survive being wrong about.
@@ -451,6 +437,10 @@ func (s *Server) proxyScheduledCreate(
 		}
 		if !retryableRejection(buffered.status, buffered.header) {
 			buffered.replay(w)
+			return
+		}
+		if lastAttempt {
+			s.replayFinalRefusal(w, buffered, bodyIsReplayable)
 			return
 		}
 
@@ -503,6 +493,58 @@ func (s *Server) proxyManagementRequest(
 	})
 }
 
+// replayFinalRefusal delivers the capacity refusal that ended a create's last
+// placement attempt.
+//
+// The node said node_at_capacity about itself. By the time it reaches the
+// client the gateway has more to say: that it tried elsewhere and ran out of
+// tries, or that it could not try elsewhere because the body was too large to
+// send twice. The client's next move differs — wait, versus split the request
+// — so the reason is the gateway's, not the node's. When the operator has
+// turned retries off the node's answer is the whole story and passes through
+// as it arrived.
+func (s *Server) replayFinalRefusal(w http.ResponseWriter, refusal *bufferedResponse, bodyIsReplayable bool) {
+	if s.maxScheduleRetries == 0 {
+		refusal.replay(w)
+		return
+	}
+	reason := refusalRetriesExhausted
+	if !bodyIsReplayable {
+		reason = refusalBodyNotReplayable
+	}
+	recordGatewayRefusal(reason)
+	refusal.header.Set(headerRefusalReason, reason)
+	if refusal.header.Get("Retry-After") == "" {
+		refusal.header.Set("Retry-After", strconv.Itoa(fleetExhaustedRetryAfterSecs))
+	}
+	refusal.replay(w)
+}
+
+// writePlacementError answers a create whose Schedule call failed.
+//
+// Two scheduler answers mean "no node" and call for opposite client
+// behaviour. ResourceExhausted is nodes that all declined — capacity, which
+// frees up — so the refusal carries Retry-After. Unavailable is no node to
+// ask, or no scheduler to ask it of, which no client-side wait cures, so it
+// carries none. Both use the one refusal header, so a client reads a single
+// vocabulary whether the gateway, the scheduler, or a node said no.
+func (s *Server) writePlacementError(w http.ResponseWriter, err error) {
+	switch status.Code(err) {
+	case codes.ResourceExhausted:
+		recordGatewayRefusal(refusalFleetExhausted)
+		writeRefusal(w, refusalFleetExhausted, fleetExhaustedRetryAfterSecs)
+	case codes.Unavailable:
+		recordGatewayRefusal(refusalNoNodes)
+		writeRefusal(w, refusalNoNodes, 0)
+	default:
+		s.writeSchedulerError(w, err)
+	}
+}
+
+// writeSchedulerError maps a scheduler RPC failure onto an HTTP answer for a
+// request that is not a create. The Retry-After split follows the same rule
+// as writePlacementError: sent for ResourceExhausted, withheld for
+// Unavailable.
 func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
 	st, ok := status.FromError(err)
 	if !ok {
@@ -514,6 +556,9 @@ func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
 		http.Error(w, st.Message(), http.StatusBadRequest)
 	case codes.NotFound:
 		http.Error(w, st.Message(), http.StatusNotFound)
+	case codes.ResourceExhausted:
+		w.Header().Set("Retry-After", strconv.Itoa(fleetExhaustedRetryAfterSecs))
+		http.Error(w, st.Message(), http.StatusServiceUnavailable)
 	case codes.Unavailable:
 		http.Error(w, st.Message(), http.StatusServiceUnavailable)
 	default:
@@ -742,6 +787,7 @@ func (s *Server) recordAssignments(ctx context.Context, sandboxIDs []string, nod
 
 	for _, result := range resp.GetResults() {
 		if result.GetError() == "" {
+			s.bindingCache.Record(result.GetSandboxId(), node)
 			continue
 		}
 		s.logger.Warn("record assignment failed",
@@ -766,6 +812,10 @@ func (s *Server) recordAssignment(ctx context.Context, sandboxID string, node *s
 		s.logger.Warn("record assignment failed", zap.Error(err), zap.String("sandbox_id", sandboxID), zap.String("node_id", node.GetNodeId()))
 		return
 	}
+	// The client's next request usually names the sandbox it was just given.
+	// Installing the binding here means that request is served from the cache
+	// rather than racing the scheduler's write through a second round trip.
+	s.bindingCache.Record(sandboxID, node)
 
 	s.logger.Debug("gateway recorded sandbox assignment",
 		zap.String("sandbox_id", sandboxID),

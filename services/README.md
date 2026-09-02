@@ -181,18 +181,41 @@ When all nodes are filtered out, the scheduler returns `Unavailable` to the call
 - `gateway.max_in_flight_creates` bounds how many `POST /sandboxes` / `POST /sandboxes-cold` placements one gateway carries at once; creates beyond it are refused immediately with `503` and `x-agentenv-refusal-reason: gateway_shed`. Zero uses the gateway default (512). Only creates are shed; management-plane requests such as `/templates` and `/snapshots` are never counted against it.
 - `gateway.max_schedule_retries` bounds how many further nodes a create is offered to after one refuses it for capacity. Zero uses the gateway default (2, so three attempts); a negative value gives every create a single attempt.
 - `GATEWAY_MAX_IN_FLIGHT_CREATES=<count>` and `GATEWAY_MAX_SCHEDULE_RETRIES=<count>` override those two keys from the environment.
+- `gateway.binding_cache_size` (default `65536`) bounds how many sandbox-to-node bindings the gateway holds locally so data-plane requests skip the scheduler round trip. `0` or a negative value disables the cache; leaving the key unset keeps the default. Concurrent misses for one sandbox share a single `LookupNode` call.
+- `gateway.binding_cache_ttl` (default `2s`) is how long a resolved binding is reused. It must stay well below `scheduler.binding_ttl`; a negative value also disables the cache.
+- `gateway.binding_cache_negative_ttl` (default `200ms`) is how long a `LookupNode` that found no binding is reused, so a client polling a sandbox that does not exist cannot hammer the scheduler. It may not exceed `gateway.binding_cache_ttl` and must not be negative. Bindings the gateway records from its own create responses are installed into the cache directly and take precedence over any lookup that was already in flight.
+- `GATEWAY_BINDING_CACHE_SIZE=<count>`, `GATEWAY_BINDING_CACHE_TTL=<duration>` and `GATEWAY_BINDING_CACHE_NEGATIVE_TTL=<duration>` override those three keys from the environment.
+- `gateway.scheduler_auth_token` is presented to the scheduler on every RPC, on both `gateway.scheduler_addr` and `gateway.query_only_scheduler_addr`, as gRPC metadata `authorization: Bearer <token>`. Unset (the default) dials exactly as before, for a scheduler that does not enforce a token yet; the gateway logs a warning at startup when it is unset. `GATEWAY_SCHEDULER_AUTH_TOKEN=<token>` overrides it from the environment.
 
 ### Create refusals
 
-A refused create is a `503` carrying `x-agentenv-refusal-reason`, so a client can tell the refusals apart and respond to each correctly:
+A refused create is a `503` carrying `x-agentenv-refusal-reason`, so a client can tell the refusals apart and respond to each correctly. `Retry-After` is the other half of the signal: it is sent when waiting can change the answer and withheld when only an operator can, so a client that retries on `Retry-After` alone and gives up otherwise behaves correctly without reading the reason at all.
 
-| Reason | Origin | Meaning |
-|---|---|---|
-| `node_at_capacity` | node | The node's admission gate refused this create. The gateway re-places it on another node up to `gateway.max_schedule_retries` times; a client sees this reason only when every attempt ended that way. |
-| `fleet_exhausted` | gateway | The scheduler had no eligible node left to offer. Capacity has to change before a retry can succeed. |
-| `gateway_shed` | gateway | The gateway declined before placing anything because it is already at `gateway.max_in_flight_creates`. The fleet may be fine; slow down. |
+| Reason | Origin | `Retry-After` | Meaning |
+|---|---|---|---|
+| `node_at_capacity` | node | yes | The node's admission gate refused this create and the gateway was configured not to retry (`gateway.max_schedule_retries` negative). With retries on, a client never sees this reason from the gateway; it sees one of the two below. |
+| `retries_exhausted` | gateway | yes (the node's) | Every node the create was offered to refused it for capacity, up to `gateway.max_schedule_retries`. The body and `Retry-After` are the last node's. |
+| `body_not_replayable` | gateway | yes (the node's) | A node refused the create for capacity and the gateway could not offer it elsewhere because the request body exceeded the 64 KiB it holds for a second attempt. Send a smaller create. |
+| `fleet_exhausted` | gateway | yes | The scheduler saw nodes and none would take the sandbox (gRPC `ResourceExhausted`). Capacity frees up as sandboxes end. |
+| `no_nodes` | gateway | no | The scheduler could offer no node at all (gRPC `Unavailable`): none discovered, or the scheduler unreachable. Waiting does not fix it. |
+| `gateway_shed` | gateway | yes | The gateway declined before placing anything because it is already at `gateway.max_in_flight_creates`. The fleet may be fine; slow down. |
 
-The gateway retries a create only on `503` **with** `node_at_capacity`. A `503` without that reason — a node mid-shutdown, a proxy in front of it, an older node — is the node's own answer and is returned to the client unchanged. Non-create requests are never retried on another node: a `503` to a `DELETE` is an answer, and re-running the `DELETE` elsewhere is not.
+The gateway retries a create only on `503` **with** `node_at_capacity`. A `503` without that reason — a node mid-shutdown, a proxy in front of it, an older node — is the node's own answer and is returned to the client unchanged. Non-create requests are never retried on another node: a `503` to a `DELETE` is an answer, and re-running the `DELETE` elsewhere is not. Fork is never rescheduled either: it is routed to the parent sandbox's node and the children cannot exist anywhere else, so a fork refused for capacity reaches the client as the node's `node_at_capacity`.
+
+Scheduler failures on non-create requests use the same `Retry-After` rule (`ResourceExhausted` sends it, `Unavailable` does not) but carry no refusal reason, because they were not creates.
+
+`agentenv_gateway_create_refusals_total{reason}` counts every gateway-issued refusal by the reasons above; `agentenv_gateway_binding_cache_total{result}` counts the binding cache's `hit`, `miss`, `negative_hit` and `evict` outcomes.
+
+### Off switches
+
+Each gateway gate is asserted in both directions by `services/gateway/internal/offswitch_test.go`: off must remove the behaviour, on must produce it.
+
+| Behaviour | Setting | Default | Off means |
+|---|---|---|---|
+| Binding cache | `gateway.binding_cache_size` (also a negative `gateway.binding_cache_ttl`) | `65536` / `2s` | Every data-plane request resolves through the scheduler |
+| Disown invalidation | node sends `x-agentenv-sandbox-disowned` | on | A cached binding survives a node's 404 until the TTL |
+| Create rescheduling | `gateway.max_schedule_retries` | `2` | Negative: one attempt, the node's refusal passes through unchanged |
+| Scheduler credential | `gateway.scheduler_auth_token` | unset | RPCs carry no `authorization` metadata |
 
 ### Schedule hints
 

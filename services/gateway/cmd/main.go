@@ -32,11 +32,35 @@ const (
 	maxAPIKeyFileLen  = maxAPIKeyLen + 2
 )
 
-func newSchedulerConn(addr string) (*grpc.ClientConn, error) {
-	return grpc.NewClient(
-		addr,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+func newSchedulerConn(addr string, authToken string) (*grpc.ClientConn, error) {
+	options := append(
+		[]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		gateway.SchedulerDialOptions(authToken)...,
 	)
+	return grpc.NewClient(addr, options...)
+}
+
+// serverOptionsFromConfig is the one place a gateway config key becomes a
+// server option. A key that parses, documents, and is then never threaded is a
+// setting that silently does nothing; keeping the mapping in one testable
+// function is what lets a test say every key arrives.
+func serverOptionsFromConfig(cfg config.GatewayConfig, apiKey string, queryOnly schedulerv1.SchedulerClient) gateway.ServerOptions {
+	return gateway.ServerOptions{
+		RequestTimeout:           cfg.RequestTimeout,
+		MaxResponseSize:          cfg.ForwardResponseSize,
+		APIKey:                   apiKey,
+		DebugMode:                cfg.DebugMode,
+		SandboxProxyDomains:      cfg.SandboxProxyDomains,
+		QueryOnlySchedulerClient: queryOnly,
+		MaxIdleConnsPerHost:      cfg.MaxIdleConnsPerHost,
+		BindingCache: gateway.BindingCacheOptions{
+			Size:        cfg.BindingCacheSize,
+			TTL:         cfg.BindingCacheTTL,
+			NegativeTTL: cfg.BindingCacheNegativeTTL,
+		},
+		MaxInFlightCreates: cfg.MaxInFlightCreates,
+		MaxScheduleRetries: cfg.MaxScheduleRetries,
+	}
 }
 
 func loadAPIKey() (string, error) {
@@ -131,7 +155,10 @@ func main() {
 	}
 	defer logger.Sync()
 
-	conn, err := newSchedulerConn(cfg.Gateway.SchedulerAddr)
+	// Both connections carry the same token: the query-only replica serves the
+	// same listener contract as the primary, and a gateway that authenticated
+	// to one but not the other would lose routing the moment enforcement lands.
+	conn, err := newSchedulerConn(cfg.Gateway.SchedulerAddr, cfg.Gateway.SchedulerAuthToken)
 	if err != nil {
 		logger.Fatal("connect scheduler failed", zap.Error(err), zap.String("addr", cfg.Gateway.SchedulerAddr))
 	}
@@ -141,7 +168,7 @@ func main() {
 	queryOnlySchedulerClient := schedulerClient
 	var queryOnlyConn *grpc.ClientConn
 	if cfg.Gateway.QueryOnlySchedulerAddr != "" {
-		queryOnlyConn, err = newSchedulerConn(cfg.Gateway.QueryOnlySchedulerAddr)
+		queryOnlyConn, err = newSchedulerConn(cfg.Gateway.QueryOnlySchedulerAddr, cfg.Gateway.SchedulerAuthToken)
 		if err != nil {
 			logger.Fatal("connect query-only scheduler failed", zap.Error(err), zap.String("addr", cfg.Gateway.QueryOnlySchedulerAddr))
 		}
@@ -149,27 +176,24 @@ func main() {
 		queryOnlySchedulerClient = schedulerv1.NewSchedulerClient(queryOnlyConn)
 	}
 
-	s, err := gateway.NewServer(logger, schedulerClient, gateway.ServerOptions{
-		RequestTimeout:           cfg.Gateway.RequestTimeout,
-		MaxResponseSize:          cfg.Gateway.ForwardResponseSize,
-		APIKey:                   apiKey,
-		DebugMode:                cfg.Gateway.DebugMode,
-		SandboxProxyDomains:      cfg.Gateway.SandboxProxyDomains,
-		QueryOnlySchedulerClient: queryOnlySchedulerClient,
-		MaxIdleConnsPerHost:      cfg.Gateway.MaxIdleConnsPerHost,
-		BindingCacheTTL:          cfg.Gateway.BindingCacheTTL,
-		MaxInFlightCreates:       cfg.Gateway.MaxInFlightCreates,
-		MaxScheduleRetries:       cfg.Gateway.MaxScheduleRetries,
-	})
+	s, err := gateway.NewServer(logger, schedulerClient, serverOptionsFromConfig(cfg.Gateway, apiKey, queryOnlySchedulerClient))
 	if err != nil {
 		logger.Fatal("init gateway server failed", zap.Error(err))
 	}
 
+	if cfg.Gateway.SchedulerAuthToken == "" {
+		// The scheduler side treats a missing token as "enforcement off", so
+		// this is a warning about what a future rollout will refuse, not an
+		// error about today.
+		logger.Warn("gateway.scheduler_auth_token is unset; scheduler RPCs carry no credential")
+	}
 	logger.Info("gateway listening",
 		zap.String("addr", cfg.Gateway.HTTPListenAddr),
 		zap.String("metrics_addr", cfg.Gateway.MetricsListenAddr),
 		zap.String("scheduler", cfg.Gateway.SchedulerAddr),
 		zap.String("query_only_scheduler", cfg.Gateway.QueryOnlySchedulerAddr),
+		zap.Bool("scheduler_auth", cfg.Gateway.SchedulerAuthToken != ""),
+		zap.Int("binding_cache_size", cfg.Gateway.BindingCacheSize),
 		zap.Strings("sandbox_proxy_domains", s.SandboxProxyDomains()),
 	)
 	httpServer := &http.Server{

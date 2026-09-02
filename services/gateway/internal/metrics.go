@@ -53,7 +53,21 @@ var (
 		},
 		[]string{"rpc", "status"},
 	)
+	// result is a closed set: hit, miss, negative_hit, evict. Read beside the
+	// LookupNode RPC rate — misses that coalesced onto one round trip show up
+	// as the gap between the two.
+	gatewayBindingCacheTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_gateway_binding_cache_total",
+			Help: "Sandbox binding cache outcomes, by result.",
+		},
+		[]string{"result"},
+	)
 )
+
+func recordGatewayBindingCache(result string) {
+	gatewayBindingCacheTotal.WithLabelValues(result).Inc()
+}
 
 type statusRecorder struct {
 	http.ResponseWriter

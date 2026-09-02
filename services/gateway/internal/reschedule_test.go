@@ -192,8 +192,9 @@ func TestScheduledCreateRetriesOnNodeRejection(t *testing.T) {
 
 // TestScheduledCreateStopsRetryingAtTheBound pins that a saturated fleet does
 // not turn every create into a walk of the whole node list. The last attempt's
-// rejection is returned to the client as the node sent it, refusal reason and
-// all, so the client can tell a full fleet from a shed.
+// rejection reaches the client as the gateway's answer, retries_exhausted, with
+// the node's Retry-After kept: the client learns that every node it was
+// offered to was full, which is a different thing from one node being full.
 func TestScheduledCreateStopsRetryingAtTheBound(t *testing.T) {
 	refusal := loadNodeAdmission503(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -212,13 +213,92 @@ func TestScheduledCreateStopsRetryingAtTheBound(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want the final rejection surfaced as 503", rec.Code)
 	}
-	if got := rec.Header().Get(headerRefusalReason); got != refusalNodeAtCapacity {
-		t.Fatalf("%s = %q, want the node's own %q passed through", headerRefusalReason, got, refusalNodeAtCapacity)
+	if got := rec.Header().Get(headerRefusalReason); got != refusalRetriesExhausted {
+		t.Fatalf("%s = %q, want %q after every offered node refused", headerRefusalReason, got, refusalRetriesExhausted)
+	}
+	if got := rec.Header().Get("Retry-After"); got != refusal.Headers["retry-after"] {
+		t.Fatalf("Retry-After = %q, want the node's own %q kept", got, refusal.Headers["retry-after"])
+	}
+	if !strings.Contains(rec.Body.String(), "503") {
+		t.Fatalf("body = %q, want the node's error body preserved", rec.Body.String())
 	}
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
 	if want := defaultMaxScheduleRetries + 1; recorder.calls != want {
 		t.Fatalf("Schedule called %d times, want it bounded at %d", recorder.calls, want)
+	}
+}
+
+// With retrying turned off there was one attempt and the node's answer is the
+// whole story; rewriting it would claim the gateway tried things it did not.
+// This is also the off switch reproducing the pre-retry gateway exactly.
+func TestScheduledCreateWithRetriesOffPassesTheNodeRefusalThrough(t *testing.T) {
+	refusal := loadNodeAdmission503(t)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		refusal.replay(w)
+	}))
+	defer upstream.Close()
+
+	recorder := &scheduleRecorder{nodes: []string{"a", "b"}}
+	server := newRescheduleTestServer(t, recorder, upstream, func(o *ServerOptions) {
+		o.MaxScheduleRetries = -1
+	})
+
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(`{"templateID":"tpl"}`))
+	req.Header.Set(headerAPIKey, testAPIKey)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if got := rec.Header().Get(headerRefusalReason); got != refusalNodeAtCapacity {
+		t.Fatalf("%s = %q, want the node's own %q with retries off", headerRefusalReason, got, refusalNodeAtCapacity)
+	}
+	if got := rec.Header().Get("Retry-After"); got != refusal.Headers["retry-after"] {
+		t.Fatalf("Retry-After = %q, want the node's %q untouched", got, refusal.Headers["retry-after"])
+	}
+}
+
+// A body the gateway could not hold gets one attempt. When that attempt is a
+// capacity refusal the client is told why there was no second one — the fix
+// on its side is a smaller request, not a wait — and still gets a Retry-After
+// because the node's refusal is transient.
+func TestScheduledCreateNamesAnUnreplayableBody(t *testing.T) {
+	refusal := loadNodeAdmission503(t)
+	var hits atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		refusal.replay(w)
+	}))
+	defer upstream.Close()
+
+	recorder := &scheduleRecorder{nodes: []string{"a", "b", "c"}}
+	server := newRescheduleTestServer(t, recorder, upstream)
+
+	body := `{"templateID":"tpl","metadata":{"pad":"` + strings.Repeat("x", maxHintBodyBytes) + `"}}`
+	req := httptest.NewRequest(http.MethodPost, "/sandboxes", strings.NewReader(body))
+	req.Header.Set(headerAPIKey, testAPIKey)
+	rec := httptest.NewRecorder()
+	server.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
+	}
+	if got := rec.Header().Get(headerRefusalReason); got != refusalBodyNotReplayable {
+		t.Fatalf("%s = %q, want %q", headerRefusalReason, got, refusalBodyNotReplayable)
+	}
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatal("a capacity refusal is transient and must carry Retry-After even when it could not be retried")
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("upstream attempts = %d, want exactly one for a body that cannot be replayed", got)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if recorder.calls != 1 {
+		t.Fatalf("Schedule called %d times, want 1", recorder.calls)
 	}
 }
 

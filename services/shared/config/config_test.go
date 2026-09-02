@@ -928,3 +928,161 @@ func TestLoadRejectsInvalidGatewayPlacementBoundsEnv(t *testing.T) {
 		t.Fatal("expected load to fail for non-integer GATEWAY_MAX_IN_FLIGHT_CREATES")
 	}
 }
+
+func TestLoadDefaultsGatewayBindingCacheAndAuth(t *testing.T) {
+	cfg, err := Load("", "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.BindingCacheSize != DefaultGatewayBindingCacheSize {
+		t.Fatalf("binding_cache_size = %d, want the default %d when the key is unset", cfg.Gateway.BindingCacheSize, DefaultGatewayBindingCacheSize)
+	}
+	if cfg.Gateway.BindingCacheTTL != 0 || cfg.Gateway.BindingCacheNegativeTTL != 0 {
+		t.Fatalf("binding cache TTLs = %s/%s, want zero (gateway default)", cfg.Gateway.BindingCacheTTL, cfg.Gateway.BindingCacheNegativeTTL)
+	}
+	if cfg.Gateway.SchedulerAuthToken != "" {
+		t.Fatalf("scheduler_auth_token = %q, want unset", cfg.Gateway.SchedulerAuthToken)
+	}
+}
+
+// Zero is this key's off switch, so an operator writing 0 must not be handed
+// the default back.
+func TestLoadParsesGatewayBindingCacheAndAuthKeys(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"gateway": {
+			"binding_cache_size": 0,
+			"binding_cache_ttl": "5s",
+			"binding_cache_negative_ttl": "1s",
+			"scheduler_auth_token": "file-token"
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := Load(path, "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.BindingCacheSize != 0 {
+		t.Fatalf("binding_cache_size = %d, want the explicit 0 kept", cfg.Gateway.BindingCacheSize)
+	}
+	if cfg.Gateway.BindingCacheTTL != 5*time.Second {
+		t.Fatalf("binding_cache_ttl = %s, want 5s", cfg.Gateway.BindingCacheTTL)
+	}
+	if cfg.Gateway.BindingCacheNegativeTTL != time.Second {
+		t.Fatalf("binding_cache_negative_ttl = %s, want 1s", cfg.Gateway.BindingCacheNegativeTTL)
+	}
+	if cfg.Gateway.SchedulerAuthToken != "file-token" {
+		t.Fatalf("scheduler_auth_token = %q, want file-token", cfg.Gateway.SchedulerAuthToken)
+	}
+}
+
+func TestLoadRejectsNumericGatewayBindingCacheDurations(t *testing.T) {
+	for _, key := range []string{"binding_cache_ttl", "binding_cache_negative_ttl"} {
+		tmpDir := t.TempDir()
+		path := filepath.Join(tmpDir, "config.json")
+		content := `{"gateway": {"` + key + `": 5}}`
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write config file failed: %v", err)
+		}
+		_, err := Load(path, "gateway")
+		if err == nil || !strings.Contains(err.Error(), "gateway."+key) {
+			t.Fatalf("err = %v, want a refusal naming gateway.%s", err, key)
+		}
+	}
+}
+
+func TestLoadAppliesGatewayBindingCacheAndAuthEnv(t *testing.T) {
+	t.Setenv("GATEWAY_BINDING_CACHE_SIZE", "0")
+	t.Setenv("GATEWAY_BINDING_CACHE_TTL", "3s")
+	t.Setenv("GATEWAY_BINDING_CACHE_NEGATIVE_TTL", "500ms")
+	t.Setenv("GATEWAY_SCHEDULER_AUTH_TOKEN", "env-token")
+
+	cfg, err := Load("", "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.BindingCacheSize != 0 {
+		t.Fatalf("binding_cache_size = %d, want 0 from env", cfg.Gateway.BindingCacheSize)
+	}
+	if cfg.Gateway.BindingCacheTTL != 3*time.Second {
+		t.Fatalf("binding_cache_ttl = %s, want 3s from env", cfg.Gateway.BindingCacheTTL)
+	}
+	if cfg.Gateway.BindingCacheNegativeTTL != 500*time.Millisecond {
+		t.Fatalf("binding_cache_negative_ttl = %s, want 500ms from env", cfg.Gateway.BindingCacheNegativeTTL)
+	}
+	if cfg.Gateway.SchedulerAuthToken != "env-token" {
+		t.Fatalf("scheduler_auth_token = %q, want env-token", cfg.Gateway.SchedulerAuthToken)
+	}
+}
+
+func TestLoadRejectsInvalidGatewayBindingCacheEnv(t *testing.T) {
+	for _, tc := range []struct{ key, value string }{
+		{"GATEWAY_BINDING_CACHE_SIZE", "lots"},
+		{"GATEWAY_BINDING_CACHE_TTL", "2"},
+		{"GATEWAY_BINDING_CACHE_NEGATIVE_TTL", "soon"},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			t.Setenv(tc.key, tc.value)
+			_, err := Load("", "gateway")
+			if err == nil || !strings.Contains(err.Error(), "invalid "+tc.key) {
+				t.Fatalf("err = %v, want the env parse refusal for %s", err, tc.key)
+			}
+		})
+	}
+}
+
+// A cached "not found" that outlives a cached binding turns a create's first
+// request into a 404, so the relation is refused at load rather than silently
+// capped at runtime where nobody would see it.
+func TestLoadRejectsGatewayNegativeTTLRelations(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{
+			name:    "negative",
+			content: `{"gateway": {"binding_cache_negative_ttl": "-1s"}}`,
+			want:    "gateway.binding_cache_negative_ttl must not be negative",
+		},
+		{
+			name:    "longer than the positive ttl",
+			content: `{"gateway": {"binding_cache_ttl": "1s", "binding_cache_negative_ttl": "2s"}}`,
+			want:    "must not exceed gateway.binding_cache_ttl",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			path := filepath.Join(tmpDir, "config.json")
+			if err := os.WriteFile(path, []byte(tc.content), 0o644); err != nil {
+				t.Fatalf("write config file failed: %v", err)
+			}
+			_, err := Load(path, "gateway")
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// The relation is only checkable when both sides are written; a negative TTL
+// alone has a documented meaning (the cache is off) and is not an error.
+func TestLoadAcceptsNegativeGatewayBindingCacheTTLAsOff(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{"gateway": {"binding_cache_ttl": "-1s", "binding_cache_negative_ttl": "1s"}}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+	cfg, err := Load(path, "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.BindingCacheTTL != -time.Second {
+		t.Fatalf("binding_cache_ttl = %s, want -1s kept", cfg.Gateway.BindingCacheTTL)
+	}
+}

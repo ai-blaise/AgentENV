@@ -196,6 +196,11 @@ func parseSchedulerDuration(raw json.RawMessage, field string) (time.Duration, e
 	return 0, fmt.Errorf("%s must be a duration string like \"30s\"", field)
 }
 
+// DefaultGatewayBindingCacheSize is the bound gateway.binding_cache_size takes
+// when the key is not written. It is a config-layer default because zero is
+// that key's off switch rather than "unset".
+const DefaultGatewayBindingCacheSize = 65536
+
 type GatewayConfig struct {
 	HTTPListenAddr         string        `json:"http_listen_addr"`
 	MetricsListenAddr      string        `json:"metrics_listen_addr"`
@@ -212,8 +217,21 @@ type GatewayConfig struct {
 	MaxIdleConnsPerHost int `json:"max_idle_conns_per_host"`
 	// BindingCacheTTL bounds how long a sandbox-to-node lookup is reused before
 	// being re-resolved. Zero uses the gateway default; it must stay well below
-	// scheduler.binding_ttl.
+	// scheduler.binding_ttl. Negative disables the cache.
 	BindingCacheTTL time.Duration `json:"binding_cache_ttl"`
+	// BindingCacheNegativeTTL bounds how long a lookup that found no binding is
+	// reused. Zero uses the gateway default; it may not exceed BindingCacheTTL.
+	BindingCacheNegativeTTL time.Duration `json:"binding_cache_negative_ttl"`
+	// BindingCacheSize bounds the bindings the gateway holds locally. Unlike
+	// the other bounds here it carries its default from defaultConfig rather
+	// than resolving zero later, because zero is the off switch: an operator
+	// who writes 0 (or a negative value) gets no cache, and one who writes
+	// nothing gets the default.
+	BindingCacheSize int `json:"binding_cache_size"`
+	// SchedulerAuthToken is presented to the scheduler on every RPC as
+	// `authorization: Bearer <token>`. Empty dials without a credential, for
+	// a scheduler that does not enforce one yet.
+	SchedulerAuthToken string `json:"scheduler_auth_token"`
 	// MaxInFlightCreates bounds concurrent create placements per gateway. Zero
 	// uses the gateway default.
 	MaxInFlightCreates int `json:"max_in_flight_creates"`
@@ -225,18 +243,21 @@ type GatewayConfig struct {
 
 func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	type wire struct {
-		HTTPListenAddr         *string         `json:"http_listen_addr"`
-		MetricsListenAddr      *string         `json:"metrics_listen_addr"`
-		SchedulerAddr          *string         `json:"scheduler_addr"`
-		QueryOnlySchedulerAddr *string         `json:"query_only_scheduler_addr"`
-		RequestTimeout         json.RawMessage `json:"request_timeout"`
-		ForwardResponseSize    *int64          `json:"forward_response_size"`
-		SandboxProxyDomains    *[]string       `json:"sandbox_proxy_domains"`
-		DebugMode              *bool           `json:"debug_mode"`
-		MaxIdleConnsPerHost    *int            `json:"max_idle_conns_per_host"`
-		BindingCacheTTL        json.RawMessage `json:"binding_cache_ttl"`
-		MaxInFlightCreates     *int            `json:"max_in_flight_creates"`
-		MaxScheduleRetries     *int            `json:"max_schedule_retries"`
+		HTTPListenAddr          *string         `json:"http_listen_addr"`
+		MetricsListenAddr       *string         `json:"metrics_listen_addr"`
+		SchedulerAddr           *string         `json:"scheduler_addr"`
+		QueryOnlySchedulerAddr  *string         `json:"query_only_scheduler_addr"`
+		RequestTimeout          json.RawMessage `json:"request_timeout"`
+		ForwardResponseSize     *int64          `json:"forward_response_size"`
+		SandboxProxyDomains     *[]string       `json:"sandbox_proxy_domains"`
+		DebugMode               *bool           `json:"debug_mode"`
+		MaxIdleConnsPerHost     *int            `json:"max_idle_conns_per_host"`
+		BindingCacheTTL         json.RawMessage `json:"binding_cache_ttl"`
+		BindingCacheNegativeTTL json.RawMessage `json:"binding_cache_negative_ttl"`
+		BindingCacheSize        *int            `json:"binding_cache_size"`
+		SchedulerAuthToken      *string         `json:"scheduler_auth_token"`
+		MaxInFlightCreates      *int            `json:"max_in_flight_creates"`
+		MaxScheduleRetries      *int            `json:"max_schedule_retries"`
 	}
 
 	parsed := wire{}
@@ -288,6 +309,19 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		g.BindingCacheTTL = d
+	}
+	if len(bytes.TrimSpace(parsed.BindingCacheNegativeTTL)) > 0 {
+		d, err := parseSchedulerDuration(parsed.BindingCacheNegativeTTL, "gateway.binding_cache_negative_ttl")
+		if err != nil {
+			return err
+		}
+		g.BindingCacheNegativeTTL = d
+	}
+	if parsed.BindingCacheSize != nil {
+		g.BindingCacheSize = *parsed.BindingCacheSize
+	}
+	if parsed.SchedulerAuthToken != nil {
+		g.SchedulerAuthToken = *parsed.SchedulerAuthToken
 	}
 
 	return nil
@@ -379,6 +413,7 @@ func defaultConfig(service string) Config {
 			RequestTimeout:      30 * time.Second,
 			ForwardResponseSize: 4 << 20,
 			SandboxProxyDomains: []string{},
+			BindingCacheSize:    DefaultGatewayBindingCacheSize,
 		},
 	}
 }
@@ -470,6 +505,34 @@ func overrideWithEnv(cfg *Config) error {
 		}
 		cfg.Gateway.MaxScheduleRetries = retries
 	}
+
+	for _, override := range []struct {
+		key    string
+		target *time.Duration
+	}{
+		{"GATEWAY_BINDING_CACHE_TTL", &cfg.Gateway.BindingCacheTTL},
+		{"GATEWAY_BINDING_CACHE_NEGATIVE_TTL", &cfg.Gateway.BindingCacheNegativeTTL},
+	} {
+		v := strings.TrimSpace(os.Getenv(override.key))
+		if v == "" {
+			continue
+		}
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid %s %q: %w", override.key, v, err)
+		}
+		*override.target = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_BINDING_CACHE_SIZE")); v != "" {
+		size, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid GATEWAY_BINDING_CACHE_SIZE %q: %w", v, err)
+		}
+		cfg.Gateway.BindingCacheSize = size
+	}
+
+	set("GATEWAY_SCHEDULER_AUTH_TOKEN", &cfg.Gateway.SchedulerAuthToken)
 
 	return nil
 }
@@ -601,6 +664,16 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 		if c.Gateway.SchedulerAddr == "" {
 			return errors.New("gateway.scheduler_addr is required")
+		}
+		if c.Gateway.BindingCacheNegativeTTL < 0 {
+			return errors.New("gateway.binding_cache_negative_ttl must not be negative; disable the cache with gateway.binding_cache_size = 0")
+		}
+		if c.Gateway.BindingCacheTTL > 0 && c.Gateway.BindingCacheNegativeTTL > c.Gateway.BindingCacheTTL {
+			return fmt.Errorf(
+				"gateway.binding_cache_negative_ttl (%s) must not exceed gateway.binding_cache_ttl (%s); "+
+					"a cached \"not found\" that outlives a cached binding turns a create's first request into a 404",
+				c.Gateway.BindingCacheNegativeTTL, c.Gateway.BindingCacheTTL,
+			)
 		}
 	}
 	return nil

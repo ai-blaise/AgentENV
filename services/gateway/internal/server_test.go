@@ -21,6 +21,7 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/config"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -218,6 +219,9 @@ func newTestServer(t *testing.T, schedulerClient schedulerv1.SchedulerClient, ti
 		RequestTimeout:  timeout,
 		MaxResponseSize: maxRespSize,
 		APIKey:          testAPIKey,
+		// The size the config layer ships. Zero here is the off switch, so a
+		// test that wants the cache gone says so through an option.
+		BindingCache: BindingCacheOptions{Size: config.DefaultGatewayBindingCacheSize},
 	}
 	for _, opt := range opts {
 		opt(&options)

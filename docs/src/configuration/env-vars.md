@@ -94,6 +94,10 @@ These variables apply to both the gateway and scheduler processes.
 | `GATEWAY_REQUEST_TIMEOUT` | `30s` | Override the gateway's HTTP request timeout (for example, `1m30s`) |
 | `GATEWAY_SANDBOX_PROXY_DOMAINS` | from config | Comma-separated DNS domains that enable gateway host-based sandbox proxy URLs like `{port}-{sandboxID}.{domain}`. Empty or unset keeps `gateway.sandbox_proxy_domains`. |
 | `GATEWAY_DEBUG_MODE` | `false` | Enable gateway debug mode |
+| `GATEWAY_BINDING_CACHE_SIZE` | `65536` | Bound on locally cached sandbox-to-node bindings. `0` or negative disables the cache. |
+| `GATEWAY_BINDING_CACHE_TTL` | `2s` | How long a resolved binding is reused. Must stay well below `scheduler.binding_ttl`; negative disables the cache. |
+| `GATEWAY_BINDING_CACHE_NEGATIVE_TTL` | `200ms` | How long a lookup that found no binding is reused. Must not be negative or exceed `GATEWAY_BINDING_CACHE_TTL`. |
+| `GATEWAY_SCHEDULER_AUTH_TOKEN` | unset | Bearer token presented to the scheduler on every RPC as `authorization: Bearer <token>`, on both scheduler addresses. Unset dials without a credential. |
 
 ## Scheduler
 

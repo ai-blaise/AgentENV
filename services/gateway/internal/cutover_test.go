@@ -217,7 +217,7 @@ func TestALargeResponseIsNotHeldInMemoryByTheCutoverPath(t *testing.T) {
 	var lookups atomic.Int32
 	client := &countingLookupClient{endpoint: upstream.URL, lookups: &lookups}
 	server := newTestServer(t, client, 5*time.Second, limit, func(o *ServerOptions) {
-		o.BindingCacheTTL = time.Minute
+		o.BindingCache.TTL = time.Minute
 	})
 	handler := authenticatedTestHandler(server)
 
@@ -375,7 +375,7 @@ func TestADirectPathDisownInvalidatesTheBindingHoweverItWasRouted(t *testing.T) 
 			client := &countingLookupClient{endpoint: upstream.URL, lookups: &lookups}
 			server := newTestServer(t, client, 5*time.Second, 1<<20,
 				withSandboxProxyDomains(domain),
-				func(o *ServerOptions) { o.BindingCacheTTL = time.Minute },
+				func(o *ServerOptions) { o.BindingCache.TTL = time.Minute },
 			)
 			handler := authenticatedTestHandler(server)
 
