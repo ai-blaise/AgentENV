@@ -189,6 +189,26 @@ runtime dependency downloads, all of which exist to start guests. It still
 generates the overlaybd runtime configuration the orchestrator reads at
 construction, and still honours every off switch above.
 
+## Fleet: sixteen mock units across two VMs
+
+`scripts/fleet/` brings the mock backend up as a fleet rather than a single
+process: four node units, a gateway, the primary scheduler, Redis and MinIO on
+one GCE VM; twelve node units, a gateway and query-only scheduler replicas on a
+second; one static `scheduler.nodes` list spanning both hosts' internal IPs.
+Every unit is a Docker container under a per-host `aenvfleet.slice` whose
+cpuset and memory cap stay clear of the GPU workload and the build jobs the two
+hosts already carry, and every unit runs with host networking — safe only
+because a mock node never primes a network slot, so nothing writes the host
+veths and iptables rules that `slot.rs` would otherwise name identically in
+every unit. No unit runs a guest.
+
+The bootstrap gates each unit on `scripts/tests/smoke/mock_node.sh` run in that
+unit's exact shape, then on the primary scheduler reporting it `ready` with
+`sandboxBackend = "mock"` through the gateway's `GET /nodes`, which is also how
+formation is verified: the ready count converging on sixteen.
+`scripts/fleet/README.md` has the carve tables, the port map, the firewall
+prerequisites and the teardown.
+
 ## Known findings not yet fixed
 
 A verification campaign — supply-chain scanning, fuzzing, mutation testing,
