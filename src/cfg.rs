@@ -696,6 +696,20 @@ pub struct MemorySnapshotConfig {
     /// memory layer. 1 = sequential (identical output layout at any value).
     #[config(default = 1)]
     pub compression_workers: usize,
+    /// Runtime-owned memory layers a pause tolerates before compacting them.
+    ///
+    /// Compaction rewrites the whole runtime suffix inside the freeze, so this
+    /// trades a deeper stack against an occasional long pause.
+    #[config(default = 32)]
+    pub max_snapshot_layers: usize,
+    /// The same budget for speculative checkpoints.
+    ///
+    /// Checkpoints run orders of magnitude more often than pauses, so the pause
+    /// budget would put an O(total memory) rewrite inside roughly every
+    /// thirty-second freeze. A deeper stack is the cheaper side of that trade;
+    /// the next real pause compacts it back down.
+    #[config(default = 96)]
+    pub checkpoint_max_snapshot_layers: usize,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }
@@ -801,6 +815,19 @@ pub struct OrchestratorConfig {
     pub admission: AdmissionConfig,
     #[config(nested)]
     pub drain: DrainConfig,
+    /// How often a running sandbox has its dirty memory checkpointed, in
+    /// milliseconds. `0` disables speculative checkpointing, which is the
+    /// shipped default: it trades steady background freezes for a shorter
+    /// pause later, and that is only worth it where pauses are on a latency
+    /// path.
+    #[config(default = 0u64)]
+    pub speculative_checkpoint_interval_ms: u64,
+    /// How many sandboxes may be checkpointed at once.
+    ///
+    /// Each capture occupies blocking threads for its memory read, so this is
+    /// the knob that keeps speculation from starving the request path.
+    #[config(default = 2)]
+    pub speculative_checkpoint_concurrency: usize,
 }
 
 /// How hard `POST /admin/drain` pushes while emptying the node.

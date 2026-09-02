@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -33,9 +33,9 @@ use crate::cfg::{BalloonConfig, ConfigManager};
 use crate::observability::prometheus::MetricGuard;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
-    CapturedSandboxSnapshot, MemoryControlCapability, PausedSandboxState, RuntimeArtifactSet,
-    SandboxBackend, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult,
-    SandboxForkSpec, SandboxMemoryTelemetry, SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, CheckpointStats, MemoryControlCapability, PausedSandboxState,
+    RuntimeArtifactSet, SandboxBackend, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
+    SandboxForkResult, SandboxForkSpec, SandboxMemoryTelemetry, SandboxRuntimeInfo,
 };
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{
@@ -329,6 +329,16 @@ impl SandboxBackend for FirecrackerSandbox {
             }
         };
         Ok(Arc::new(FirecrackerPausedState::new(snapshot_config)))
+    }
+
+    async fn checkpoint(&mut self) -> SandboxCaptureResult<CheckpointStats> {
+        // Every failure here is recoverable by construction: nothing the guest
+        // depends on is mutated, and `checkpoint_memory` resumes the VM on the
+        // way out. Reporting it as terminal would destroy a healthy sandbox
+        // over a missed optimisation.
+        FirecrackerSandbox::checkpoint_memory(self)
+            .await
+            .map_err(SandboxCaptureError::recoverable)
     }
 
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
@@ -736,6 +746,102 @@ impl FirecrackerSandbox {
             Some(captured.mem_overlaybd_config.image_config_path.clone());
     }
 
+    /// Capture dirty memory only, leaving the rootfs alone, and resume.
+    ///
+    /// The prefix of `snapshot_to_dir` up to and including `mem_image.json`,
+    /// and nothing after it: no `restack_snapshot_overlaybd_rootfs`, no
+    /// `snapshot_extra_drives`. Those are what make a capture resumable and
+    /// also what make it expensive and, on failure, terminal -- the restack
+    /// seals the writable upper, so a failure there means the sandbox cannot
+    /// resume at all. A checkpoint has neither property because it produces
+    /// nothing anyone is allowed to resume from.
+    ///
+    /// The artifacts land under the same live snapshot root as a pause, so the
+    /// next real capture inherits them as its parent chain and the guard frees
+    /// them with everything else.
+    pub async fn checkpoint_memory(&mut self) -> Result<CheckpointStats> {
+        let snapshot_root = self.live_snapshot_root().await?;
+        snapshot_root.prepare().await?;
+        let checkpoint_dir = snapshot_root.path().join(Uuid::now_v7().to_string());
+        tokio::fs::create_dir_all(&checkpoint_dir)
+            .await
+            .with_context(|| format!("create checkpoint dir {}", checkpoint_dir.display()))?;
+
+        let started = Instant::now();
+        self.run_free_page_hinting().await;
+        self.fc_instance.pause().await?;
+
+        let captured = self.capture_memory_layer(&checkpoint_dir).await;
+
+        // Resume before reporting the failure. A checkpoint that failed has
+        // touched nothing the guest depends on -- that is the whole point of
+        // skipping the rootfs -- so leaving the VM paused would turn a cheap
+        // miss into an outage.
+        let resumed = self.resume().await;
+        let freeze = started.elapsed();
+
+        let captured = match captured {
+            Ok(captured) => captured,
+            Err(err) => {
+                Self::cleanup_failed_snapshot_dir(&checkpoint_dir).await;
+                resumed.context("resume after a failed checkpoint")?;
+                return Err(err);
+            }
+        };
+        resumed.context("resume after checkpoint")?;
+
+        let (mem_image_config_path, layer_bytes) = captured;
+        // Only now: the next capture must diff against a layer that exists.
+        self.mem_snapshot_parent_config_path = Some(mem_image_config_path);
+        Ok(CheckpointStats {
+            layer_bytes,
+            freeze,
+        })
+    }
+
+    /// Writes the memory layer and its image config, returning the config path.
+    ///
+    /// Split out so `checkpoint_memory` owns the pause/resume pairing and this
+    /// owns the capture, and neither can return early past the other's cleanup.
+    async fn capture_memory_layer(&self, checkpoint_dir: &Path) -> Result<(PathBuf, u64)> {
+        let vm_state_path = checkpoint_dir.join(VM_STATE_FILE_NAME);
+        let memory_output = OverlaybdCompactOutput::from_memory_snapshot_config(
+            &ConfigManager::global_config().memory_snapshot,
+        );
+        let (mem_layer_path, _) = self
+            .snapshot_memory_to_overlaybd(&vm_state_path, checkpoint_dir, memory_output)
+            .await?;
+        let layer_bytes = tokio::fs::metadata(&mem_layer_path)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+
+        let mem_image_config = build_mem_snapshot_image_config(
+            self.mem_snapshot_parent_config_path.as_deref(),
+            &mem_layer_path,
+            checkpoint_dir,
+            memory_output,
+            ConfigManager::global_config()
+                .memory_snapshot
+                .checkpoint_max_snapshot_layers,
+        )
+        .await?;
+        let mem_image_config_path = checkpoint_dir.join("mem_image.json");
+        tokio::fs::write(
+            &mem_image_config_path,
+            serde_json::to_vec_pretty(&mem_image_config)
+                .context("serialize checkpoint mem image config")?,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "write checkpoint mem image config to {}",
+                mem_image_config_path.display()
+            )
+        })?;
+        Ok((mem_image_config_path, layer_bytes))
+    }
+
     async fn snapshot_to_dir(
         &self,
         snapshot_dir: &Path,
@@ -760,6 +866,9 @@ impl FirecrackerSandbox {
             &mem_layer_path,
             snapshot_dir,
             memory_output,
+            ConfigManager::global_config()
+                .memory_snapshot
+                .max_snapshot_layers,
         )
         .await?;
         let mem_image_config_path = snapshot_dir.join("mem_image.json");

@@ -5511,3 +5511,114 @@ async fn a_disabled_memory_control_loop_never_touches_a_guest() -> Result<()> {
     );
     Ok(())
 }
+
+/// The claim is a CAS, and it only fires for a sandbox that is actually due.
+///
+/// Both halves matter. Claiming a sandbox that is not due would freeze guests
+/// on every sweep rather than on the interval; claiming one that is not
+/// `Running` would take a sandbox out from under a pause, snapshot or delete
+/// already in flight.
+#[tokio::test]
+async fn only_a_running_due_sandbox_is_claimed_for_a_checkpoint() {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let interval = Duration::from_secs(30);
+    let now = SystemTime::now();
+    let long_ago = now - Duration::from_secs(600);
+
+    let due = SandboxId::new();
+    let fresh = SandboxId::new();
+    let busy = SandboxId::new();
+    for (id, state, created_at) in [
+        (due, SandboxState::Running, long_ago),
+        (fresh, SandboxState::Running, now),
+        (busy, SandboxState::Pausing, long_ago),
+    ] {
+        orchestrator
+            .store
+            .add(SandboxMetadata {
+                id,
+                state,
+                created_at,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    assert!(
+        orchestrator
+            .claim_checkpointable_sandbox(due, now, interval)
+            .await
+            .unwrap(),
+        "a running sandbox past its interval must be claimed"
+    );
+    assert_eq!(
+        orchestrator.store.get(&due).await.unwrap().unwrap().state,
+        SandboxState::Snapshotting,
+        "a claim must take the sandbox out of Running"
+    );
+
+    assert!(
+        !orchestrator
+            .claim_checkpointable_sandbox(fresh, now, interval)
+            .await
+            .unwrap(),
+        "a sandbox inside its interval must not be claimed"
+    );
+    assert_eq!(
+        orchestrator.store.get(&fresh).await.unwrap().unwrap().state,
+        SandboxState::Running,
+        "a refused claim must leave the state alone"
+    );
+
+    assert!(
+        !orchestrator
+            .claim_checkpointable_sandbox(busy, now, interval)
+            .await
+            .unwrap(),
+        "a sandbox already transitioning must not be claimed"
+    );
+    assert_eq!(
+        orchestrator.store.get(&busy).await.unwrap().unwrap().state,
+        SandboxState::Pausing,
+        "a refused claim must not disturb the transition in flight"
+    );
+}
+
+/// A finished checkpoint returns the sandbox to `Running` and stamps it.
+///
+/// Without the stamp the next sweep finds it due again immediately and the
+/// interval means nothing; without the restore it is stranded in a state no
+/// user action clears.
+#[tokio::test]
+async fn a_checkpoint_returns_the_sandbox_to_running_and_stamps_it() {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let sandbox_id = SandboxId::new();
+    orchestrator
+        .store
+        .add(SandboxMetadata {
+            id: sandbox_id,
+            state: SandboxState::Snapshotting,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    orchestrator
+        .checkpoint_claimed_sandbox(sandbox_id)
+        .await
+        .expect("checkpointing an absent backend is a no-op, not a failure");
+
+    let metadata = orchestrator.store.get(&sandbox_id).await.unwrap().unwrap();
+    assert_eq!(
+        metadata.state,
+        SandboxState::Running,
+        "a checkpoint must hand the sandbox back"
+    );
+    assert!(
+        metadata.last_checkpoint_at.is_some(),
+        "a checkpoint that does not stamp the sandbox leaves it due forever"
+    );
+}

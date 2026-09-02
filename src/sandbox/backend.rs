@@ -8,6 +8,7 @@ use std::any::Any;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -79,6 +80,20 @@ impl From<anyhow::Error> for SandboxCaptureError {
             Err(err) => Self::Recoverable(err),
         }
     }
+}
+
+/// What one [`SandboxBackend::checkpoint`] did.
+///
+/// `layer_bytes` is the size of the memory layer written, which is the dirty
+/// set since the previous capture -- the quantity the next pause no longer has
+/// to move. A backend with no checkpoint support reports the default, whose
+/// zero bytes and zero duration say exactly that.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointStats {
+    /// Bytes in the memory layer this checkpoint emitted.
+    pub layer_bytes: u64,
+    /// How long the guest was paused.
+    pub freeze: Duration,
 }
 
 pub type SandboxCaptureResult<T> = std::result::Result<T, SandboxCaptureError>;
@@ -320,6 +335,30 @@ pub trait SandboxBackend: Send + 'static {
     /// runtime before failing, so callers must not keep treating the sandbox
     /// as safely runnable.
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot>;
+
+    /// Capture the guest's dirty memory without capturing its rootfs.
+    ///
+    /// The point is to shorten a *later* pause: Firecracker resets its dirty
+    /// bitmap on every diff snapshot, so the next real capture emits only what
+    /// changed since this one instead of everything touched since boot.
+    ///
+    /// What comes out is deliberately **not** independently resumable. The
+    /// memory image is newer than any rootfs image on disk, because rootfs
+    /// writes are still in the live writable upper. It is a pre-stage consumed
+    /// by the next `snapshot`/`pause`, which restacks the rootfs and adopts
+    /// these layers as inherited lowers. So a checkpoint must never be
+    /// persisted, published, or reachable from the API -- a resume from one
+    /// would pair new memory with an old disk.
+    ///
+    /// Skipping the rootfs is also what makes it safe to run often: the rootfs
+    /// restack is the step that seals the writable upper and therefore the step
+    /// whose failure is terminal.
+    ///
+    /// Backends that cannot do this report no work, which is honest -- the
+    /// caller's next pause is simply as expensive as it would have been.
+    async fn checkpoint(&mut self) -> SandboxCaptureResult<CheckpointStats> {
+        Ok(CheckpointStats::default())
+    }
 
     /// Fork this running sandbox into ready child backends.
     ///

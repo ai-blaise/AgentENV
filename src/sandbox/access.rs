@@ -5,7 +5,7 @@ use anyhow::{bail, Context, Result};
 use hmac::{Hmac, Mac};
 use rand::{rngs::SysRng, TryRng};
 use sha2::Sha256;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::cfg::AppConfig;
 use crate::managed_secret::{self, CreateOutcome};
@@ -58,10 +58,18 @@ impl SandboxAccessTokenGenerator {
         let managed_seed_path = config.home_path.join(MANAGED_SEED_RELATIVE_PATH);
         let seed = resolve_seed(&managed_seed_path, managed_seed_must_exist)?;
 
+        // A managed seed is generated per node, so tokens minted on one node
+        // verify nowhere else. Standalone that is invisible; clustered it means
+        // no paused sandbox is portable -- the artifact moves, the token that
+        // opens it does not, and the failure surfaces as an opaque 401 on the
+        // node that adopted it rather than at the node that was misconfigured.
+        // A warning was not enough: nothing downstream can recover from it.
         if config.cluster.scheduler_endpoint.is_some() {
-            warn!(
-                path = %managed_seed_path.display(),
-                "using a node-local managed sandbox access-token seed; configure AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED with the same value on every node in a clustered deployment"
+            bail!(
+                "sandbox access-token seed is node-local ({}) but this node is clustered; \
+                 set AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED to the same value on every node, \
+                 otherwise a sandbox paused on one node cannot be resumed on another",
+                managed_seed_path.display()
             );
         }
 
@@ -245,6 +253,50 @@ mod tests {
 
         assert_eq!(generator.seed, "configured-seed".as_bytes());
         assert!(!managed_path.exists());
+        Ok(())
+    }
+
+    /// A clustered node must not fall back to a seed only it can verify.
+    ///
+    /// The managed seed is generated per node, so a clustered node that accepts
+    /// one mints tokens no other node can check. That is not a degraded mode,
+    /// it is a sandbox that can be paused and never resumed, so the refusal is
+    /// at startup where the operator can still act on it.
+    #[test]
+    fn a_clustered_node_refuses_a_node_local_seed() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config = AppConfig {
+            home_path: temp.path().to_owned(),
+            cluster: crate::cfg::ClusterConfig {
+                scheduler_endpoint: Some("http://scheduler:9000".to_owned()),
+            },
+            ..Default::default()
+        };
+
+        let err = SandboxAccessTokenGenerator::load_or_create(&config, false)
+            .expect_err("a clustered node accepted a seed only it can verify");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED"),
+            "the refusal must name the variable that fixes it, said {message:?}"
+        );
+        Ok(())
+    }
+
+    /// The same node, unclustered, still runs.
+    ///
+    /// Without this the fix above would read as "a managed seed is never
+    /// allowed", which would break every standalone deployment.
+    #[test]
+    fn a_standalone_node_still_creates_a_managed_seed() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config = AppConfig {
+            home_path: temp.path().to_owned(),
+            ..Default::default()
+        };
+
+        let generator = SandboxAccessTokenGenerator::load_or_create(&config, false)?;
+        assert!(!generator.seed.is_empty());
         Ok(())
     }
 

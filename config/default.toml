@@ -285,6 +285,16 @@ poll_ms = 3
 [orchestrator]
 # Expired-sandbox eviction interval in milliseconds (1000 = 1 second).
 auto_evict_interval_ms = 1000
+
+# How often a running sandbox has its dirty memory checkpointed, in ms.
+# 0 disables it. A checkpoint shortens a later pause by resetting the guest's
+# dirty bitmap, at the cost of a short freeze on this cadence -- worth it only
+# where pause latency matters.
+speculative_checkpoint_interval_ms = 0
+# How many sandboxes may be checkpointed at once. Each capture holds blocking
+# threads for its memory read, so this bounds what speculation can take from
+# the request path.
+speculative_checkpoint_concurrency = 2
 # Default sandbox lifetime in seconds when a request omits it.
 default_sandbox_timeout_secs = 15
 # Minimum auto-resumed lifetime in seconds (300 = 5 minutes).
@@ -490,6 +500,13 @@ compression_algorithm = "lz4"
 # Workers compressing 4 KiB blocks. One is sequential; higher values run in
 # parallel without changing the output layout.
 compression_workers = 1
+
+# Runtime-owned memory layers a pause tolerates before compacting them.
+# Compaction rewrites the whole runtime suffix inside the freeze.
+max_snapshot_layers = 32
+# The same budget for speculative checkpoints, which run far more often; a
+# deeper stack is cheaper than an O(total memory) rewrite on that cadence.
+checkpoint_max_snapshot_layers = 96
 
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd

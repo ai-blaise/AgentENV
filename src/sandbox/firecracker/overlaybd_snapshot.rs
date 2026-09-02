@@ -35,6 +35,13 @@ use crate::sandbox::SandboxCaptureError;
 /// triggers; the effective budget shrinks as the stable prefix grows. Well
 /// below the hard limit of 255 (`MAX_STACK_LAYERS`) in overlaybd.
 const DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS: usize = 32;
+
+/// Hard ceiling on any caller-supplied layer budget.
+///
+/// overlaybd itself refuses a stack deeper than 255. A budget is a knob an
+/// operator can set, so it is clamped here rather than trusted: exceeding the
+/// limit does not degrade, it fails to open the image.
+const MAX_OVERLAYBD_STACK_DEPTH: usize = 250;
 const INHERITED_LAYERS_DIR: &str = "inherited-layers";
 const MANAGED_BASE_LAYER_FILE: &str = "managed-base.commit";
 const FIRECRACKER_DIRTY_PAGE_SIZE: u64 = 4096;
@@ -382,6 +389,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         MANAGED_BASE_LAYER_FILE,
         // Rootfs layers must stay raw: only memory snapshots may be compressed.
         OverlaybdCompactOutput::Raw,
+        DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS,
     )
     .await?;
     image_config.lowers = rewritten_lowers;
@@ -401,6 +409,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
     compaction_output: OverlaybdCompactOutput,
+    layer_budget: usize,
 ) -> Result<Vec<LayerConfig>> {
     rewrite_lowers_with_runtime_roots(
         existing_lowers,
@@ -409,6 +418,7 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
         compaction_output_name,
         canonicalized_runtime_owned_roots(),
         compaction_output,
+        layer_budget,
     )
     .await
 }
@@ -420,6 +430,7 @@ async fn rewrite_lowers_with_runtime_roots(
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
+    layer_budget: usize,
 ) -> Result<Vec<LayerConfig>> {
     let (mut lowers, mut runtime_owned_lowers) =
         split_runtime_suffix(existing_lowers, runtime_owned_roots);
@@ -431,7 +442,8 @@ async fn rewrite_lowers_with_runtime_roots(
     // layer is never pointlessly rewritten into itself. This keeps the total
     // stack well below overlaybd's 255-layer hard limit without compacting on
     // every pause when the prefix is already large.
-    let max_runtime_owned_layers = DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS
+    let max_runtime_owned_layers = layer_budget
+        .min(MAX_OVERLAYBD_STACK_DEPTH)
         .saturating_sub(lowers.len() / 4)
         .max(1);
     let compactable_count = runtime_owned_lowers.len() + usize::from(appended_layer.is_some());
@@ -573,6 +585,7 @@ pub(super) async fn build_mem_snapshot_image_config(
     new_layer_path: &Path,
     output_dir: &Path,
     memory_output: OverlaybdCompactOutput,
+    layer_budget: usize,
 ) -> Result<ImageConfig> {
     let inherited_image_config =
         load_existing_image_config(resume_mem_image_config_path, "memory snapshot")?;
@@ -583,6 +596,7 @@ pub(super) async fn build_mem_snapshot_image_config(
         Some(new_layer),
         "mem_compacted.commit",
         memory_output,
+        layer_budget,
     )
     .await?;
 
@@ -989,6 +1003,7 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
+            DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS,
         )
         .await
         .expect("rewrite inherited runtime layers");
@@ -1054,6 +1069,7 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
+            DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS,
         )
         .await
         .expect("rewrite with deep stable prefix");
@@ -1134,6 +1150,7 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
+            DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS,
         )
         .await
         .expect("rewrite with shrinking budget");
@@ -1144,6 +1161,120 @@ mod tests {
         assert_eq!(compacted, output_dir.join(MANAGED_BASE_LAYER_FILE));
         assert!(compacted.exists());
         assert!(!compacted.with_extension("commit.tmp").exists());
+    }
+
+    /// The budget is what decides compaction, and a checkpoint's is larger.
+    ///
+    /// Same stack, same layers, two budgets: the pause budget compacts and the
+    /// checkpoint budget does not. Without this the parameter could be threaded
+    /// everywhere and read nowhere, which is how it was hard-coded before.
+    #[tokio::test]
+    async fn a_larger_budget_leaves_the_suffix_uncompacted() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        // 124 stable lowers shrink any budget by 31. The pause budget of 32
+        // lands on 1, so two runtime layers exceed it; a checkpoint budget of
+        // 96 lands on 65 and leaves them alone.
+        let build_lowers = |suffix: &[PathBuf]| {
+            let mut lowers: Vec<LayerConfig> = (0..124)
+                .map(|index| LayerConfig {
+                    file: String::new(),
+                    digest: format!("sha256:base-{index}"),
+                    size: 4096,
+                    ..Default::default()
+                })
+                .collect();
+            lowers.extend(suffix.iter().map(|path| local_layer_config(path)));
+            lowers
+        };
+        let layer_a = seal_raw_test_layer(&runtime_root, "a", 4096, &[(0, 0xAA)]).await;
+        let layer_b = seal_raw_test_layer(&runtime_root, "b", 4096, &[(0, 0xBB)]).await;
+        let suffix = [layer_a, layer_b];
+
+        let pause_dir = temp.path().join("pause-out");
+        std::fs::create_dir_all(&pause_dir).expect("create pause out");
+        let compacted = rewrite_lowers_with_runtime_roots(
+            build_lowers(&suffix),
+            &pause_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS,
+        )
+        .await
+        .expect("rewrite under the pause budget");
+
+        let checkpoint_dir = temp.path().join("checkpoint-out");
+        std::fs::create_dir_all(&checkpoint_dir).expect("create checkpoint out");
+        let kept = rewrite_lowers_with_runtime_roots(
+            build_lowers(&suffix),
+            &checkpoint_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            96,
+        )
+        .await
+        .expect("rewrite under the checkpoint budget");
+
+        assert_eq!(
+            compacted.len(),
+            125,
+            "the pause budget must fold the runtime suffix into one layer"
+        );
+        assert_eq!(
+            kept.len(),
+            126,
+            "the checkpoint budget must leave both runtime layers standing"
+        );
+        assert!(
+            !checkpoint_dir.join(MANAGED_BASE_LAYER_FILE).exists(),
+            "a checkpoint under budget must not pay for a compaction"
+        );
+    }
+
+    /// A budget above overlaybd's stack limit is clamped, not honoured.
+    ///
+    /// The budget is operator-settable, and overlaybd does not degrade past 255
+    /// lowers -- it fails to open the image.
+    #[tokio::test]
+    async fn an_absurd_budget_is_clamped_to_the_stack_limit() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_root = temp.path().join("runtime");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+        let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
+
+        let mut lowers = Vec::new();
+        for index in 0..(MAX_OVERLAYBD_STACK_DEPTH + 2) {
+            let layer =
+                seal_raw_test_layer(&runtime_root, &format!("l{index}"), 4096, &[(0, 0xCD)]).await;
+            lowers.push(local_layer_config(&layer));
+        }
+
+        let rewritten = rewrite_lowers_with_runtime_roots(
+            lowers,
+            &output_dir,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &runtime_owned_roots,
+            OverlaybdCompactOutput::Raw,
+            usize::MAX,
+        )
+        .await
+        .expect("rewrite under an absurd budget");
+
+        assert_eq!(
+            rewritten.len(),
+            1,
+            "a budget above the stack limit must still compact, not be taken at face value"
+        );
     }
 
     #[tokio::test]
@@ -1225,6 +1356,7 @@ mod tests {
             &new_layer,
             temp.path(),
             OverlaybdCompactOutput::Raw,
+            DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS,
         )
         .await
         .expect("build memory image config");

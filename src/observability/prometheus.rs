@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::extract::Request;
 use axum::http::{Method, StatusCode};
@@ -53,6 +53,23 @@ impl HttpRouteSource {
             Self::ProxyPrefix => "proxy_prefix",
         }
     }
+}
+
+/// Records one completed speculative checkpoint.
+///
+/// The freeze duration rides the same histogram as every other capture stage so
+/// a checkpoint freeze can be compared directly against a pause freeze, which is
+/// the comparison that says whether speculation is paying for itself. The bytes
+/// are separate: they are the dirty set the next pause no longer has to move.
+pub fn record_checkpoint(layer_bytes: u64, freeze: Duration) {
+    metrics::histogram!(
+        "agentenv_sandbox_stage_duration_seconds",
+        "operation" => "checkpoint",
+        "stage" => "freeze",
+        "status" => "ok",
+    )
+    .record(freeze.as_secs_f64());
+    metrics::histogram!("agentenv_sandbox_checkpoint_bytes").record(layer_bytes as f64);
 }
 
 pub struct SandboxStageTimer {

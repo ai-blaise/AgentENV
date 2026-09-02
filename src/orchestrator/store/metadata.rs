@@ -58,10 +58,32 @@ pub struct SandboxMetadata {
     /// Older records deserialize as non-secure sandboxes.
     #[serde(default)]
     pub secure: bool,
+    /// When this sandbox last had its dirty memory checkpointed.
+    ///
+    /// Only the speculative checkpoint driver reads or writes it. Records
+    /// written before checkpointing existed decode as `None`, which reads as
+    /// "never checkpointed" and is correct.
+    #[serde(default)]
+    pub last_checkpoint_at: Option<SystemTime>,
     /// Paused state produced by the sandbox backend during `pause`.
     /// Passed back to the backend factory when `resume_sandbox` is called.
     #[serde(skip)]
     pub paused_state: Option<Arc<dyn PausedSandboxState>>,
+}
+
+impl SandboxMetadata {
+    /// Whether this sandbox is due for a speculative checkpoint.
+    ///
+    /// A sandbox that has never been checkpointed is due as soon as it has been
+    /// alive for one interval -- checkpointing at the instant of creation would
+    /// capture a guest that has not dirtied anything yet and pay a freeze for
+    /// an empty layer.
+    pub fn checkpoint_due(&self, now: SystemTime, interval: Duration) -> bool {
+        let since = self.last_checkpoint_at.unwrap_or(self.created_at);
+        now.duration_since(since)
+            .map(|elapsed| elapsed >= interval)
+            .unwrap_or(false)
+    }
 }
 
 impl Default for SandboxMetadata {
@@ -77,6 +99,7 @@ impl Default for SandboxMetadata {
             expires_at: None,
             auto_resume: false,
             virtualization_mode: VirtualizationMode::default(),
+            last_checkpoint_at: None,
             runtime_versions: SnapshotRuntimeVersions::new(
                 "unknown".to_string(),
                 "unknown".to_string(),
@@ -130,6 +153,59 @@ impl SandboxMetadata {
 
 #[cfg(test)]
 mod tests {
+
+    /// A sandbox that has never been checkpointed is due off its creation time.
+    ///
+    /// Falling back to `created_at` rather than treating `None` as "due now" is
+    /// what stops a freshly created sandbox being frozen before it has dirtied
+    /// anything, which would pay a freeze for an empty layer.
+    #[test]
+    fn checkpoint_due_counts_from_creation_until_the_first_checkpoint() {
+        let interval = Duration::from_secs(30);
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let metadata = SandboxMetadata {
+            created_at: created,
+            last_checkpoint_at: None,
+            ..Default::default()
+        };
+
+        assert!(
+            !metadata.checkpoint_due(created + Duration::from_secs(29), interval),
+            "a sandbox younger than one interval is not due"
+        );
+        assert!(
+            metadata.checkpoint_due(created + interval, interval),
+            "a sandbox that has never been checkpointed is due after one interval"
+        );
+
+        let checkpointed = SandboxMetadata {
+            last_checkpoint_at: Some(created + Duration::from_secs(100)),
+            ..metadata
+        };
+        assert!(
+            !checkpointed.checkpoint_due(created + Duration::from_secs(120), interval),
+            "the last checkpoint, not creation, sets the next deadline"
+        );
+        assert!(
+            checkpointed.checkpoint_due(created + Duration::from_secs(130), interval),
+            "one interval after the last checkpoint it is due again"
+        );
+    }
+
+    /// A clock that went backwards must not make everything due.
+    #[test]
+    fn a_backwards_clock_does_not_make_a_sandbox_due() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let metadata = SandboxMetadata {
+            created_at: created,
+            last_checkpoint_at: None,
+            ..Default::default()
+        };
+        assert!(
+            !metadata.checkpoint_due(created - Duration::from_secs(10), Duration::from_secs(30)),
+            "a now earlier than the reference point must read as not due"
+        );
+    }
     use super::*;
     use std::time::UNIX_EPOCH;
 

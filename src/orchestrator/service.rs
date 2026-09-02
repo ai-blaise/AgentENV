@@ -7,7 +7,8 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use futures::stream::StreamExt;
-use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
+use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock, Semaphore};
+use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
 
@@ -15,13 +16,13 @@ use crate::cfg::{ConfigManager, MemoryControlConfig};
 use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
-use crate::observability::prometheus::{MetricGuard, SandboxStageTimer};
+use crate::observability::prometheus::{record_checkpoint, MetricGuard, SandboxStageTimer};
 use crate::sandbox::{
-    CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerPausedState,
-    FirecrackerSandboxFactory, FirecrackerSnapshotManifest, FreshSandboxBuildSpec,
-    PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator, SandboxBackend,
-    SandboxBackendFactory, SandboxForkSpec, SandboxLaunchConfig, SandboxNetworkPolicy,
-    SandboxRuntimeInfo,
+    CheckpointStats, CustomExtensionClient, CustomExtensionParams, EnvdAccessToken,
+    FirecrackerPausedState, FirecrackerSandboxFactory, FirecrackerSnapshotManifest,
+    FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator,
+    SandboxBackend, SandboxBackendFactory, SandboxForkSpec, SandboxLaunchConfig,
+    SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
@@ -48,6 +49,12 @@ type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
 /// Maximum time to wait for a sandbox to leave a transitional state.
 /// Guards against indefinite blocking when a sandbox's in-progress operation
 /// never completes (e.g. the task holding the state panics without rolling back).
+/// How many times a pause re-attempts its claim while a capture holds the
+/// sandbox. Two waits and a final try: a capture is one freeze, so more than
+/// that means something is re-claiming faster than the pause can win, and
+/// erroring is more useful than waiting.
+const PAUSE_CAPTURE_WAIT_ATTEMPTS: usize = 3;
+
 const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
 const MEMORY_CONTROL_PASS_METRIC: &str = "agentenv_memory_control_pass_duration_seconds";
@@ -281,7 +288,25 @@ where
 
         // Start the auto-evict task.
         let evict_interval = Duration::from_millis(config.auto_evict_interval_ms);
-        Self::start_auto_evict_task(Arc::clone(&orchestrator), evict_interval, shutdown_rx);
+        Self::start_auto_evict_task(
+            Arc::clone(&orchestrator),
+            evict_interval,
+            shutdown_rx.clone(),
+        );
+
+        // Speculative checkpointing, when the operator has asked for it. Off by
+        // default: it buys a shorter pause with a steady stream of short
+        // freezes, which is only the right trade where pauses are on a latency
+        // path.
+        let checkpoint_interval = Duration::from_millis(config.speculative_checkpoint_interval_ms);
+        if !checkpoint_interval.is_zero() {
+            Self::start_speculative_checkpoint_task(
+                Arc::clone(&orchestrator),
+                checkpoint_interval,
+                config.speculative_checkpoint_concurrency,
+                shutdown_rx,
+            );
+        }
 
         // Reconcile durable paused protection, then start maintenance (fail-closed).
         let gc = app_config.image.cache.gc_schedule();
@@ -1198,6 +1223,183 @@ where
         }
     }
 
+    /// Claims a running sandbox for a speculative checkpoint.
+    ///
+    /// The read-modify-write happens inside the store's single write lock, so a
+    /// user pause, snapshot or delete arriving at the same moment
+    /// deterministically wins or loses rather than interleaving with the
+    /// freeze. Losing is the common case and is not an error.
+    ///
+    /// `Snapshotting` is reused rather than adding a state: `SandboxState` is
+    /// user-visible through `Display` and the API model, and a checkpoint is
+    /// not a thing users asked for or should have to learn about.
+    async fn claim_checkpointable_sandbox(
+        &self,
+        sandbox_id: SandboxId,
+        now: SystemTime,
+        interval: Duration,
+    ) -> Result<bool> {
+        match self
+            .store
+            .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+                if metadata.checkpoint_due(now, interval) {
+                    metadata.state = SandboxState::Snapshotting;
+                }
+            })
+            .await
+        {
+            Ok(update) if update.current.state == SandboxState::Snapshotting => Ok(true),
+            Ok(_) => Ok(false),
+            Err(StoreError::StateConflict { .. }) | Err(StoreError::SandboxNotFound { .. }) => {
+                Ok(false)
+            }
+            Err(err) => Err(OrchestratorError::from(err)),
+        }
+    }
+
+    /// Checkpoints one claimed sandbox and returns it to `Running`.
+    ///
+    /// The state is restored whatever happens. A checkpoint mutates nothing the
+    /// guest depends on, so a failed one must leave a running sandbox running;
+    /// leaving it in `Snapshotting` would strand it in a state no user action
+    /// can clear.
+    async fn checkpoint_claimed_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
+        let outcome = match handle {
+            Some(handle) => {
+                let mut sandbox = handle.lock().await;
+                sandbox.checkpoint().await
+            }
+            None => Ok(CheckpointStats::default()),
+        };
+
+        let restored = self
+            .store
+            .update_if_state(&sandbox_id, &[SandboxState::Snapshotting], |metadata| {
+                metadata.state = SandboxState::Running;
+                metadata.last_checkpoint_at = Some(SystemTime::now());
+            })
+            .await;
+        if let Err(err) = restored {
+            warn!("failed to return sandbox to running after checkpoint: {err}");
+        }
+
+        match outcome {
+            Ok(stats) => {
+                if stats.layer_bytes > 0 {
+                    record_checkpoint(stats.layer_bytes, stats.freeze);
+                }
+                Ok(())
+            }
+            Err(err) => Err(OrchestratorError::from(anyhow::Error::from(err))),
+        }
+    }
+
+    /// Checkpoints every running sandbox that is due, bounded in concurrency.
+    ///
+    /// Bounded because the memory read behind a capture occupies a blocking
+    /// thread per concurrent chunk; unbounded, a node with many sandboxes would
+    /// spend its blocking pool on speculation and stop serving the proxy.
+    async fn checkpoint_due_sandboxes(
+        self: &Arc<Self>,
+        interval: Duration,
+        concurrency: usize,
+    ) -> Result<usize> {
+        if self.is_shutting_down() || interval.is_zero() {
+            return Ok(0);
+        }
+
+        let now = SystemTime::now();
+        let candidates: Vec<SandboxId> = self
+            .store
+            .list()
+            .await?
+            .into_iter()
+            .filter(|metadata| {
+                metadata.state == SandboxState::Running && metadata.checkpoint_due(now, interval)
+            })
+            .map(|metadata| metadata.id)
+            .collect();
+
+        let permits = Arc::new(Semaphore::new(concurrency.max(1)));
+        let mut tasks = JoinSet::new();
+        for sandbox_id in candidates {
+            let this = Arc::clone(self);
+            let permits = Arc::clone(&permits);
+            tasks.spawn(async move {
+                let _permit = permits.acquire_owned().await.ok()?;
+                match this
+                    .claim_checkpointable_sandbox(sandbox_id, now, interval)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => return None,
+                    Err(err) => {
+                        debug!("skipping checkpoint claim: {err}");
+                        return None;
+                    }
+                }
+                match this.checkpoint_claimed_sandbox(sandbox_id).await {
+                    Ok(()) => Some(()),
+                    Err(err) => {
+                        warn!(%sandbox_id, "speculative checkpoint failed: {err}");
+                        None
+                    }
+                }
+            });
+        }
+
+        let mut checkpointed = 0;
+        while let Some(joined) = tasks.join_next().await {
+            if matches!(joined, Ok(Some(()))) {
+                checkpointed += 1;
+            }
+        }
+        Ok(checkpointed)
+    }
+
+    /// Background driver for speculative checkpoints.
+    ///
+    /// Structurally the auto-evict task: a `Weak<Self>` so the orchestrator can
+    /// still be dropped, a skipping ticker so a slow sweep does not queue
+    /// another, and the same shutdown channel.
+    fn start_speculative_checkpoint_task(
+        this: Arc<Self>,
+        interval: Duration,
+        concurrency: usize,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) {
+        let Ok(runtime_handle) = tokio::runtime::Handle::try_current() else {
+            warn!("speculative checkpoint task not started: no Tokio runtime available");
+            return;
+        };
+
+        let this = Arc::downgrade(&this);
+        runtime_handle.spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            debug!("speculative checkpoint task started with interval {interval:?}");
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        let Some(this) = this.upgrade() else { break };
+                        if let Err(err) =
+                            this.checkpoint_due_sandboxes(interval, concurrency).await
+                        {
+                            warn!("speculative checkpoint sweep failed: {err}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     async fn delete_sandbox_impl(
         self: &Arc<Self>,
         sandbox_id: SandboxId,
@@ -1451,35 +1653,60 @@ where
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("pausing sandbox");
-        match self
-            .store
-            .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
-            .await
-        {
-            Ok(_) => {}
-            Err(StoreError::StateConflict { actual_state, .. }) => {
-                return match actual_state {
-                    // Another task is already performing the pause.  Wait for
-                    // it to finish and then report the final outcome.
-                    SandboxState::Pausing => self.join_concurrent_pause(sandbox_id).await,
-                    SandboxState::Paused => Ok(()),
-                    SandboxState::Killing => {
-                        info!("sandbox is being deleted while pausing");
-                        Err(OrchestratorError::SandboxNotFound(sandbox_id))
-                    }
-                    _ => {
-                        info!(state = ?actual_state, "cannot pause sandbox in current state");
-                        Err(OrchestratorError::InvalidSandboxState {
-                            sandbox_id,
-                            state: actual_state,
-                        })
-                    }
-                };
+        // A capture holds `Snapshotting` for the length of a freeze. Speculative
+        // checkpoints take it on their own schedule, so a user pause that
+        // errored on it would fail for a reason the user did not cause and
+        // cannot see. Wait it out and try again instead. Bounded, because
+        // waiting forever on a sandbox that keeps being re-claimed is a hang
+        // dressed up as patience.
+        for attempt in 0..PAUSE_CAPTURE_WAIT_ATTEMPTS {
+            match self
+                .store
+                .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
+                .await
+            {
+                Ok(_) => break,
+                Err(StoreError::StateConflict {
+                    actual_state: SandboxState::Snapshotting,
+                    ..
+                }) if attempt + 1 < PAUSE_CAPTURE_WAIT_ATTEMPTS => {
+                    debug!("waiting for an in-flight capture before pausing");
+                    self.wait_for_transition(sandbox_id, SandboxState::Snapshotting)
+                        .await?;
+                }
+                Err(err) => return self.report_pause_conflict(sandbox_id, err).await,
             }
-            Err(err) => return Err(OrchestratorError::from(err)),
         }
 
         self.pause_sandbox_impl(sandbox_id).await
+    }
+
+    /// Turns a failed claim of the pause transition into the caller's answer.
+    async fn report_pause_conflict(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        err: StoreError,
+    ) -> Result<()> {
+        let StoreError::StateConflict { actual_state, .. } = err else {
+            return Err(OrchestratorError::from(err));
+        };
+        match actual_state {
+            // Another task is already performing the pause. Wait for it to
+            // finish and then report the final outcome.
+            SandboxState::Pausing => self.join_concurrent_pause(sandbox_id).await,
+            SandboxState::Paused => Ok(()),
+            SandboxState::Killing => {
+                info!("sandbox is being deleted while pausing");
+                Err(OrchestratorError::SandboxNotFound(sandbox_id))
+            }
+            _ => {
+                info!(state = ?actual_state, "cannot pause sandbox in current state");
+                Err(OrchestratorError::InvalidSandboxState {
+                    sandbox_id,
+                    state: actual_state,
+                })
+            }
+        }
     }
 
     async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
