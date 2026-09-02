@@ -527,9 +527,15 @@ async fn fetch_p2p_range(
     let fetch_len = p2p_fetch_len(request_range, len, metadata.size())?;
     let bytes = tokio::time::timeout(
         state.fetch_range_timeout,
-        state
-            .transport
-            .fetch_byte_range(&layer.descriptor, request_range.start, fetch_len),
+        // The streaming variant: this is a demand read on a page-fault path,
+        // so the bytes have one consumer and no reason to be written down on
+        // the way to it. Prefill is what wants the store, and it takes the
+        // other method.
+        state.transport.fetch_byte_range_streaming(
+            &layer.descriptor,
+            request_range.start,
+            fetch_len,
+        ),
     )
     .await
     .map_err(|_| {
@@ -539,9 +545,10 @@ async fn fetch_p2p_range(
         )
     })?
     .context("fetch p2p layer range")?;
-    // For remote P2P providers this timeout covers the network range download
-    // into the local store. For local providers it only covers stream creation;
-    // later local-store reads flow through the response body.
+    // The timeout covers reaching first bytes, not the whole transfer: the
+    // streaming path returns as soon as the connection is established and the
+    // request is on the wire, and the bytes then flow through the response
+    // body. A local provider behaves the same way, for the same reason.
     // Once this stream is attached to the response body, headers are committed;
     // any mid-stream P2P failure is reported through HTTP framing instead of
     // falling back to origin.

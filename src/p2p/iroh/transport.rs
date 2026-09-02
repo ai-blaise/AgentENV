@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
+use bao_tree::io::BaoContentItem;
 use bytes::Bytes;
-use futures::{stream, StreamExt};
+use futures::{stream, Stream, StreamExt};
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::presets;
 use iroh::protocol::Router;
@@ -18,6 +19,7 @@ use iroh::{Endpoint, EndpointAddr, Watcher};
 use iroh_blobs::api::blobs::{AddPathOptions, ImportMode};
 use iroh_blobs::api::downloader::{DownloadProgressItem, Downloader};
 use iroh_blobs::api::proto::ExportRangesItem;
+use iroh_blobs::get;
 use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
 use iroh_blobs::store::fs::{options::Options as FsStoreOptions, FsStore};
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
@@ -94,6 +96,15 @@ pub struct IrohBlobsP2pTransport {
     fetch_timeout: Duration,
     /// Pooled catalog connections, or `None` when pooling is turned off.
     catalog_pool: Option<ConnectionPool>,
+    /// Pooled blob connections, on iroh-blobs' own ALPN.
+    ///
+    /// Separate from `catalog_pool` because a pool is bound to one ALPN, and
+    /// separate from the `Downloader`'s connections because a streamed range
+    /// drives the get state machine itself rather than going through the
+    /// store. Sized and aged from the same config: a demand read that
+    /// re-handshakes per range has not avoided any of the latency the
+    /// streaming path exists to avoid.
+    blobs_pool: Option<ConnectionPool>,
     /// Catalog connections this node has actually dialled.
     ///
     /// Incremented from the pool's connect callback, so it counts handshakes
@@ -191,6 +202,7 @@ impl IrohBlobsP2pTransport {
             &config,
             Arc::clone(&catalog_connections),
         );
+        let blobs_pool = build_blobs_pool(router.endpoint().clone(), &config);
 
         Self::spawn_gc_arming_task(Arc::clone(&pending_gc), gc_interval, store_dir.clone());
         Self::spawn_reannounce_task(
@@ -219,6 +231,7 @@ impl IrohBlobsP2pTransport {
             catalog_lookup_timeout: config.catalog_lookup_timeout,
             fetch_timeout: config.fetch_timeout,
             catalog_pool,
+            blobs_pool,
             catalog_connections,
             cluster_cidrs,
             pending_gc,
@@ -752,6 +765,126 @@ fn build_catalog_pool(
     Some(ConnectionPool::new(endpoint, CATALOG_ALPN, options))
 }
 
+/// Builds the blob-transfer pool, or `None` when pooling is off.
+///
+/// Shares the catalog's sizing because both are per-peer connection reuse
+/// against the same fleet, and a separate pair of knobs would be two ways to
+/// express one intent.
+fn build_blobs_pool(endpoint: Endpoint, config: &ResolvedP2pConfig) -> Option<ConnectionPool> {
+    if config.catalog_max_connections == 0 {
+        return None;
+    }
+    let options = ConnectionPoolOptions {
+        idle_timeout: config.catalog_connection_idle,
+        max_connections: config.catalog_max_connections,
+        ..ConnectionPoolOptions::default()
+    };
+    Some(ConnectionPool::new(endpoint, iroh_blobs::ALPN, options))
+}
+
+/// Streams one BLAKE3-verified byte range straight off a peer connection.
+///
+/// The get state machine yields the blob's leaves in order, each stamped with
+/// its offset in the blob. Verification happens as they arrive, so a peer
+/// cannot substitute bytes; what this adds is that nothing is written down on
+/// the way past. Leaves outside the requested range are produced by the
+/// protocol -- a range is widened to chunk boundaries -- and are dropped here
+/// rather than returned, so the caller sees exactly the bytes it asked for.
+fn stream_verified_blob_range(
+    connection: iroh_blobs::util::connection_pool::ConnectionRef,
+    blob_hash: iroh_blobs::Hash,
+    range: std::ops::Range<u64>,
+    budget: u64,
+) -> impl Stream<Item = Result<Bytes>> + Send + 'static {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(8);
+    tokio::spawn(async move {
+        // The pool permit lives on the `ConnectionRef`, so it is moved in here
+        // rather than cloned out of: releasing it at the end of the call that
+        // opened it would have the pool counting this transfer's connection as
+        // free for its whole duration.
+        let result =
+            drive_verified_blob_range((*connection).clone(), blob_hash, range, budget, &tx).await;
+        drop(connection);
+        if let Err(err) = result {
+            let _ = tx.send(Err(err)).await;
+        }
+    });
+    stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    })
+}
+
+async fn drive_verified_blob_range(
+    connection: iroh::endpoint::Connection,
+    blob_hash: iroh_blobs::Hash,
+    range: std::ops::Range<u64>,
+    budget: u64,
+    tx: &tokio::sync::mpsc::Sender<Result<Bytes>>,
+) -> Result<()> {
+    let request = GetRequest::blob_ranges(blob_hash, ChunkRanges::bytes(range.clone()));
+    let connected = get::fsm::start(connection, request, Default::default())
+        .next()
+        .await
+        .map_err(|err| Error::Internal(anyhow::anyhow!("open streamed range request: {err}")))?;
+    let get::fsm::ConnectedNext::StartRoot(start) = connected
+        .next()
+        .await
+        .map_err(|err| Error::Internal(anyhow::anyhow!("start streamed range: {err}")))?
+    else {
+        return Err(Error::Internal(anyhow::anyhow!(
+            "peer answered a blob range request with no root"
+        )));
+    };
+    let (mut content, _size) = start
+        .next()
+        .next()
+        .await
+        .map_err(|err| Error::Internal(anyhow::anyhow!("read streamed range header: {err}")))?;
+
+    let mut delivered = 0_u64;
+    loop {
+        match content.next().await {
+            get::fsm::BlobContentNext::More((next, item)) => {
+                let item = item.map_err(|err| {
+                    Error::Internal(anyhow::anyhow!("verify streamed range: {err}"))
+                })?;
+                if let BaoContentItem::Leaf(leaf) = item {
+                    if let Some(slice) = slice_to_range(&leaf, &range) {
+                        delivered = delivered.saturating_add(slice.len() as u64);
+                        // The bound is on what a peer may send, not on what was
+                        // asked for: an unbounded reader is a peer-controlled
+                        // allocation on a page-fault path.
+                        if delivered > budget {
+                            return Err(Error::Internal(anyhow::anyhow!(
+                                "peer sent {delivered} bytes for a range budgeted at {budget}"
+                            )));
+                        }
+                        if tx.send(Ok(slice)).await.is_err() {
+                            // The reader is gone; so is the reason to keep pulling.
+                            return Ok(());
+                        }
+                    }
+                }
+                content = next;
+            }
+            get::fsm::BlobContentNext::Done(_) => return Ok(()),
+        }
+    }
+}
+
+/// Clips one leaf to the requested byte range, or drops it entirely.
+fn slice_to_range(leaf: &bao_tree::io::Leaf, range: &std::ops::Range<u64>) -> Option<Bytes> {
+    let leaf_end = leaf.offset.saturating_add(leaf.data.len() as u64);
+    let start = leaf.offset.max(range.start);
+    let end = leaf_end.min(range.end);
+    if start >= end {
+        return None;
+    }
+    let from = (start - leaf.offset) as usize;
+    let to = (end - leaf.offset) as usize;
+    Some(leaf.data.slice(from..to))
+}
+
 fn pool_connect_error(node_id: &str, err: PoolConnectError) -> Error {
     Error::Internal(anyhow::anyhow!(
         "connect to P2P catalog peer {node_id}: {err}"
@@ -958,6 +1091,62 @@ impl P2pTransport for IrohBlobsP2pTransport {
         let stream = self.export_local_blob_range(blob_hash, range).await?;
         debug!(providers_count, "fetched artifact range from P2P provider");
         Ok(stream)
+    }
+
+    async fn fetch_byte_range_streaming(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        offset: u64,
+        len: usize,
+    ) -> Result<P2pByteStream> {
+        if len == 0 {
+            return Ok(Box::pin(stream::empty()));
+        }
+        let end = offset
+            .checked_add(u64::try_from(len).map_err(|err| Error::InvalidDescriptor {
+                reason: format!("range length does not fit u64: {err}"),
+            })?)
+            .ok_or_else(|| Error::InvalidDescriptor {
+                reason: "range end overflow".to_string(),
+            })?;
+        let range = offset..end;
+
+        let (blob_hash, providers) = match self.resolve_fetch_source(descriptor)? {
+            // A local hit is already store-resident; reading it back is the
+            // cheapest path there is, not a detour.
+            BlobFetchSource::Local { blob_hash } => {
+                return self.export_local_blob_range(blob_hash, range).await;
+            }
+            BlobFetchSource::Remote {
+                blob_hash,
+                providers,
+            } => (blob_hash, providers),
+        };
+
+        // One provider, not a split download: splitting is what the store-backed
+        // path buys with its store, since partial results from several peers
+        // have to be reassembled somewhere. Falling back rather than failing
+        // keeps a streamed read no less available than a stored one.
+        let Some(provider) = providers.first().copied() else {
+            return self.fetch_byte_range(descriptor, offset, len).await;
+        };
+        let Some(pool) = self.blobs_pool.as_ref() else {
+            return self.fetch_byte_range(descriptor, offset, len).await;
+        };
+        let connection = match pool.get_or_connect(provider).await {
+            Ok(connection) => connection,
+            Err(err) => {
+                debug!(error = %err, "streamed range could not connect; falling back to the store path");
+                return self.fetch_byte_range(descriptor, offset, len).await;
+            }
+        };
+
+        let budget = (end - offset)
+            .saturating_add(RANGE_VERIFICATION_ALLOWANCE)
+            .saturating_mul(2);
+        let stream = stream_verified_blob_range(connection, blob_hash, range, budget);
+        p2p_metrics::record_range_stream_started();
+        Ok(Box::pin(stream))
     }
 
     #[instrument(
@@ -1858,6 +2047,102 @@ mod tests {
         assert!(
             consumer.get_local(&key).await.is_none(),
             "range-only fetch must not advertise this node as a full artifact provider"
+        );
+
+        consumer.shutdown().await.context("shutdown consumer P2P")?;
+        provider.shutdown().await.context("shutdown provider P2P")?;
+        Ok(())
+    }
+
+    /// A streamed range returns the right bytes and leaves nothing behind.
+    ///
+    /// This is the whole difference between the two paths, and it is not
+    /// visible in what they return -- both return the same bytes. The
+    /// store-backed path verifies into the store and reads back out, so the
+    /// blob is resident afterwards; the streaming path verifies in flight, so
+    /// it is not. Asserting the bytes alone would pass against a
+    /// `fetch_byte_range_streaming` that just called `fetch_byte_range`, which
+    /// is exactly the default this overrides.
+    #[tokio::test]
+    async fn a_streamed_range_returns_the_bytes_without_storing_the_blob() -> Result<()> {
+        let temp = tempfile::tempdir().context("create temp test dir")?;
+        let (provider, consumer) = test_provider_consumer(&temp).await?;
+
+        let key = "test/p2p/iroh/streamed-range".to_string();
+        let bytes: Vec<u8> = (0..(128 * 1024)).map(|idx| (idx % 251) as u8).collect();
+        provider
+            .publish(&P2pPublishRequest::bytes(key.clone(), bytes.clone()))
+            .await
+            .context("publish provider bytes artifact")?;
+
+        let descriptor = consumer
+            .lookup(&key)
+            .await?
+            .context("expected descriptor from provider")?;
+        let store_dir = temp.path().join("consumer-store");
+        let before = directory_size(&store_dir);
+
+        let offset = 7777_u64;
+        let len = 33_333_usize;
+        let streamed = consumer
+            .fetch_byte_range_streaming(&descriptor, offset, len)
+            .await
+            .context("stream range from provider")?;
+        let streamed = collect_range_stream(streamed).await?;
+
+        assert_eq!(
+            streamed.as_slice(),
+            &bytes[offset as usize..offset as usize + len],
+            "a streamed range must return exactly the bytes asked for"
+        );
+        let after = directory_size(&store_dir);
+        assert_eq!(
+            after, before,
+            "a streamed range grew the local store from {before} to {after} bytes; \
+             the store round trip is the cost this path exists to avoid"
+        );
+
+        consumer.shutdown().await.context("shutdown consumer P2P")?;
+        provider.shutdown().await.context("shutdown provider P2P")?;
+        Ok(())
+    }
+
+    /// The store-backed path is the other half of that contract.
+    ///
+    /// Without this, the assertion above could be satisfied by a streaming path
+    /// that silently fetched nothing, and by a store path that had stopped
+    /// storing -- which would break background prefill, whose entire purpose is
+    /// that the bytes stay.
+    #[tokio::test]
+    async fn a_stored_range_does_leave_the_blob_behind() -> Result<()> {
+        let temp = tempfile::tempdir().context("create temp test dir")?;
+        let (provider, consumer) = test_provider_consumer(&temp).await?;
+
+        let key = "test/p2p/iroh/stored-range".to_string();
+        let bytes: Vec<u8> = (0..(128 * 1024)).map(|idx| (idx % 251) as u8).collect();
+        provider
+            .publish(&P2pPublishRequest::bytes(key.clone(), bytes.clone()))
+            .await
+            .context("publish provider bytes artifact")?;
+
+        let descriptor = consumer
+            .lookup(&key)
+            .await?
+            .context("expected descriptor from provider")?;
+        let store_dir = temp.path().join("consumer-store");
+        let before = directory_size(&store_dir);
+
+        let fetched = consumer
+            .fetch_byte_range(&descriptor, 7777, 33_333)
+            .await
+            .context("fetch range from provider")?;
+        let _ = collect_range_stream(fetched).await?;
+
+        let after = directory_size(&store_dir);
+        assert!(
+            after > before,
+            "the store-backed path left nothing local ({before} -> {after} bytes); \
+             background prefill depends on the bytes staying"
         );
 
         consumer.shutdown().await.context("shutdown consumer P2P")?;

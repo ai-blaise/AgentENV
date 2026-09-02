@@ -188,6 +188,18 @@ impl DescriptorCacheResult {
     }
 }
 
+/// Counts byte ranges served by the streaming path rather than the store one.
+///
+/// The two differ in where the bytes land, not in what is returned, so nothing
+/// about a read's result says which path served it. What this makes visible is
+/// the property the streaming path exists for: a demand read that is not also
+/// a disk write. Read it beside `agentenv_p2p_store_bytes` -- streamed ranges
+/// climbing while store bytes stay flat is the whole intended behaviour, and
+/// both climbing together means the streaming path is falling back.
+pub(crate) fn record_range_stream_started() {
+    metrics::counter!("agentenv_p2p_range_streams_total").increment(1);
+}
+
 pub(crate) fn record_descriptor_cache(result: DescriptorCacheResult) {
     metrics::counter!(
         "agentenv_p2p_descriptor_cache_total",

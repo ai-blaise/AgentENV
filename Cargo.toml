@@ -122,6 +122,15 @@ hex = "0.4"
 semver = "1"
 iroh = { version = "=1.0.0-rc.0" }
 iroh-blobs = { version = "=0.101.0" }
+# Direct because the streamed range path drives iroh-blobs' get state machine
+# itself and has to name the content items it yields; iroh-blobs does not
+# re-export them. Pinned to what iroh-blobs resolves, so there is one copy.
+bao-tree = { version = "=0.16.0", default-features = false, features = [
+    "experimental-mixed",
+    "tokio_fsm",
+    "validate",
+    "serde",
+] }
 rand = "0.10"
 flate2 = "1"
 tar = "0.4"

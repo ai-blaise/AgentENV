@@ -68,6 +68,30 @@ pub trait P2pTransport: Send + Sync {
         len: usize,
     ) -> Result<P2pByteStream>;
 
+    /// Fetch a byte range without landing it in the local store.
+    ///
+    /// [`fetch_byte_range`](Self::fetch_byte_range) verifies the bytes into the
+    /// store and then reads them back out again -- a disk write plus a disk
+    /// read per range. That is the right shape for a prefill, where having the
+    /// bytes locally afterwards is the point, and the wrong shape for a demand
+    /// read, where nothing will ask for them again and the store is a detour
+    /// the reader waits on.
+    ///
+    /// Verification is not traded away: the bytes are checked against the
+    /// blob's BLAKE3 tree as they arrive, so a peer still cannot return
+    /// anything other than what was asked for.
+    ///
+    /// The default delegates, so a transport that has no separate streaming
+    /// path is correct without implementing one.
+    async fn fetch_byte_range_streaming(
+        &self,
+        descriptor: &P2pArtifactDescriptor,
+        offset: u64,
+        len: usize,
+    ) -> Result<P2pByteStream> {
+        self.fetch_byte_range(descriptor, offset, len).await
+    }
+
     /// Publish a local artifact to the transport.
     ///
     /// Disabled transports return `Ok(())` so callers can treat P2P publishing
