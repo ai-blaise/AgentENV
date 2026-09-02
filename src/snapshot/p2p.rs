@@ -101,19 +101,31 @@ impl SnapshotP2pArtifact {
 
     /// The layers of a snapshot's rootfs that may be advertised to peers.
     ///
-    /// Only the content-addressed ones. A layer with a digest and a size came
-    /// from a registry, so the mesh is serving a copy of a blob any peer could
-    /// already pull, keyed by the digest of that same plaintext.
+    /// Two things have to hold. The layer must be runtime-generated-delta-free,
+    /// and it must be content-addressed.
     ///
-    /// The snapshot's own layer is a different thing wearing the same shape.
-    /// It is the delta the guest wrote to `/`, keyed by a local uuid because
-    /// no registry ever saw it, and it cannot be read back by anything: the
-    /// facade does have a uuid route, but only its registry-origin address is
-    /// patched into a generated overlaybd config, so no read ever arrives
-    /// there. Advertising it put the guest's filesystem in front of the whole
-    /// mesh, unsealed, in exchange for a lookup that cannot happen — the same
-    /// trade that memory and attached-drive layers are already kept out of.
-    pub(crate) fn local_overlaybd_layers(image_config_path: &Path) -> Vec<Self> {
+    /// Provenance is checked first because it is the one that carries guest
+    /// data. The snapshot's own layer is the delta the guest wrote to `/`, and
+    /// it wears exactly the same shape as a registry blob: `restack` hands the
+    /// sealed upper a `LayerDescriptor` whose digest is a sha256 of the delta's
+    /// own bytes, so it arrives here with a non-empty digest and a positive
+    /// size. Digest presence therefore says nothing about where a layer came
+    /// from — only the filename convention does, which is why every other
+    /// caller that has to tell them apart uses the same predicate.
+    ///
+    /// Advertising the delta would put the guest's filesystem in front of the
+    /// whole mesh, unsealed (a content-addressed layer is published in the
+    /// clear so the facade can read ranges out of it), in exchange for a lookup
+    /// that cannot happen: nothing resolves a snapshot's delta over P2P. That
+    /// is the same trade the memory and attached-drive layers are already kept
+    /// out of.
+    ///
+    /// What remains is a copy of a blob any peer could already pull from a
+    /// registry, keyed by the digest of that same plaintext.
+    pub(crate) fn local_overlaybd_layers(
+        image_config_path: &Path,
+        registry_digests: &std::collections::HashSet<String>,
+    ) -> Vec<Self> {
         let image_config = match load_overlaybd_image_config(image_config_path) {
             Ok(image_config) => image_config,
             Err(error) => {
@@ -129,20 +141,21 @@ impl SnapshotP2pArtifact {
         image_config
             .lowers
             .into_iter()
-            .flat_map(|layer| {
-                if layer.file.is_empty() {
-                    return Vec::new();
-                }
-
-                let mut artifacts = Vec::new();
-                if !layer.digest.is_empty() && layer.size > 0 {
-                    artifacts.push(Self::content_addressed_overlaybd_layer(
-                        layer.file.clone(),
-                        layer.digest,
-                        layer.size,
-                    ));
-                }
-                artifacts
+            .filter(|layer| !layer.file.is_empty())
+            // An allowlist, not a denylist: a layer is advertised only when the
+            // committed record calls it External, meaning a registry holds the
+            // same bytes. Naming cannot carry this. A sandbox resumed from a
+            // snapshot gets every lower back from the repository as
+            // `managed-layers/sha256_<digest>.overlaybd.commit`, so the parent's
+            // guest delta arrives content-addressed and indistinguishable by
+            // filename from a registry blob; a basename test recognised the
+            // delta only in the generation that created it. Defaulting to
+            // "do not publish" also means a record we cannot read publishes
+            // nothing, which is the safe direction for guest bytes.
+            .filter(|layer| registry_digests.contains(&layer.digest))
+            .filter(|layer| !layer.digest.is_empty() && layer.size > 0)
+            .map(|layer| {
+                Self::content_addressed_overlaybd_layer(layer.file, layer.digest, layer.size)
             })
             .collect()
     }
@@ -362,7 +375,7 @@ mod tests {
     #[tokio::test]
     async fn local_overlaybd_layers_publish_only_digest_layers() {
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let descriptorless = temp.path().join("snapshot.commit");
+        let descriptorless = temp.path().join("descriptorless.commit");
         let described = temp.path().join("described.commit");
         let uuid = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
         write_sealed_layer(&descriptorless, uuid).await;
@@ -392,7 +405,13 @@ mod tests {
         )
         .expect("write image config");
 
-        let artifacts = SnapshotP2pArtifact::local_overlaybd_layers(&image_config_path);
+        // The described layer is the registry-origin one, so the record calls
+        // it External and it is the only candidate the guard may pass.
+        let registry_digests = std::collections::HashSet::from([
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ]);
+        let artifacts =
+            SnapshotP2pArtifact::local_overlaybd_layers(&image_config_path, &registry_digests);
 
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].publish_mode, P2pPublishMode::Copy);
@@ -402,62 +421,271 @@ mod tests {
         );
     }
 
-    /// The snapshot's own layer is the guest's writes to `/`, and it is not
-    /// advertised however it is reached: no digest to key it by, no consumer
-    /// that would look it up, and no envelope on the wire if one did.
+    /// The guest's writes to `/` must never be advertised, and the shape they
+    /// arrive in is indistinguishable from a registry blob's: the ublk restack
+    /// hands the sealed upper a descriptor, so the delta reaches publication
+    /// with a real content digest and a real size (the same shape
+    /// `stage_live_runtime_preserves_restacked_layer_descriptor` asserts the
+    /// staged config keeps).
+    ///
+    /// Each row therefore pins one half of one guard. A delta named layer with
+    /// a full descriptor pins provenance; the registry-named rows with a
+    /// missing digest or a zero size pin each half of the content-addressing
+    /// conjunction. Dropping any one of the three advertises a row that must
+    /// stay on the node.
     #[tokio::test]
     async fn local_overlaybd_layers_never_advertise_the_snapshot_delta() {
+        struct Row {
+            file: &'static str,
+            described: bool,
+            sized: bool,
+            /// Whether the committed record calls this layer External, i.e. a
+            /// registry holds the same bytes. This is what the guard reads;
+            /// the filename is deliberately not.
+            external: bool,
+            advertised: bool,
+        }
+
+        let rows = [
+            Row {
+                file: "registry.commit",
+                described: true,
+                sized: true,
+                external: true,
+                advertised: true,
+            },
+            // The runtime-generated delta as the restack path produces it.
+            Row {
+                file: "snapshot.commit",
+                described: true,
+                sized: true,
+                external: false,
+                advertised: false,
+            },
+            // The compaction of a runtime-owned suffix: guest bytes merged
+            // into one layer, content-addressed exactly like the delta.
+            Row {
+                file: "managed-base.commit",
+                described: true,
+                sized: true,
+                external: false,
+                advertised: false,
+            },
+            // The case a basename test cannot see: a sandbox resumed from a
+            // snapshot gets every lower back from the repository under this
+            // shape, the parent's guest delta included. It carries a digest
+            // and a size and is named exactly like a registry blob, so only
+            // its absence from the record's External set keeps it home.
+            Row {
+                file: "sha256_dead10cc.overlaybd.commit",
+                described: true,
+                sized: true,
+                external: false,
+                advertised: false,
+            },
+            Row {
+                file: "registry-undescribed.commit",
+                described: false,
+                sized: true,
+                external: true,
+                advertised: false,
+            },
+            Row {
+                file: "registry-unsized.commit",
+                described: true,
+                sized: false,
+                external: true,
+                advertised: false,
+            },
+        ];
+
         let temp = tempfile::TempDir::new().expect("tempdir");
-        let registry_layer_path = temp.path().join("registry.commit");
-        let delta_layer_path = temp.path().join("snapshot.commit");
-        let registry_uuid = Uuid::parse_str("22222222-3333-4444-5555-666666666666").unwrap();
-        let delta_uuid = Uuid::parse_str("33333333-4444-5555-6666-777777777777").unwrap();
-        write_sealed_layer(&registry_layer_path, registry_uuid).await;
-        write_sealed_layer(&delta_layer_path, delta_uuid).await;
-        let registry_descriptor = crate::digest::FileDigest::describe(&registry_layer_path)
-            .await
-            .expect("describe registry layer");
-        let image_config = ImageConfig {
-            lowers: vec![
-                LayerConfig {
-                    file: registry_layer_path.display().to_string(),
-                    digest: registry_descriptor.sha256.clone(),
-                    size: registry_descriptor.size,
-                    ..Default::default()
+        let mut lowers = Vec::new();
+        let mut want_advertised = Vec::new();
+        let mut registry_digests = std::collections::HashSet::new();
+        for (index, row) in rows.iter().enumerate() {
+            let path = temp.path().join(row.file);
+            std::fs::write(&path, format!("layer-{index}")).expect("write layer");
+            let descriptor = crate::digest::FileDigest::describe(&path)
+                .await
+                .expect("describe layer");
+            if row.advertised {
+                want_advertised.push(layer_key_from_digest(&descriptor.sha256));
+            }
+            if row.external && row.described {
+                registry_digests.insert(descriptor.sha256.clone());
+            }
+            lowers.push(LayerConfig {
+                file: path.display().to_string(),
+                digest: if row.described {
+                    descriptor.sha256
+                } else {
+                    String::new()
                 },
-                // The snapshot's own commit: a real layer on disk, with no
-                // digest because nothing published it anywhere.
-                LayerConfig {
-                    file: delta_layer_path.display().to_string(),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
+                size: if row.sized { descriptor.size } else { 0 },
+                ..Default::default()
+            });
+        }
+
         let image_config_path = temp.path().join("image.json");
         std::fs::write(
             &image_config_path,
-            serde_json::to_vec(&image_config).expect("serialize image config"),
+            serde_json::to_vec(&ImageConfig {
+                lowers,
+                ..Default::default()
+            })
+            .expect("serialize image config"),
         )
         .expect("write image config");
 
-        let artifacts = SnapshotP2pArtifact::local_overlaybd_layers(&image_config_path);
+        let advertised =
+            SnapshotP2pArtifact::local_overlaybd_layers(&image_config_path, &registry_digests)
+                .into_iter()
+            .map(|artifact| artifact.key)
+            .collect::<Vec<_>>();
 
         assert_eq!(
-            artifacts.len(),
-            1,
-            "only the registry-origin layer may be advertised, got {:?}",
-            artifacts.iter().map(|a| &a.key).collect::<Vec<_>>()
+            advertised, want_advertised,
+            "only the registry-origin layer may be advertised"
         );
+    }
+
+    /// The publish request the transport actually receives, for the one artifact
+    /// class that goes out in the clear. Asserted on the request rather than on
+    /// the constructor so a later refactor of `publish` cannot seal a layer (the
+    /// facade reads ranges out of it) or unseal a fixed artifact.
+    #[tokio::test]
+    async fn a_content_addressed_layer_publishes_its_plaintext() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let layer_path = temp.path().join("registry.commit");
+        std::fs::write(&layer_path, b"layer-plaintext").expect("write layer");
+
+        let transport: Arc<dyn P2pTransport> = Arc::new(crate::p2p::mock::MockTransport::default());
+        let artifact = SnapshotP2pArtifact::content_addressed_overlaybd_layer(
+            layer_path,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            15,
+        );
+        artifact
+            .publish(&transport, &sealing::SnapshotSealing::disabled())
+            .await
+            .expect("publishing a layer needs no sealing secret");
+
+        let descriptor = transport
+            .lookup(&artifact.key)
+            .await
+            .expect("lookup")
+            .expect("the layer should be advertised");
+        let published = transport
+            .fetch_bytes(&descriptor, 1024)
+            .await
+            .expect("fetch");
+        assert_eq!(published.as_ref(), b"layer-plaintext");
+    }
+
+    /// The sealed round trip a peer-accelerated resume takes: publish under the
+    /// node's sealing state, fetch back through the caller's byte cap, open.
+    ///
+    /// The caps are used as the real callers use them, so shrinking either
+    /// constant by a refactor fails here rather than only in production.
+    #[tokio::test]
+    async fn a_sealed_fixed_artifact_round_trips_within_its_cap() {
+        let sealing_key = sealing::install_test_global_sealing();
+        let sealing_state = sealing::SnapshotSealing::with_key(sealing_key);
+        let transport: Arc<dyn P2pTransport> = Arc::new(crate::p2p::mock::MockTransport::default());
+        let snapshot_id = SnapshotId::generate();
+        let scoped_id = snapshot_id.to_string();
+
+        let manifest = br#"{"vm_state":"vm_state.bin"}"#;
+        SnapshotP2pArtifact::bytes(
+            &snapshot_id,
+            "firecracker-manifest.json",
+            Bytes::from_static(manifest),
+        )
+        .publish(&transport, &sealing_state)
+        .await
+        .expect("publish");
+
+        let scope = SealScope::new(&scoped_id, "firecracker-manifest.json");
+        let opened = fetch_artifact_bytes(&transport, &scope, MAX_FIRECRACKER_MANIFEST_BYTES)
+            .await
+            .expect("a sealed artifact opens for a node holding the secret");
+        assert_eq!(opened.as_ref(), manifest);
+
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let vm_state = temp.path().join("vm_state.bin");
+        std::fs::write(&vm_state, b"vcpu-and-device-state").expect("write vm state");
+        SnapshotP2pArtifact::fixed(&snapshot_id, "vm_state.bin", vm_state)
+            .publish(&transport, &sealing_state)
+            .await
+            .expect("publish");
+
+        let destination = temp.path().join("restored-vm_state.bin");
+        let scope = SealScope::new(&scoped_id, "vm_state.bin");
+        let size = fetch_artifact(&transport, &scope, &destination, MAX_VM_STATE_BYTES)
+            .await
+            .expect("a sealed artifact opens for a node holding the secret");
+        assert_eq!(size, b"vcpu-and-device-state".len() as u64);
         assert_eq!(
-            artifacts[0].key,
-            layer_key_from_digest(&registry_descriptor.sha256)
+            std::fs::read(&destination).expect("read restored"),
+            b"vcpu-and-device-state"
         );
+    }
+
+    /// The caller's cap is what stands between an unauthenticated peer and an
+    /// unbounded write, and it is checked before the seal is: a peer offering
+    /// more than the caller agreed to hold is refused, not opened and rejected.
+    #[tokio::test]
+    async fn a_fixed_artifact_larger_than_its_cap_is_refused() {
+        let sealing_key = sealing::install_test_global_sealing();
+        let sealing_state = sealing::SnapshotSealing::with_key(sealing_key);
+        let transport: Arc<dyn P2pTransport> = Arc::new(crate::p2p::mock::MockTransport::default());
+        let snapshot_id = SnapshotId::generate();
+        let scoped_id = snapshot_id.to_string();
+
+        SnapshotP2pArtifact::bytes(
+            &snapshot_id,
+            "firecracker-manifest.json",
+            Bytes::from_static(&[7_u8; 4096]),
+        )
+        .publish(&transport, &sealing_state)
+        .await
+        .expect("publish");
+
+        let scope = SealScope::new(&scoped_id, "firecracker-manifest.json");
+        // Matched rather than `expect_err`: the Ok side is the whole artifact,
+        // and printing four kilobytes of it buries the failure.
+        let error = match fetch_artifact_bytes(&transport, &scope, 64).await {
+            Ok(_) => panic!("a peer must not be able to exceed the caller's bound"),
+            Err(error) => error,
+        };
         assert!(
-            !artifacts
-                .iter()
-                .any(|artifact| artifact.key.contains("/uuid/")),
-            "a layer keyed by a local uuid is the guest's own delta and must not leave the node"
+            format!("{error:#}").contains("larger than the 64-byte limit"),
+            "expected the caller's own bound to refuse it, got {error:#}"
         );
+    }
+
+    /// The rollout property: a peer still publishing in the clear is treated as
+    /// absent rather than trusted, so the caller falls back to the repository.
+    #[tokio::test]
+    async fn an_unsealed_fixed_artifact_is_not_opened() {
+        sealing::install_test_global_sealing();
+        let transport: Arc<dyn P2pTransport> = Arc::new(crate::p2p::mock::MockTransport::default());
+        let snapshot_id = SnapshotId::generate();
+        let scoped_id = snapshot_id.to_string();
+
+        let key = fixed_artifact_key(&snapshot_id, "firecracker-manifest.json");
+        transport
+            .publish(&P2pPublishRequest::bytes(
+                key.clone(),
+                Bytes::from_static(br#"{"vm_state":"vm_state.bin"}"#),
+            ))
+            .await
+            .expect("publish in the clear");
+
+        let scope = SealScope::new(&scoped_id, "firecracker-manifest.json");
+        fetch_artifact_bytes(&transport, &scope, MAX_FIRECRACKER_MANIFEST_BYTES)
+            .await
+            .expect_err("an artifact published in the clear must not be accepted");
     }
 }

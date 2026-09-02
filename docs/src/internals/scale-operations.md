@@ -80,7 +80,10 @@ came from a registry, identified by the digest of the same bytes any peer
 could already pull. The guest's own data never does: not the memory layers,
 not the attached drives, and not the rootfs delta — every write the guest made
 to `/`. All three are served from the repository, and none of them has a read
-path that would consume a peer copy.
+path that would consume a peer copy. The delta is the one that has to be
+excluded rather than simply not offered, because it rides inside the rootfs
+image config; it is excluded by where it came from, not by whether it has a
+digest, since the restack gives it one.
 
 Turning it on means provisioning **the same** 32-byte secret on every node
 that may resolve a snapshot:
@@ -102,9 +105,16 @@ while delivering nothing. That is why nothing is generated automatically.
 
 It is not on by default and this is the bar it has not yet cleared:
 
-1. **Sealing is deployed fleet-wide.** Until then, enabling snapshot P2P
-   publishes nothing anyway, and enabling overlaybd P2P advertises layers with
-   no confidentiality story of their own.
+1. **Sealing is deployed fleet-wide.** Until then, snapshot P2P still
+   advertises the registry-origin rootfs layers — bytes any peer could already
+   pull from the registry, keyed by the digest of that same content — while
+   withholding the fixed artifacts that are what actually accelerates
+   resolution. That is exposure-shaped surface without the payoff. Overlaybd
+   P2P advertises the same class of layers with no confidentiality story of
+   their own. Note that layers pulled from a credentialed private registry
+   become servable to mesh peers by digest the moment `[p2p]` is enabled, so a
+   private-registry deployment has to treat mesh membership as inside the
+   registry's trust boundary.
 2. **A measured hit rate on a real fleet.** The facade caches misses to avoid
    re-paying the lookup budget per layer, so a low hit rate is cheap but not
    free. The number to beat is the repository fetch it replaces.
@@ -215,27 +225,36 @@ prerequisites and the teardown.
 ## Known findings not yet fixed
 
 A verification campaign — supply-chain scanning, fuzzing, mutation testing,
-Miri, TLA+ model checking and adversarial review — ran over this branch. Most
-of what it found is fixed and covered by tests. These are the ones that are
-not, recorded with enough detail to act on rather than rediscover.
+Miri, TLA+ model checking and adversarial review — ran over this branch. This
+section is the ledger of what it found and what is still open. Nothing is open
+right now: all four entries recorded here have since been closed and covered
+by tests. They are kept as a record rather than deleted, so the reasoning stays
+discoverable.
 
-**The pre-authentication memory bound for P2P artifacts is not where the code
-says it is.** `sealing::MAX_CHUNK_SIZE` bounds the parser's buffer, but the
-transport has already materialised the whole peer-supplied blob before the
-parser sees it: `src/p2p/iroh/transport.rs` `download_blob` is bounded only by
-`fetch_timeout_ms`, and `read_local_blob_bytes` then reads it into memory. A
-byte cap belongs there, checked against the blob's stored size before the
-read. Only reachable with P2P enabled, which is off by default.
+Closing a finding includes deleting or annotating its entry here. That step was
+missed twice — `2b4bf2a` landed before this document's next edit and its entry
+survived, and `dd3397a` closed six review findings without touching the ledger —
+which is how a list of fixed defects came to read as a list of live ones.
 
-**The drain's per-move timeout cancels the saga from outside**, bypassing the
-compensation paths it is careful to run itself.
+**Closed by `2b4bf2a`: the pre-authentication byte bound for P2P artifacts.**
+`max_bytes` is now a parameter of the whole fetch API (`src/p2p/transport.rs`),
+enforced against the bytes as they arrive in `download_blob_bounded` and
+against the blob's stored size before a local read, with every caller updated.
 
-**The scheduler caches a roster under a digest it never verifies**, so a single
-inconsistent heartbeat poisons the cache for every later elided one.
+**Closed by `dd3397a`: the drain no longer cancels the saga from outside.**
+`run_move` puts the move on its own task and a timeout requests a cooperative
+`MoveCancel`, waiting out `unwind_grace` rather than aborting the task, so the
+compensation paths still run.
 
-**`resolveRoster`'s safety argument cites a TTL/heartbeat-interval validation
-that does not exist.** The comment claims the registry validates the ordering
-against the node's reported interval; nothing does.
+**Closed by `dd3397a`: the scheduler verifies the roster digest it caches.**
+`rosterCache.remember` recomputes the digest over the ids and refuses a
+mismatch, so one inconsistent heartbeat cannot poison later elided ones.
+
+**Closed by `dd3397a`: `resolveRoster`'s safety argument now cites something
+real.** `validateSchedulerTTLOrdering` exists and is wired into config
+validation, `mayElideRoster` re-checks the TTL/interval relation on every
+heartbeat, and the comment names the opt-in check plus that runtime
+enforcement.
 
 ## What is not covered
 

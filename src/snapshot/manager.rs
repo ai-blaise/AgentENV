@@ -5,7 +5,7 @@ use futures::{stream, StreamExt};
 use tracing::warn;
 
 use super::p2p::SnapshotP2pArtifact;
-use super::types::SNAPSHOT_ARTIFACT_LAYOUT;
+use super::types::{OverlaybdLayerRef, SNAPSHOT_ARTIFACT_LAYOUT};
 use crate::p2p::P2pTransport;
 use crate::sandbox::{
     CapturedSandboxSnapshot, FirecrackerCapturedSnapshot, FirecrackerSnapshotManifest,
@@ -158,16 +158,34 @@ impl SnapshotManager {
         // consumer: the overlaybd facade resolves them by registry origin, so
         // what it serves is content that is also a registry blob.
         //
-        // Everything else the snapshot is made of stays on the node — the
-        // memory layers, the attached-drive layers, and the rootfs delta the
-        // guest itself wrote. All three are guest data, all three are
-        // materialized from the repository rather than from P2P, and the
-        // facade never looks any of them up, so advertising them exposed the
-        // most sensitive bytes on the node to anyone in the mesh in exchange
-        // for nothing. Advertising them again requires a fetch path that opens
-        // a sealed envelope, which the range-read facade does not have.
+        // Only the rootfs config is offered. The memory layers and the
+        // attached-drive layers are guest data with no P2P consumer, and they
+        // stay on the node by never being routed here at all. The rootfs
+        // delta — the guest's own writes to `/` — travels inside this config
+        // and cannot be excluded by not passing it, so `local_overlaybd_layers`
+        // drops it on provenance; see the guard there for why its digest is no
+        // help. Any of them would go out unsealed, because the range-read
+        // facade has no path that opens an envelope.
+        // The record is what knows provenance: External means a registry holds
+        // these bytes, Managed means this repository does, and only the former
+        // may leave the node. The image config alone cannot say which is which.
+        let registry_digests: std::collections::HashSet<String> = record
+            .committed
+            .as_ref()
+            .map(|committed| {
+                committed
+                    .rootfs_layers
+                    .iter()
+                    .filter_map(|layer| match layer {
+                        OverlaybdLayerRef::External(external) => Some(external.digest.clone()),
+                        OverlaybdLayerRef::Managed(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
             &manifest.rootfs.image_config_path,
+            &registry_digests,
         ));
 
         if artifacts.is_empty() {
@@ -433,6 +451,19 @@ mod tests {
     async fn publish_mock_snapshot(
         sealing: Arc<SnapshotSealing>,
     ) -> (Arc<MockTransport>, SnapshotId, String, TempDir, TempDir) {
+        publish_mock_snapshot_as(sealing, None).await.0
+    }
+
+    /// The same, keeping the manager so the caller can drive it further, and
+    /// optionally giving the snapshot an alias.
+    #[allow(clippy::type_complexity)]
+    async fn publish_mock_snapshot_as(
+        sealing: Arc<SnapshotSealing>,
+        alias: Option<&str>,
+    ) -> (
+        (Arc<MockTransport>, SnapshotId, String, TempDir, TempDir),
+        SnapshotManager,
+    ) {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let backend = PosixFsBackend::new(PosixFsBackendConfig {
             root: tempdir.path().join("repository"),
@@ -451,6 +482,7 @@ mod tests {
         let snapshot_id = SnapshotId::generate();
         let metadata = SnapshotPublishMetadata {
             id: snapshot_id.clone(),
+            alias: alias.map(|alias| SnapshotAlias::parse(alias).expect("alias should parse")),
             ..SnapshotPublishMetadata::mock()
         };
 
@@ -464,7 +496,10 @@ mod tests {
             .expect("describe rootfs lower")
             .sha256;
 
-        (p2p, snapshot_id, rootfs_layer_digest, tempdir, workspace)
+        (
+            (p2p, snapshot_id, rootfs_layer_digest, tempdir, workspace),
+            manager,
+        )
     }
 
     fn test_sealing() -> Arc<SnapshotSealing> {
@@ -481,13 +516,26 @@ mod tests {
         for key in [
             fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
             fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest),
-            layer_key_from_digest(&rootfs_digest),
         ] {
             assert!(
                 p2p.lookup(&key).await.expect("lookup").is_some(),
                 "{key} should have been advertised"
             );
         }
+
+        // This snapshot's rootfs lower is repository-managed: nothing says a
+        // registry holds the same bytes, so it stays on the node. That costs
+        // nothing, because the facade resolves layers by registry origin and
+        // could never have served this one to a peer. The layer that does
+        // carry a registry origin is advertised, which
+        // `local_overlaybd_layers_never_advertise_the_snapshot_delta` pins.
+        assert!(
+            p2p.lookup(&layer_key_from_digest(&rootfs_digest))
+                .await
+                .expect("lookup")
+                .is_none(),
+            "a repository-managed layer must not be advertised"
+        );
     }
 
     /// The fixed artifacts carry guest CPU state and the manifest naming every
@@ -509,13 +557,14 @@ mod tests {
             );
         }
 
-        // Rootfs layers are registry-shaped content with a real P2P consumer,
-        // so they stay advertised either way.
+        // The rootfs lower here is repository-managed, so it is not advertised
+        // whatever the sealing secret says: provenance decides that, not
+        // sealing.
         assert!(p2p
             .lookup(&layer_key_from_digest(&rootfs_digest))
             .await
             .expect("lookup")
-            .is_some());
+            .is_none());
     }
 
     /// What the transport holds must be ciphertext. This is the property the
@@ -554,5 +603,52 @@ mod tests {
         )
         .expect("a holder of the secret can open it");
         serde_json::from_slice::<serde_json::Value>(&opened).expect("opens to the manifest");
+    }
+
+    /// Deleting a snapshot has to withdraw its fixed advertisements, or the
+    /// transport's retention tags are never removed and its gated collector has
+    /// nothing to collect — the store then grows for the life of the process,
+    /// which is the regression this edge was added to close.
+    ///
+    /// Deleted by alias rather than by id on purpose. The id path short-circuits
+    /// through `SnapshotId::parse`, which succeeds whether or not the record
+    /// still exists, so only the alias path also pins the ordering: resolve has
+    /// to happen before the repository drops the record, or there is nothing
+    /// left to resolve and nothing is withdrawn.
+    #[tokio::test]
+    async fn delete_by_alias_withdraws_the_fixed_artifacts_it_advertised() {
+        let ((p2p, snapshot_id, rootfs_digest, _repository, _workspace), manager) =
+            publish_mock_snapshot_as(test_sealing(), Some("withdrawn")).await;
+
+        let fixed = [
+            fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
+            fixed_artifact_key(&snapshot_id, SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest),
+        ];
+        for key in &fixed {
+            assert!(
+                p2p.lookup(key).await.expect("lookup").is_some(),
+                "{key} should have been advertised before the delete"
+            );
+        }
+
+        manager.delete("withdrawn").await.expect("delete");
+
+        for key in &fixed {
+            assert!(
+                p2p.lookup(key).await.expect("lookup").is_none(),
+                "{key} must be withdrawn on delete"
+            );
+        }
+
+        // The managed rootfs lower was never advertised, so the delete has
+        // nothing to withdraw for it. A registry-origin layer that had been
+        // advertised would stay: layers are content-addressed and shared
+        // between snapshots, owned by the image cache's retention rather than
+        // by this delete.
+        assert!(p2p
+            .lookup(&layer_key_from_digest(&rootfs_digest))
+            .await
+            .expect("lookup")
+            .is_none());
     }
 }

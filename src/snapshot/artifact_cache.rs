@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::fs;
-use tokio::sync::{watch, Mutex as AsyncMutex};
+use tokio::sync::watch;
 use tracing::warn;
 
 use crate::snapshot::types::RuntimeArtifactLease;
@@ -79,18 +79,70 @@ struct SharedFetchError {
     message: String,
 }
 
+/// Owns a key's entry in the inflight map for as long as one caller is
+/// materializing it.
+///
+/// The registration has to be released on every exit, not just on the two the
+/// fetch itself takes. An early return between registration and the fetch, a
+/// panic inside it, or — the reachable one — the caller's future being dropped
+/// leaves the key registered against a sender that will never send, and every
+/// later caller then parks on a dead channel and fails. `load_runnable` is
+/// awaited directly inside the axum handler for `POST /sandboxes`, so a client
+/// that disconnects during a slow download used to brick that snapshot's key
+/// for the life of the process.
+struct InflightGuard {
+    cache: Arc<LocalArtifactCache>,
+    key: String,
+    sender: Option<watch::Sender<Option<InflightFetchResult>>>,
+}
+
+impl InflightGuard {
+    /// Publishes the materialization's outcome to any waiter and releases the
+    /// registration.
+    fn complete(mut self, result: InflightFetchResult) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(Some(result));
+        }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Some(sender) = self.sender.take() {
+            let _ = sender.send(Some(InflightFetchResult::Failed(SharedFetchError {
+                message: format!(
+                    "materialization of '{}' was abandoned before it produced a result",
+                    self.key
+                ),
+            })));
+        }
+        self.cache.remove_inflight(&self.key);
+    }
+}
+
+/// What a caller found when it reached for ownership of a key.
+enum InflightClaim {
+    /// Another caller owns it; wait on its result rather than duplicating work.
+    Waiting(InflightFetch),
+    Owned(InflightGuard),
+}
+
 /// Node-local disk cache for downloaded or materialized runtime artifacts.
 ///
 /// Design invariants:
 /// - Files with `ref_count > 0` are never evicted.
 /// - Fetches are deduplicated: only one fetch per key at a time.
+/// - A deduplication claim is always released, however the claiming caller
+///   leaves — so one failure or cancellation costs a retry, never the key.
 /// - Entries are node-local derived state that can be regenerated or
 ///   re-fetched if the cache is missing or partially evicted.
 pub(crate) struct LocalArtifactCache {
     cache_root: PathBuf,
     max_size_bytes: u64,
     index: Mutex<CacheIndex>,
-    inflight: AsyncMutex<HashMap<String, InflightFetch>>,
+    /// Synchronous so [`InflightGuard::drop`] can release a registration; no
+    /// call site holds it across an await.
+    inflight: Mutex<HashMap<String, InflightFetch>>,
 }
 
 impl LocalArtifactCache {
@@ -107,7 +159,7 @@ impl LocalArtifactCache {
                 entries: HashMap::new(),
                 total_size: 0,
             }),
-            inflight: AsyncMutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -158,17 +210,12 @@ impl LocalArtifactCache {
                 return self.pin_local_file(key, &local_path).await;
             }
 
-            let sender = {
-                let mut inflight = self.inflight.lock().await;
-                if let Some(existing) = inflight.get(key).cloned() {
-                    drop(inflight);
+            let guard = match self.claim_inflight(key) {
+                InflightClaim::Waiting(existing) => {
                     wait_for_inflight_result(existing.receiver, key).await?;
                     continue;
                 }
-
-                let (sender, receiver) = watch::channel(None);
-                inflight.insert(key.to_string(), InflightFetch { receiver });
-                sender
+                InflightClaim::Owned(guard) => guard,
             };
 
             if let Some(parent) = local_path.parent() {
@@ -184,8 +231,7 @@ impl LocalArtifactCache {
                 Ok(size) => size,
                 Err(error) => {
                     let shared_error = SharedFetchError::from_anyhow(&error);
-                    self.finish_inflight(key, sender, InflightFetchResult::Failed(shared_error))
-                        .await;
+                    guard.complete(InflightFetchResult::Failed(shared_error));
                     return Err(error);
                 }
             };
@@ -206,8 +252,7 @@ impl LocalArtifactCache {
                 idx.total_size += size;
             }
 
-            self.finish_inflight(key, sender, InflightFetchResult::Success)
-                .await;
+            guard.complete(InflightFetchResult::Success);
 
             if self.is_over_limit() {
                 let cache = Arc::clone(self);
@@ -239,10 +284,7 @@ impl LocalArtifactCache {
                 return Ok(handle);
             }
 
-            let existing = {
-                let inflight = self.inflight.lock().await;
-                inflight.get(key).cloned()
-            };
+            let existing = self.lock_inflight().get(key).cloned();
             if let Some(existing) = existing {
                 wait_for_inflight_result(existing.receiver, key).await?;
                 continue;
@@ -309,15 +351,31 @@ impl LocalArtifactCache {
         })
     }
 
-    async fn finish_inflight(
-        &self,
-        key: &str,
-        sender: watch::Sender<Option<InflightFetchResult>>,
-        result: InflightFetchResult,
-    ) {
-        let _ = sender.send(Some(result));
-        let mut inflight = self.inflight.lock().await;
-        inflight.remove(key);
+    fn lock_inflight(&self) -> std::sync::MutexGuard<'_, HashMap<String, InflightFetch>> {
+        self.inflight.lock().unwrap_or_else(|poisoned| {
+            warn!("snapshot artifact cache inflight mutex poisoned; recovering");
+            poisoned.into_inner()
+        })
+    }
+
+    /// Takes ownership of a key's materialization, or reports who already has it.
+    fn claim_inflight(self: &Arc<Self>, key: &str) -> InflightClaim {
+        let mut inflight = self.lock_inflight();
+        if let Some(existing) = inflight.get(key).cloned() {
+            return InflightClaim::Waiting(existing);
+        }
+
+        let (sender, receiver) = watch::channel(None);
+        inflight.insert(key.to_string(), InflightFetch { receiver });
+        InflightClaim::Owned(InflightGuard {
+            cache: Arc::clone(self),
+            key: key.to_string(),
+            sender: Some(sender),
+        })
+    }
+
+    fn remove_inflight(&self, key: &str) {
+        self.lock_inflight().remove(key);
     }
 
     fn try_acquire(self: &Arc<Self>, key: &str) -> Option<CacheHandle> {
@@ -539,7 +597,7 @@ mod tests {
                 entries: HashMap::new(),
                 total_size: 0,
             }),
-            inflight: AsyncMutex::new(HashMap::new()),
+            inflight: Mutex::new(HashMap::new()),
         });
         std::fs::create_dir_all(&cache.cache_root).unwrap();
 
@@ -650,5 +708,137 @@ mod tests {
             b"warm-cache".to_vec()
         );
         assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// A transient filesystem failure between claiming the key and fetching it
+    /// must cost one attempt, not the key. This is the ENOSPC/EDQUOT shape: the
+    /// condition clears, and every later resume of that snapshot has to work.
+    ///
+    /// The dangling symlink is the deterministic way to fail `create_dir_all`
+    /// while `try_exists` on the file below it still reports a plain absence,
+    /// which is what puts the failure after the claim rather than before it.
+    #[tokio::test]
+    async fn a_failed_cache_directory_does_not_poison_the_key() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let cache = test_cache(tempdir.path());
+        let key = "artifacts/t1/vm_state.bin";
+
+        let blocked_parent = tempdir.path().join("cache").join("artifacts").join("t1");
+        std::fs::create_dir_all(blocked_parent.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(tempdir.path().join("gone"), &blocked_parent).unwrap();
+
+        let error = match cache
+            .ensure_cached(key, |dest| async move {
+                tokio::fs::write(dest, b"snap-data").await?;
+                Ok(9)
+            })
+            .await
+        {
+            Ok(_) => panic!("the cache directory cannot be created"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("create local cache dir"),
+            "the failure must land after the claim, got: {error:#}"
+        );
+
+        std::fs::remove_file(&blocked_parent).unwrap();
+
+        let handle = cache
+            .ensure_cached(key, |dest| async move {
+                tokio::fs::write(dest, b"snap-data").await?;
+                Ok(9)
+            })
+            .await
+            .expect("the condition cleared, so a retry must materialize the key");
+        assert_eq!(std::fs::read(handle.path()).unwrap(), b"snap-data".to_vec());
+    }
+
+    /// `load_runnable` is awaited inside the `POST /sandboxes` handler, and axum
+    /// drops handler futures when the client disconnects. A caller that goes
+    /// away mid-download must not take the snapshot's key with it.
+    #[tokio::test]
+    async fn a_cancelled_materialization_does_not_poison_the_key() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let cache = test_cache(tempdir.path());
+        let key = "artifacts/t1/vm_state.bin";
+
+        let claimed = Arc::new(tokio::sync::Notify::new());
+        let owner = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let claimed = Arc::clone(&claimed);
+            async move {
+                cache
+                    .ensure_cached(key, move |_dest| {
+                        let claimed = Arc::clone(&claimed);
+                        async move {
+                            claimed.notify_one();
+                            std::future::pending::<()>().await;
+                            Ok(0)
+                        }
+                    })
+                    .await
+                    .map(|_| ())
+            }
+        });
+        claimed.notified().await;
+        owner.abort();
+        let _ = owner.await;
+
+        let handle = cache
+            .ensure_cached(key, |dest| async move {
+                tokio::fs::write(dest, b"snap-data").await?;
+                Ok(9)
+            })
+            .await
+            .expect("an abandoned claim must leave the key retryable");
+        assert_eq!(std::fs::read(handle.path()).unwrap(), b"snap-data".to_vec());
+    }
+
+    /// The other half: a waiter parked on the abandoned claim gets a retryable
+    /// error naming what happened, rather than the dead-channel message that
+    /// told operators nothing.
+    #[tokio::test]
+    async fn a_waiter_on_an_abandoned_claim_is_told_why() {
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let cache = test_cache(tempdir.path());
+        let key = "artifacts/t1/vm_state.bin";
+
+        let claimed = Arc::new(tokio::sync::Notify::new());
+        let owner = tokio::spawn({
+            let cache = Arc::clone(&cache);
+            let claimed = Arc::clone(&claimed);
+            async move {
+                cache
+                    .ensure_cached(key, move |_dest| {
+                        let claimed = Arc::clone(&claimed);
+                        async move {
+                            claimed.notify_one();
+                            std::future::pending::<()>().await;
+                            Ok(0)
+                        }
+                    })
+                    .await
+                    .map(|_| ())
+            }
+        });
+        claimed.notified().await;
+
+        let receiver = cache
+            .lock_inflight()
+            .get(key)
+            .cloned()
+            .expect("the owner should hold the claim")
+            .receiver;
+        owner.abort();
+        let _ = owner.await;
+
+        let error = wait_for_inflight_result(receiver, key)
+            .await
+            .expect_err("an abandoned claim is not a success");
+        assert!(
+            error.to_string().contains("abandoned before it produced"),
+            "unexpected error: {error:#}"
+        );
     }
 }

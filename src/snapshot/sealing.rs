@@ -544,8 +544,39 @@ pub fn set_global_snapshot_sealing(sealing: std::sync::Arc<SnapshotSealing>) {
 }
 
 /// Returns the process-wide sealing state, disabled when none was installed.
+///
+/// Reading does not install the fallback. A read that ran before startup's
+/// install — anything constructed earlier in `main` that defaults to the global
+/// state — would otherwise pin the whole process to disabled sealing, and the
+/// set-once warning above is emitted at the install, so the operator would be
+/// told sealing was already configured by the very code that silently turned it
+/// off.
 pub fn global_snapshot_sealing() -> std::sync::Arc<SnapshotSealing> {
-    std::sync::Arc::clone(GLOBAL.get_or_init(|| std::sync::Arc::new(SnapshotSealing::disabled())))
+    static DISABLED: std::sync::OnceLock<std::sync::Arc<SnapshotSealing>> =
+        std::sync::OnceLock::new();
+    GLOBAL
+        .get()
+        .or_else(|| Some(DISABLED.get_or_init(|| std::sync::Arc::new(SnapshotSealing::disabled()))))
+        .map(std::sync::Arc::clone)
+        .expect("the disabled fallback is always available")
+}
+
+/// Installs the sealing state the lib tests share, returning the key that is
+/// actually visible to readers afterwards.
+///
+/// The global is set-once per process, so tests cannot each own it. They call
+/// this instead: the first caller installs, every caller gets the same key back,
+/// and a test that needs to seal something can hand that key to a local
+/// [`SnapshotSealing`] and still match what the fetch path reads.
+#[cfg(test)]
+pub(crate) fn install_test_global_sealing() -> ArtifactSealingKey {
+    set_global_snapshot_sealing(std::sync::Arc::new(SnapshotSealing::with_key(
+        ArtifactSealingKey::from_bytes(vec![0x2a_u8; KEY_LEN]).expect("test sealing key"),
+    )));
+    global_snapshot_sealing()
+        .key()
+        .cloned()
+        .expect("installing a sealing key must make it visible to every reader")
 }
 
 #[cfg(test)]
@@ -807,6 +838,35 @@ mod tests {
     fn the_secret_is_not_printed() {
         let rendered = format!("{:?}", key());
         assert_eq!(rendered, "ArtifactSealingKey(<redacted>)");
+    }
+
+    /// The installation, not just the state it installs.
+    ///
+    /// `set_global_snapshot_sealing` is called from exactly one place in the
+    /// tree — startup — so a wiring break here turns sealing off for the whole
+    /// fleet in silence: the startup warning fires only when the secret is
+    /// genuinely unconfigured, and a reader that gets a disabled state simply
+    /// stops advertising fixed artifacts.
+    ///
+    /// Keys are opaque by design, so identity is asserted by use rather than by
+    /// comparison: what the installed key sealed, the key readers get opens.
+    #[test]
+    fn installed_sealing_is_what_readers_get_and_a_later_install_cannot_swap_it() {
+        let installed = install_test_global_sealing();
+        let visible = global_snapshot_sealing();
+        assert!(visible.is_enabled(), "installing a key must enable sealing");
+
+        let sealed = seal_bytes(&installed, &scope(), b"guest memory");
+        assert_eq!(
+            open_bytes(visible.key().expect("key"), &scope(), &sealed).expect("open"),
+            b"guest memory",
+        );
+
+        set_global_snapshot_sealing(std::sync::Arc::new(SnapshotSealing::disabled()));
+        assert!(
+            global_snapshot_sealing().is_enabled(),
+            "a later install must not disarm a live key"
+        );
     }
 }
 

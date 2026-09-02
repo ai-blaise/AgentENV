@@ -136,7 +136,9 @@ Snapshot publication advertises:
 - Fixed Firecracker artifacts under `snapshot/v1/artifacts/{snapshot_id}/{relative_path}`:
   - `vm_state.bin` is published from its local file path.
   - `firecracker-manifest.json` is serialized from the committed manifest and published as bytes.
-- Overlaybd layers referenced by the snapshot's rootfs, memory, and attached-drive image configs. These are not published under a snapshot-specific key. They reuse the overlaybd layer artifact protocol owned by `src/overlaybd/p2p/artifact.rs`, with keys like `overlaybd-layer/v1/sha256:<digest>` and `LayerMetadata` understood by the overlaybd HTTP facade.
+- Registry-origin overlaybd layers referenced by the snapshot's **rootfs** image config, and only those carrying a digest and a non-zero size. These are not published under a snapshot-specific key. They reuse the overlaybd layer artifact protocol owned by `src/overlaybd/p2p/artifact.rs`, with keys like `overlaybd-layer/v1/sha256:<digest>` and `LayerMetadata` understood by the overlaybd HTTP facade.
+
+The memory layers, the attached-drive layers, and the guest's rootfs delta are deliberately never advertised: they are guest data with no P2P consumer, and a content-addressed layer goes out unsealed. The memory and attached-drive configs are excluded by never being handed to `SnapshotP2pArtifact::local_overlaybd_layers` at all. The delta travels inside the rootfs config and is dropped there by provenance — a filename check, not a digest check, because the ublk restack gives the delta a content digest and a size of its own, so it is shaped exactly like a registry blob. `local_overlaybd_layers_never_advertise_the_snapshot_delta` in `src/snapshot/p2p.rs` pins each half of that guard.
 
 That split is important. Snapshot fixed artifacts are scoped to one snapshot ID and are only consumed by snapshot runtime resolvers. Overlaybd commit layers are content-addressed and may be consumed by any overlaybd runtime path, including foreground range reads through `/p2p-http/{origin}`. Do not add a second snapshot-specific key format for overlaybd layers; doing so publishes bytes that overlaybd cannot discover.
 
