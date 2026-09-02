@@ -1,6 +1,7 @@
 use std::fmt;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,23 @@ use uuid::Uuid;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// How long a reachability answer is reused before it is probed again.
+///
+/// The facade is a loopback process started with this one, so the answer
+/// changes when it crashes or is restarted, not between image opens.
+const ACCELERATOR_PROBE_TTL_MS: u64 = 30_000;
+
+/// Milliseconds from a monotonic clock, for probe ageing only.
+fn monotonic_millis() -> u64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    // Starts at 1 so that zero can mean "never probed" without a separate flag.
+    ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+        + 1
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum RemoteOpenMode {
     Direct,
@@ -35,6 +53,46 @@ struct ImageServiceInner {
     p2p_publish_url: Option<String>,
     remote_runtime: OnceCell<RemoteRuntime>,
     remote_mode: parking_lot::RwLock<RemoteOpenMode>,
+    /// Whether the P2P facade answered, and when that was last established.
+    accelerator: AcceleratorProbe,
+}
+
+/// A cached answer to "is the P2P facade reachable", refreshed off the hot path.
+///
+/// The probe is a DNS resolution and a synchronous connect with a one-second
+/// timeout. It used to run inline in `enable_acceleration`, which
+/// `create_image_file` calls on every image open -- so opening an image could
+/// park a Tokio worker for a second, and a facade that was down parked one for
+/// a second every time.
+///
+/// The reachability of a loopback facade changes on the timescale of process
+/// restarts, not of image opens, so a cached answer with a periodic refresh
+/// says the same thing at a fraction of the cost. Before the first probe
+/// lands, the answer is "not reachable", which selects the cached read path --
+/// a slower first open rather than a blocked one, and never a wrong one.
+#[derive(Debug)]
+struct AcceleratorProbe {
+    reachable: AtomicBool,
+    /// Monotonic milliseconds at the last completed probe; 0 means never.
+    checked_at_ms: AtomicU64,
+    /// Held for the duration of one refresh so concurrent opens start one probe
+    /// between them rather than one each.
+    refreshing: AtomicBool,
+}
+
+impl AcceleratorProbe {
+    fn new() -> Self {
+        Self {
+            reachable: AtomicBool::new(false),
+            checked_at_ms: AtomicU64::new(0),
+            refreshing: AtomicBool::new(false),
+        }
+    }
+
+    fn is_stale(&self, now_ms: u64) -> bool {
+        let checked = self.checked_at_ms.load(Ordering::Acquire);
+        checked == 0 || now_ms.saturating_sub(checked) >= ACCELERATOR_PROBE_TTL_MS
+    }
 }
 
 struct RemoteRuntime {
@@ -93,6 +151,7 @@ impl ImageService {
                 p2p_publish_url,
                 remote_runtime: OnceCell::new(),
                 remote_mode: parking_lot::RwLock::new(RemoteOpenMode::Cached),
+                accelerator: AcceleratorProbe::new(),
             }),
         })
     }
@@ -266,7 +325,7 @@ impl ImageService {
 
     pub fn enable_acceleration(&self) -> bool {
         let p2p = &self.inner.global_config.p2p_config;
-        let accelerate_address = if p2p.enable && check_accelerate_url(&p2p.address) {
+        let accelerate_address = if p2p.enable && self.accelerator_is_reachable(&p2p.address) {
             *self.inner.remote_mode.write() = RemoteOpenMode::Direct;
             p2p.address.clone()
         } else {
@@ -281,6 +340,50 @@ impl ImageService {
         }
 
         !accelerate_address.is_empty()
+    }
+
+    /// Reads the cached probe, refreshing it in the background when stale.
+    ///
+    /// Never blocks: the refresh runs on a blocking thread and this call
+    /// returns whatever the last completed probe said. With no Tokio runtime
+    /// -- which is where several of the tools that build images run -- the
+    /// probe happens inline, because there is no worker to protect and the
+    /// alternative is never probing at all.
+    fn accelerator_is_reachable(&self, address: &str) -> bool {
+        let probe = &self.inner.accelerator;
+        let now_ms = monotonic_millis();
+        if !probe.is_stale(now_ms) {
+            return probe.reachable.load(Ordering::Acquire);
+        }
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            let reachable = check_accelerate_url(address);
+            probe.reachable.store(reachable, Ordering::Release);
+            probe.checked_at_ms.store(now_ms, Ordering::Release);
+            return reachable;
+        };
+
+        if probe
+            .refreshing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let inner = Arc::clone(&self.inner);
+            let address = address.to_string();
+            handle.spawn_blocking(move || {
+                let reachable = check_accelerate_url(&address);
+                inner
+                    .accelerator
+                    .reachable
+                    .store(reachable, Ordering::Release);
+                inner
+                    .accelerator
+                    .checked_at_ms
+                    .store(monotonic_millis(), Ordering::Release);
+                inner.accelerator.refreshing.store(false, Ordering::Release);
+            });
+        }
+        probe.reachable.load(Ordering::Acquire)
     }
 
     pub async fn open_remote_blob_with_size(
@@ -898,6 +1001,116 @@ mod tests {
         assert_eq!(&got[..], object.as_slice());
 
         server_handle.abort();
+    }
+
+    /// Deciding whether to accelerate must not park a worker.
+    ///
+    /// The probe is a DNS resolution plus a connect with a one-second timeout,
+    /// and `create_image_file` asks this question on every image open. Run
+    /// inline against a facade that is not listening -- the case that costs the
+    /// full timeout, and the case a node hits continuously when its facade is
+    /// down -- it made every open a second slower. An unroutable address is
+    /// used rather than a closed port because a closed port on loopback is
+    /// refused immediately; the timeout only bites where packets go nowhere.
+    #[tokio::test]
+    async fn deciding_whether_to_accelerate_does_not_block_the_caller() {
+        let tmp = TempDir::new().expect("tempdir");
+        let global_path = tmp.path().join("overlaybd.json");
+        write_json(
+            &global_path,
+            &serde_json::json!({
+                "registryFsVersion": "v2",
+                "ioEngine": 0,
+                "cacheConfig": {
+                    "cacheType": "file",
+                    "cacheDir": tmp.path().join("cache"),
+                    "cacheSizeGB": 1,
+                    "refillSize": 262144,
+                    "blockSize": 65536
+                },
+                "p2pConfig": {
+                    "enable": true,
+                    // TEST-NET-1, which is routed nowhere.
+                    "address": "http://192.0.2.1:9731/p2p-http/"
+                }
+            }),
+        );
+
+        let service = ImageService::from_config_path(&global_path)
+            .await
+            .expect("service");
+
+        let started = std::time::Instant::now();
+        for _ in 0..3 {
+            assert!(
+                !service.enable_acceleration(),
+                "an unreachable facade must not be selected"
+            );
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < CONNECT_TIMEOUT,
+            "three acceleration decisions took {elapsed:?}, at least one connect timeout \
+             ({CONNECT_TIMEOUT:?}); the probe is still running on the caller's thread"
+        );
+    }
+
+    /// A reachable facade is still selected, once the probe has landed.
+    ///
+    /// Without this the fix above would be satisfied by never probing at all,
+    /// which disables P2P everywhere rather than making the decision cheap.
+    #[tokio::test]
+    async fn a_reachable_facade_is_selected_once_the_probe_lands() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a stand-in facade");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            loop {
+                if listener.accept().await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let tmp = TempDir::new().expect("tempdir");
+        let global_path = tmp.path().join("overlaybd.json");
+        write_json(
+            &global_path,
+            &serde_json::json!({
+                "registryFsVersion": "v2",
+                "ioEngine": 0,
+                "cacheConfig": {
+                    "cacheType": "file",
+                    "cacheDir": tmp.path().join("cache"),
+                    "cacheSizeGB": 1,
+                    "refillSize": 262144,
+                    "blockSize": 65536
+                },
+                "p2pConfig": {
+                    "enable": true,
+                    "address": format!("http://127.0.0.1:{port}/p2p-http/")
+                }
+            }),
+        );
+
+        let service = ImageService::from_config_path(&global_path)
+            .await
+            .expect("service");
+
+        // The first call starts the probe and answers from the empty cache.
+        let _ = service.enable_acceleration();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if service.enable_acceleration() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the probe never reported a reachable facade"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]
