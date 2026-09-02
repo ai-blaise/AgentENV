@@ -358,3 +358,24 @@ var schedulerSandboxEventsLostTotal = promauto.NewCounterVec(
 	},
 	[]string{"node_id"},
 )
+
+// schedulerMobilityLookupTotal counts lookups a binding miss did not end.
+//
+// The three ways it can end differently are worth separating. `holder` means
+// another node is mid-handover and the caller was sent there; `origin` means
+// the paused state was never committed anywhere the cluster can read, so only
+// the node that wrote it can serve it; `placed` means the state is committed
+// and this lookup chose a node for it. A rising `origin` rate says paused
+// sandboxes are not reaching the repository, which is the thing that makes
+// them unmovable -- and it is invisible from the binding metrics alone.
+var schedulerMobilityLookupTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "agentenv_scheduler_mobility_lookup_total",
+		Help: "Sandbox lookups resolved from a mobility record after a binding miss.",
+	},
+	[]string{"via"},
+)
+
+func recordSchedulerMobilityLookup(via string) {
+	schedulerMobilityLookupTotal.WithLabelValues(via).Inc()
+}

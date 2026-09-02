@@ -362,8 +362,132 @@ func (s *Service) ListNodes(_ context.Context, _ *schedulerv1.ListNodesRequest) 
 	return &schedulerv1.ListNodesResponse{Nodes: nodes}, nil
 }
 
-func (s *Service) LookupNode(_ context.Context, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
-	return lookupNode(s.logger, s.store, req)
+// LookupNode resolves a sandbox to the node that serves it.
+//
+// A binding is the fast answer and the common one. When there is none, the
+// sandbox is not necessarily gone: a paused sandbox whose binding lapsed, or
+// one whose origin node departed, still has a mobility record, and the record
+// says whether anyone can serve it and who. Returning NotFound there was a
+// sandbox that exists, is resumable, and is unreachable -- the client sees a
+// 404 for a sandbox it can list.
+func (s *Service) LookupNode(ctx context.Context, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
+	resp, err := lookupNode(s.logger, s.store, req)
+	if status.Code(err) != codes.NotFound {
+		return resp, err
+	}
+	placed, placeErr := s.placeFromMobilityRecord(ctx, req.GetSandboxId())
+	if placeErr != nil {
+		// The binding miss is the client's answer; a mobility store that could
+		// not be read is not grounds for a different one.
+		s.logger.Debug("scheduler mobility placement failed",
+			zap.String("sandbox_id", req.GetSandboxId()), zap.Error(placeErr))
+		return nil, err
+	}
+	if placed == nil {
+		return nil, err
+	}
+	return placed, nil
+}
+
+// placeFromMobilityRecord answers a binding miss from the mobility record, or
+// reports that there is nothing to answer with.
+//
+// A nil response and a nil error means "no record, or none that can be served"
+// -- the caller keeps its NotFound.
+func (s *Service) placeFromMobilityRecord(
+	ctx context.Context,
+	sandboxID string,
+) (*schedulerv1.LookupNodeResponse, error) {
+	if s.mobility == nil {
+		return nil, nil
+	}
+	record, ok, err := s.mobility.Get(ctx, sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
+
+	// A node currently holding the sandbox is where it is, not a placement
+	// decision. Re-placing it would send the caller somewhere the sandbox is
+	// not, and the holder would refuse the resume anyway.
+	if holder := strings.TrimSpace(record.HolderNodeID); holder != "" {
+		if node, found := s.nodes.Resolve(holder); found {
+			return s.recordAndAnswer(sandboxID, node, "holder")
+		}
+	}
+
+	// An uncommitted paused state is readable only where it was written, so
+	// the origin is the only node that can serve it. If the origin is gone,
+	// so is the sandbox.
+	if strings.TrimSpace(record.SnapshotID) == "" {
+		if node, found := s.nodes.Resolve(strings.TrimSpace(record.OriginNodeID)); found {
+			return s.recordAndAnswer(sandboxID, node, "origin")
+		}
+		return nil, nil
+	}
+
+	node, selectErr := s.selectForMobilityRecord()
+	if selectErr != nil {
+		return nil, nil
+	}
+	return s.recordAndAnswer(sandboxID, node, "placed")
+}
+
+// selectForMobilityRecord picks a node for a committed paused sandbox, using
+// the same filters a fresh placement uses.
+//
+// No hint: the shipped strategies ignore it, and the record's CPU and memory
+// are not a placement constraint here -- the destination node's own admission
+// control is authoritative about whether it can take the sandbox, and it
+// refuses in a way this cannot pre-empt.
+func (s *Service) selectForMobilityRecord() (Node, error) {
+	now := time.Now()
+	discovered := s.nodes.SampleNodes(s.candidateSampleSize /* allowLingering */, false)
+	if s.strategy.NeedsStableOrder() {
+		sortNodesByID(discovered)
+	}
+	rich := make([]RichNode, 0, len(discovered))
+	for _, n := range discovered {
+		snapshot, health := s.nodes.PeekObservedHealth(n.ID)
+		if s.reservationsEnabled {
+			snapshot = s.ledger.ApplyTo(n.ID, snapshot, now)
+		}
+		rich = append(rich, RichNode{Node: n, Snapshot: snapshot, Health: health})
+	}
+	eligible := rich
+	if s.healthGateEnabled {
+		eligible, _, _ = FilterByHealth(rich, s.reportTTL, now)
+	}
+	eligible = FilterByResourceLimit(eligible, s.resourceLimit)
+	selected, err := s.strategy.Select(eligible, nil)
+	if err != nil {
+		return Node{}, err
+	}
+	return selected.Node, nil
+}
+
+// recordAndAnswer writes the binding the lookup just resolved and returns it.
+//
+// Writing it is what stops the next lookup for the same sandbox repeating this
+// work, and it is also what makes the answer stable: without a binding, two
+// concurrent lookups could place one sandbox on two nodes.
+func (s *Service) recordAndAnswer(
+	sandboxID string,
+	node Node,
+	via string,
+) (*schedulerv1.LookupNodeResponse, error) {
+	if err := s.store.Record(sandboxID, node, time.Now()); err != nil {
+		return nil, err
+	}
+	s.logger.Debug("scheduler lookup resolved from mobility record",
+		zap.String("sandbox_id", sandboxID),
+		zap.String("node_id", node.ID),
+		zap.String("via", via),
+	)
+	recordSchedulerMobilityLookup(via)
+	return &schedulerv1.LookupNodeResponse{Node: node.ToProto()}, nil
 }
 
 func lookupNode(logger *zap.Logger, store BindingStore, req *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {

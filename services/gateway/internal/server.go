@@ -276,9 +276,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	var node *schedulerv1.Node
 
 	if hasSandbox {
-		rpcStart := time.Now()
-		resp, err := s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
-		recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
+		resp, err := s.lookupSandboxNode(routingCtx, sandboxID)
 		if err != nil {
 			s.writeSchedulerError(w, err)
 			return
@@ -545,6 +543,41 @@ func (s *Server) writePlacementError(w http.ResponseWriter, err error) {
 // request that is not a create. The Retry-After split follows the same rule
 // as writePlacementError: sent for ResourceExhausted, withheld for
 // Unavailable.
+// lookupSandboxNode resolves a sandbox to its node, falling back on a miss.
+//
+// The query-only path is a cached binding read and answers almost every
+// request. It cannot answer for a sandbox with no binding, because a read
+// replica has neither a node registry nor a strategy -- and a paused sandbox
+// whose binding lapsed has no binding while still being perfectly resumable.
+// The primary can answer that from the mobility record, so a NotFound from the
+// cheap path is retried against it rather than returned as a 404 for a sandbox
+// the client can still see in a list.
+//
+// Only NotFound is retried. Unavailable or DeadlineExceeded mean the cheap path
+// failed, and asking a second scheduler the same question inside the same
+// request budget spends the client's deadline to return the same error.
+func (s *Server) lookupSandboxNode(
+	ctx context.Context,
+	sandboxID string,
+) (*schedulerv1.LookupNodeResponse, error) {
+	rpcStart := time.Now()
+	resp, err := s.queryOnlyScheduler.LookupNode(ctx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
+	recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
+	if status.Code(err) != codes.NotFound || s.scheduler == nil {
+		return resp, err
+	}
+
+	fallbackStart := time.Now()
+	fallback, fallbackErr := s.scheduler.LookupNode(ctx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
+	recordGatewaySchedulerRPC("LookupNodeFallback", fallbackStart, fallbackErr)
+	if fallbackErr != nil {
+		// The original miss is the honest answer; the fallback's error is about
+		// the fallback.
+		return nil, err
+	}
+	return fallback, nil
+}
+
 func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
 	st, ok := status.FromError(err)
 	if !ok {
