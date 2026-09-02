@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +14,7 @@ use overlaybd::helper::prepare_runtime_upper;
 use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
 use overlaybd::RestackSnapshotTerminalFailure;
-use tokio::net::UnixListener;
+use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, Notify, RwLock};
 use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
 
@@ -27,6 +28,25 @@ use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec,
 };
 use crate::runtime;
+
+/// First delay after a failed accept(2), doubling up to
+/// [`ACCEPT_RETRY_MAX_BACKOFF`] while the failure persists.
+const ACCEPT_RETRY_MIN_BACKOFF: Duration = Duration::from_millis(10);
+const ACCEPT_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Source of daemon control-socket connections.
+///
+/// Abstracted over [`UnixListener`] so the accept-failure retry policy can be
+/// exercised without exhausting the test process's descriptor table.
+trait ConnectionSource {
+    fn accept_connection(&self) -> impl Future<Output = std::io::Result<UnixStream>>;
+}
+
+impl ConnectionSource for UnixListener {
+    async fn accept_connection(&self) -> std::io::Result<UnixStream> {
+        self.accept().await.map(|(stream, _)| stream)
+    }
+}
 
 // ── Managed device wrapper ──────────────────────────────────────────────────
 
@@ -380,15 +400,62 @@ impl UblkDaemonServer {
         );
         signal_ready()?;
 
+        let outcome = self.accept_loop(&listener).await;
+
+        // Graceful cleanup: stop all devices. Runs on every exit path, so an
+        // error raised inside the loop cannot leave ublk devices attached with
+        // no userspace server behind them.
+        self.stop_all_devices().await;
+
+        // Remove socket file.
+        let _ = std::fs::remove_file(&self.socket_path);
+        tracing::info!("ublk daemon stopped");
+        outcome
+    }
+
+    /// Serve connections until shutdown is requested.
+    ///
+    /// accept(2) failures are transient by nature — EMFILE/ENFILE under fd
+    /// pressure, ENOBUFS/ENOMEM under socket memory pressure — so they are
+    /// retried rather than propagated. Exiting here takes every ublk device on
+    /// the node down with the process, and the kernel cannot re-adopt those
+    /// devices afterwards, so one retryable errno must never end the daemon.
+    async fn accept_loop<S: ConnectionSource>(&self, listener: &S) -> Result<()> {
         // Note: spawned connection handlers may outlive the accept loop when
         // shutdown fires. This is acceptable — DashMap operations are individually
         // atomic, so a concurrent handle_delete and stop_all_devices on the same
         // device ID will race on `devices.remove()`, and only one will get the
         // device while the other silently skips it. No data corruption is possible.
+        let mut backoff = ACCEPT_RETRY_MIN_BACKOFF;
         loop {
             tokio::select! {
-                accept = listener.accept() => {
-                    let (stream, _) = accept.context("accept daemon connection")?;
+                accept = listener.accept_connection() => {
+                    let stream = match accept {
+                        Ok(stream) => {
+                            backoff = ACCEPT_RETRY_MIN_BACKOFF;
+                            stream
+                        }
+                        Err(err) => {
+                            // The un-accepted connection keeps the listener
+                            // readable, so the sleep is what stops a busy spin;
+                            // it also gives in-flight handlers time to release
+                            // the descriptors that caused the failure.
+                            tracing::warn!(
+                                ?err,
+                                backoff_ms = backoff.as_millis() as u64,
+                                "accept daemon connection failed; retrying"
+                            );
+                            tokio::select! {
+                                _ = tokio::time::sleep(backoff) => {}
+                                _ = self.shutdown.notified() => {
+                                    tracing::info!("ublk daemon shutdown requested");
+                                    return Ok(());
+                                }
+                            }
+                            backoff = (backoff * 2).min(ACCEPT_RETRY_MAX_BACKOFF);
+                            continue;
+                        }
+                    };
                     let devices = Arc::clone(&self.devices);
                     let ctrl_ring = self.ctrl_ring.clone();
                     let image_service_cache = Arc::clone(&self.image_service_cache);
@@ -415,18 +482,10 @@ impl UblkDaemonServer {
                 }
                 _ = self.shutdown.notified() => {
                     tracing::info!("ublk daemon shutdown requested");
-                    break;
+                    return Ok(());
                 }
             }
         }
-
-        // Graceful cleanup: stop all devices.
-        self.stop_all_devices().await;
-
-        // Remove socket file.
-        let _ = std::fs::remove_file(&self.socket_path);
-        tracing::info!("ublk daemon stopped");
-        Ok(())
     }
 
     /// Request the daemon to shut down.
@@ -1634,6 +1693,7 @@ fn clear_page_cache(device_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use storage_util::io_ring::spawn_io_ring_worker;
     use tempfile::TempDir;
 
     /// Minimal local `ImageService`; placeholder images have no lowers, so this
@@ -1713,5 +1773,88 @@ mod tests {
         assert_ne!(small_path, large_path);
         assert_eq!(small.num_lbas(), 8 * 1024 * 1024 / 512);
         assert_eq!(large.num_lbas(), 16 * 1024 * 1024 / 512);
+    }
+
+    /// Accept source that always fails the way a node under descriptor
+    /// pressure does, timestamping every attempt the loop makes.
+    struct AlwaysEmfile {
+        attempts: Arc<std::sync::Mutex<Vec<tokio::time::Instant>>>,
+    }
+
+    impl AlwaysEmfile {
+        fn new() -> Self {
+            Self {
+                attempts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            }
+        }
+
+        fn attempt_times(&self) -> Vec<tokio::time::Instant> {
+            self.attempts.lock().unwrap().clone()
+        }
+    }
+
+    impl ConnectionSource for AlwaysEmfile {
+        async fn accept_connection(&self) -> std::io::Result<UnixStream> {
+            self.attempts
+                .lock()
+                .unwrap()
+                .push(tokio::time::Instant::now());
+            Err(std::io::Error::from_raw_os_error(libc::EMFILE))
+        }
+    }
+
+    async fn test_server(dir: &Path) -> UblkDaemonServer {
+        let image_service = test_image_service(dir).await;
+        let (ctrl_ring, _handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        UblkDaemonServer::new(
+            dir.join("daemon.sock"),
+            ctrl_ring,
+            image_service,
+            dir.join("resize-overlaybd-global.json"),
+        )
+    }
+
+    /// A transient accept(2) errno must not end the daemon: every ublk device
+    /// on the node dies with the process and the kernel cannot re-adopt them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn transient_accept_failures_are_retried_with_backoff() {
+        let dir = TempDir::new().unwrap();
+        let server = Arc::new(test_server(dir.path()).await);
+        let listener = AlwaysEmfile::new();
+        let attempts = Arc::clone(&listener.attempts);
+
+        // Let the loop ride out several failures before asking it to stop, so
+        // a daemon that treats the first error as fatal cannot pass.
+        let stopper = Arc::clone(&server);
+        tokio::spawn(async move {
+            while attempts.lock().unwrap().len() < 3 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            stopper.request_shutdown();
+        });
+
+        let outcome = tokio::time::timeout(Duration::from_secs(10), server.accept_loop(&listener))
+            .await
+            .expect("accept loop should stop once shutdown is requested");
+        outcome.expect("transient accept failures must not end the accept loop");
+
+        let times = listener.attempt_times();
+        assert!(
+            times.len() >= 3,
+            "accept loop should have retried at least 3 times, got {}",
+            times.len()
+        );
+        // Retrying without sleeping would spin at 100% CPU for as long as the
+        // errno persists, because the un-accepted connection keeps the
+        // listener readable.
+        for (index, pair) in times.windows(2).enumerate() {
+            let gap = pair[1] - pair[0];
+            assert!(
+                gap >= ACCEPT_RETRY_MIN_BACKOFF,
+                "retry {} came {gap:?} after the previous one; \
+                 accept retries must back off, not busy-spin",
+                index + 1
+            );
+        }
     }
 }

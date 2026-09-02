@@ -94,6 +94,7 @@ User-visible rootfs images are selected at the template API layer.
 | `default_image` | string | `ubuntu:24.04` | Image used when template builds omit `fromImage` |
 | `search_registries` | array of strings | `["docker.io", "ghcr.io"]` | Registries tried when resolving short image references |
 | `allowed_registries` | array of strings | unset (no restriction) | Whitelist of registry hosts (e.g. `docker.io`, `registry.example.com:5000`). **Omitting the key** imposes no restriction; an **explicit empty list `[]`** denies every registry. When set to a non-empty list, only references whose registry host is in the list resolve; any other host is rejected as a client (4xx, `ImageReferenceError`) error. See *How the three registry settings interact* below. |
+| `convert_standard_oci` | boolean | `true` | Convert standard OCI tar images into local overlaybd commits. Off, only overlaybd-native images resolve and a standard one is rejected with a user-facing error |
 | `try_referrers_overlaybd_prefixes` | array of strings | `[]` | Image reference prefixes for which AgentENV tries OCI Referrers API via `regctl` for an overlaybd-native artifact before converting a standard OCI image locally. Prefixes are matched with simple `starts_with`; include the trailing slash yourself, for example `registry.example.com/` or `registry.example.com/team/`. Requires `regctl` on `PATH`; lookup failures fall back to the source image. |
 
 ### How the three registry settings interact
@@ -240,6 +241,27 @@ Default VM resources for sandboxes.
 |-----|------|---------|-------------|
 | `mem_size_mib` | integer | `1024` | Guest RAM in MiB |
 | `vcpu_count` | integer | `2` | Number of virtual CPUs |
+| `backend` | string | `"firecracker"` | Sandbox backend. `firecracker` runs a microVM per sandbox and refuses to start without `/dev/kvm` and `ublk_drv`; `mock` runs no guest and isolates nothing, for exercising the control plane on hosts that cannot virtualize. Env: `AENV_SANDBOX_BACKEND` |
+
+## `[machine.disk_rate_limit]`
+
+Per-sandbox virtio-blk rate limits, applied to every drive the sandbox gets.
+Zero means unlimited. Dormant values are ignored entirely while `enabled` is
+false, so a pre-staged section cannot block startup.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Apply the limits below |
+| `bandwidth_bytes_per_sec` | integer | `0` | Sustained bandwidth ceiling |
+| `bandwidth_burst_bytes` | integer | `0` | One-time bandwidth burst |
+| `iops` | integer | `0` | Sustained IOPS ceiling |
+| `iops_burst` | integer | `0` | One-time IOPS burst |
+
+Validation rules, enforced at config load when `enabled` is true:
+
+- Each burst requires its matching sustained limit to be nonzero; a burst paired
+  with a zero sustained limit is silently ignored by the consumer.
+- Every value must fit Firecracker's signed `i64` token-bucket fields.
 
 ## `[envd]`
 
@@ -274,6 +296,29 @@ Sandbox lifecycle management.
 | `auto_resume_min_sandbox_timeout_secs` | integer | `300` | When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration |
 | `persisted_sandbox_store_path` | string | `"$AENV_HOME/persisted-sandboxes"` | Directory for persisted sandbox state |
 
+## `[orchestrator.admission]`
+
+Node-local admission control. It ships inert — `enabled = false` and every limit
+unset — because a mis-tuned limit turns available capacity into rejections. When
+enabled, a create that would cross a limit is refused at the gate with a
+`Retry-After` instead of failing deep in the create path.
+
+Each limit is compared against the sum of what the metadata store holds and what
+in-flight creates have already reserved, so two concurrent admissions cannot both
+see pre-reservation capacity.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Enable the gate. Off, every create is admitted whatever the node is carrying |
+| `max_sandbox_count` | integer | unset | Ceiling on running sandboxes |
+| `max_sandbox_starting_count` | integer | unset | Ceiling on sandboxes still starting |
+| `max_allocated_cpu` | integer | unset | Ceiling on summed vCPU reservation |
+| `max_allocated_memory_bytes` | integer | unset | Ceiling on summed memory reservation |
+| `max_sandbox_count_including_paused` | integer | unset | Ceiling on running plus paused sandboxes |
+| `min_free_network_slots` | integer | unset | Refuse a create when fewer than this many network slots would remain. Warm pooled slots count as free |
+| `retry_after_secs` | integer | `2` | `Retry-After` seconds returned with a rejection |
+| `snapshot_max_age_ms` | integer | `200` | How long one node-metrics reading may be reused across admission decisions. Collecting metrics walks every sandbox, so re-reading per decision would make the gate the bottleneck under the burst it exists to survive |
+
 ## `[pool]`
 
 Shared process-wide warm-pool defaults used by network slots, block devices, and pre-spawned Firecracker processes. Pools prewarm to the low watermark, then grow the refill target geometrically toward the high watermark when real acquisitions drain the pool.
@@ -287,8 +332,11 @@ Component sections:
 
 | Section | Key | Type | Default | Description |
 |---------|-----|------|---------|-------------|
+| `[pool.network]` | `enabled` | boolean | `true` | Enable the warm network-slot pool. ANDed with `maintenance_enabled`: either one off means no background refill |
 | `[pool.network]` | `maintenance_enabled` | boolean | `true` | Enable the background network-slot maintenance worker |
-| `[pool.block]` | `enabled` | boolean | `true` | Enable the ublk overlaybd warm-device pool |
+| `[pool.network]` | `startup_prewarm` | boolean | `true` | Build slots up to the low watermark during server startup |
+| `[pool.network]` | `fill_concurrency` | integer | `4` | Slots built concurrently per refill batch. Slot creation is dominated by RTNL-serialized netlink work, so this does not scale linearly |
+| `[pool.block]` | `enabled` | boolean | `true` | Enable the ublk overlaybd warm-device pool. Its only switch: `maintenance_enabled` and `fill_concurrency` do not apply, because the daemon refills asynchronously from request paths |
 | `[pool.block]` | `startup_prewarm` | boolean | capability-based | Prewarm block devices after the first reusable image shape is known. When omitted, it is enabled only if the kernel supports `UBLK_F_UPDATE_SIZE`; an explicit value overrides detection |
 | `[pool.firecracker]` | `enabled` | boolean | `true` | Enable pre-spawned Firecracker processes for snapshot resume |
 | `[pool.firecracker]` | `maintenance_enabled` | boolean | `true` | Enable the background Firecracker process maintenance worker |
@@ -329,6 +377,16 @@ Optional scheduler heartbeat reporting for multi-node control plane integration.
 |-----|------|---------|-------------|
 | `enabled` | boolean | `false` | Enable periodic scheduler heartbeat reporting. Requires `[cluster].scheduler_endpoint` |
 | `interval_secs` | integer | `5` | Heartbeat report interval in seconds |
+
+### `[observability.scheduler_report.kill_switch]`
+
+What the node does once it has lost contact with the scheduler. See
+[Operating AgentENV at scale](../internals/scale-operations.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `action` | string | `"disabled"` | `"disabled"` or `"block_creates"`. Pausing running sandboxes is deliberately not offered: with a single scheduler replica a restart is indistinguishable from a partition, so that action would pause the fleet on every deploy. An unrecognized value is refused at startup |
+| `after_secs` | integer | `60` | Seconds without a successful heartbeat before the action applies — twelve missed heartbeats at the default interval. Not an off switch: zero alongside an action is refused at startup, and disabling is `action = "disabled"` |
 
 Environment variable overrides:
 

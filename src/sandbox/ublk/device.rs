@@ -263,9 +263,19 @@ impl UblkDeviceManager {
             .expect("UblkDeviceManager::init_global() must be called before global()")
     }
 
-    /// Returns `true` if the ublk daemon client was successfully spawned.
+    /// Returns `true` while the node can serve ublk-backed storage.
+    ///
+    /// A spawned client is not enough: when the daemon dies the kernel drops
+    /// every device it was serving and there is no respawn path, so a client
+    /// that outlived its daemon must not report the node as capable.
     pub fn is_available(&self) -> bool {
-        self.client.is_some()
+        self.client.as_ref().is_some_and(|client| !client.is_dead())
+    }
+
+    /// Why ublk storage is unavailable, when the cause was a daemon that died
+    /// after a successful start.
+    pub fn daemon_death_reason(&self) -> Option<String> {
+        self.client.as_ref()?.death_reason()
     }
 
     fn require_client(&self) -> Result<&Arc<UblkDaemonClient>> {
@@ -739,6 +749,33 @@ fn record_restack_usage_stats(dev_id: u32, kind: &'static str, stats: &RestackSn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Snapshot resume checks availability before it allocates anything. A
+    /// dead daemon means the kernel already tore down its devices, so the
+    /// manager must stop claiming the node can serve them.
+    #[test]
+    fn availability_follows_daemon_liveness() {
+        let socket = PathBuf::from("/nonexistent/ublk.sock");
+
+        let none = UblkDeviceManager::new(None, false);
+        assert!(!none.is_available());
+        assert_eq!(none.daemon_death_reason(), None);
+
+        let live = UblkDeviceManager::new(
+            Some(UblkDaemonClient::new_for_test(socket.clone(), false)),
+            false,
+        );
+        assert!(live.is_available());
+        assert_eq!(live.daemon_death_reason(), None);
+
+        let dead =
+            UblkDeviceManager::new(Some(UblkDaemonClient::new_for_test(socket, true)), false);
+        assert!(
+            !dead.is_available(),
+            "a client that outlived its daemon must not report the node as capable"
+        );
+        assert!(dead.daemon_death_reason().is_some());
+    }
 
     #[test]
     fn rejects_persisted_cow_backend_with_migration_guidance() {

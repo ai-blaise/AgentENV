@@ -19,8 +19,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::cfg::{AdmissionConfig, AppConfig, SnapshotConfig};
     use crate::observability::{KillSwitch, KillSwitchAction};
+    use crate::orchestrator::{AdmissionController, NodeCapacityInputs, OrchestratorMetrics};
+    use crate::p2p::{DisabledP2pTransport, P2pTransport};
     use crate::snapshot::sealing::{ArtifactSealingKey, SnapshotSealing};
+    use crate::types::SandboxResources;
 
     /// The kill switch stops a node accepting work once it has lost contact
     /// with the scheduler. Off, a node out of contact must keep accepting —
@@ -41,6 +45,113 @@ mod tests {
                 "{action:?} should block = {want_blocked}"
             );
         }
+    }
+
+    /// The switch as an operator actually enables it: name the action and
+    /// touch nothing else. Building it from hand-picked arguments was how the
+    /// documented recipe came to produce a switch that never fired — the
+    /// window has its own field, and its default used to be a second, silent
+    /// off switch.
+    #[test]
+    fn the_documented_kill_switch_recipe_arms_it() {
+        let cfg = crate::cfg::ObservabilitySchedulerReportConfig::default().kill_switch;
+        let switch = KillSwitch::new(
+            KillSwitchAction::BlockCreates,
+            Duration::from_secs(cfg.after_secs),
+        );
+        switch.record_success();
+        assert!(
+            switch.since_last_success().is_some() && cfg.after_secs > 0,
+            "action = \"block_creates\" with the default window must arm a switch that can fire"
+        );
+    }
+
+    /// Node-local admission control. Off, every create is admitted whatever
+    /// the node is carrying — that is the rollback for a mis-tuned limit
+    /// turning capacity into rejections.
+    #[tokio::test]
+    async fn admission_rejects_only_when_enabled() {
+        for (enabled, want_admitted) in [(true, false), (false, true)] {
+            let controller = AdmissionController::new(AdmissionConfig {
+                enabled,
+                max_sandbox_count: Some(1),
+                max_sandbox_starting_count: None,
+                max_allocated_cpu: None,
+                max_allocated_memory_bytes: None,
+                max_sandbox_count_including_paused: None,
+                min_free_network_slots: None,
+                retry_after_secs: 2,
+                snapshot_max_age_ms: 0,
+            });
+            let over_the_limit = OrchestratorMetrics {
+                running_sandbox_count: 5,
+                ..Default::default()
+            };
+
+            let admitted = controller
+                .try_admit(
+                    1,
+                    SandboxResources::default(),
+                    NodeCapacityInputs::default(),
+                    || async { Some(over_the_limit) },
+                )
+                .await
+                .is_ok();
+            assert_eq!(
+                admitted, want_admitted,
+                "admission enabled = {enabled} should admit = {want_admitted}"
+            );
+        }
+    }
+
+    /// Snapshot P2P. Off, the snapshot manager gets no transport at all, so
+    /// resolution goes to the repository and nothing is advertised.
+    #[test]
+    fn snapshot_p2p_is_a_real_switch() {
+        let transport: Arc<dyn P2pTransport> = Arc::new(DisabledP2pTransport);
+
+        let on = SnapshotConfig {
+            p2p_enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            on.p2p_transport_for(&transport).is_some(),
+            "on must hand the snapshot manager a transport"
+        );
+
+        let off = SnapshotConfig {
+            p2p_enabled: false,
+            ..Default::default()
+        };
+        assert!(
+            off.p2p_transport_for(&transport).is_none(),
+            "off must leave the snapshot manager without one"
+        );
+    }
+
+    /// Warm pool maintenance, as the network pool resolves it: the component
+    /// flag and the shared `[pool]` flag are ANDed, so either one off means no
+    /// background refill.
+    #[test]
+    fn warm_pool_maintenance_is_a_real_switch() {
+        for (pool_enabled, maintenance_enabled, want) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
+            let mut config = AppConfig::default();
+            config.pool.network.enabled = pool_enabled;
+            config.pool.network.maintenance_enabled = maintenance_enabled;
+            assert_eq!(
+                config.network_pool_config().maintenance_enabled,
+                want,
+                "pool.enabled={pool_enabled} pool.network.maintenance_enabled={maintenance_enabled}"
+            );
+        }
+        // The behavioural assertions live in crates/warm-pool, which owns the
+        // worker: `release_respects_high_watermark_when_maintenance_disabled`
+        // and `release_allows_maintenance_worker_to_drain_above_high_watermark`.
     }
 
     /// Sealing gates whether snapshot fixed artifacts may be advertised at

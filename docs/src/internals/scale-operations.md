@@ -9,11 +9,14 @@ upgrade changes nothing until someone decides it should.
 Each of these is asserted in both directions by the conformance harness
 (`services/*/internal/offswitch_test.go` and `src/offswitch.rs`): off must
 remove the behaviour, on must produce it. A gate that does nothing is worse
-than no gate, because it reads as a rollback that will not roll back.
+than no gate, because it reads as a rollback that will not roll back. Where a
+switch's behavioural assertions live elsewhere — the warm pool's worker is
+covered in `crates/warm-pool` — the harness still pins the wiring, and says so
+in a comment naming the tests it defers to.
 
 | Behaviour | Setting | Default | Off means |
 | --- | --- | --- | --- |
-| Node stops accepting work when out of contact | `observability.scheduler_report.kill_switch.action` | `disabled` | A partitioned node keeps accepting creates |
+| Node stops accepting work when out of contact | `observability.scheduler_report.kill_switch.action` (window: `.after_secs`, default 60) | `disabled` | A partitioned node keeps accepting creates |
 | Health-gated placement | scheduler `WithHealthGate` | on | Any discovered node is a candidate, however stale |
 | Bounded candidate sampling | scheduler `WithCandidateSampleSize` | 32 | Every placement inspects the whole fleet |
 | Reservation ledger | `scheduler.reservations_enabled` | off | Placement reads each heartbeat snapshot verbatim; a burst inside one interval sees the same numbers |
@@ -23,11 +26,17 @@ than no gate, because it reads as a rollback that will not roll back.
 | Snapshot artifact sealing | `snapshot.artifact_sealing_secret` | unset | Fixed artifacts are not advertised to peers at all |
 | Snapshot P2P | `snapshot.p2p_enabled` | on | Resolution goes to the repository only |
 | Warm slot prewarm | `pool.network.startup_prewarm` | on | The first callers pay full slot construction cost |
-| Warm pool maintenance | `pool.network.maintenance_enabled` | on | No background refill; slots are built on demand |
+| Warm pool maintenance | `pool.network.maintenance_enabled` (ANDed with `pool.network.enabled`) | on | No background refill; slots are built on demand |
+| Node-local admission control | `orchestrator.admission.enabled` | off | Every create is admitted whatever the node is carrying |
 
-Zero is never "off" for a duration. It is what an unset config field looks
-like, and an operator who never touched a setting must get the default rather
-than silently lose the behaviour. Disabling is always an explicit value.
+Zero is never "off" for a duration a switch depends on. It is what an unset
+config field looks like, and an operator who never touched a setting must get
+the default rather than silently lose the behaviour, so
+`kill_switch.after_secs = 0` alongside an action is refused at startup rather
+than quietly arming nothing. Disabling is always an explicit value. The one
+duration that does read zero as off is `p2p.reannounce_interval_secs`, whose
+default is 60: it turns off a refresh, not a safety gate, and an untouched
+config never reaches it.
 
 ## Rolling an upgrade
 
@@ -48,8 +57,12 @@ reading, which is not the same direction for every field:
 
 A node only starts eliding its roster after a scheduler tells it digests are
 understood, so a new node against an old scheduler keeps sending everything.
-The matrix is walked explicitly in
-`services/scheduler/internal/version_skew_test.go`.
+The first four rows are walked explicitly in
+`services/scheduler/internal/version_skew_test.go`; the disown header is a
+gateway concern and is covered in `services/gateway/internal/cutover_test.go`.
+Only the directions reachable in-tree are testable — an old node against a new
+scheduler. The reverse needs a released binary, which is what the `a54bacd`
+floor below is for.
 
 That permission expires with each response rather than latching on the first
 one that granted it. Schedulers are replaced by rollouts and rollbacks, and a
@@ -59,14 +72,24 @@ that reads an elided roster as an empty one and deletes every binding it holds.
 
 Because the heartbeat that discovers the change has already been sent, an
 elided heartbeat also declines to call itself complete: `roster_complete`
-describes the message, not just the node. A scheduler that cannot resolve the
-digest — including one that has never heard of digests — then reconciles
-nothing instead of deleting everything. The scheduler takes the authority to
+describes the message, not just the node. A scheduler that resolves the digest
+then reconciles nothing instead of deleting everything, taking the authority to
 delete from the cached roster the digest resolves to, raised but never lowered
 by the wire bit.
 
-Upgrade order does not matter. Upgrading schedulers first buys the wire
-savings sooner, because nodes cannot elide until a scheduler says they may.
+That protection needs a scheduler that acts on `roster_complete`, which begins
+at `a54bacd`. To anything older — every scheduler up to and including `v0.1.3`
+— the field is an unknown one, discarded, and an elided heartbeat reads as "this
+node owns nothing" and deletes every binding for it, with no grace. Expiring the
+elision permission per response bounds that to the single heartbeat that
+discovers the change, roughly one interval (5s by default) of 404s for every
+sandbox on the node, per grant.
+
+So there is a floor, and it is the reason to upgrade schedulers first rather
+than a preference: once any node that can elide is deployed, no scheduler below
+`a54bacd` may serve heartbeats. No rollback past it, and no pre-floor replica
+left in the load-balancer rotation — with a shared binding store, one stale
+replica wipes what the rest of the fleet is serving.
 
 ## Snapshot artifact sealing
 

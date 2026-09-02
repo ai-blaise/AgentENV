@@ -9,6 +9,7 @@ use nix::fcntl::{Flock, FlockArg};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use super::durable::{create_dir_durably, write_file_durably};
 use super::layout::PosixFsSnapshotArtifactLayout;
 use crate::snapshot::repository::SnapshotListFilter;
 use crate::snapshot::{
@@ -69,13 +70,7 @@ impl PosixFsCatalogStore {
         snapshot_id: &SnapshotId,
     ) -> RepositoryResult<PublishSession> {
         self.ensure_layout()?;
-        let snapshot_dir = self.layout(snapshot_id).snapshot_dir();
-        fs::create_dir_all(&snapshot_dir).map_err(|error| {
-            RepositoryError::backend(
-                format!("create snapshot dir '{}'", snapshot_dir.display()),
-                error,
-            )
-        })?;
+        create_dir_durably(&self.layout(snapshot_id).snapshot_dir())?;
         Ok(PublishSession {
             snapshot_id: snapshot_id.clone(),
         })
@@ -398,72 +393,16 @@ impl PosixFsCatalogStore {
     where
         T: Serialize,
     {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                RepositoryError::backend(format!("create '{}'", parent.display()), error)
-            })?;
-        }
         let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
             RepositoryError::backend(format!("serialize json '{}'", path.display()), error)
         })?;
-        let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
-            message: format!("resolve parent for '{}'", path.display()),
-            source: None,
-        })?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
-            RepositoryError::backend(format!("create temp file in '{}'", parent.display()), error)
-        })?;
-        temp.write_all(&bytes).map_err(|error| {
-            RepositoryError::backend(
-                format!("write temp json '{}'", temp.path().display()),
-                error,
-            )
-        })?;
-        temp.as_file().sync_all().map_err(|error| {
-            RepositoryError::backend(format!("sync temp json '{}'", temp.path().display()), error)
-        })?;
-        let tmp_path = temp.path().to_path_buf();
-        temp.persist(path).map_err(|error| {
-            RepositoryError::backend(
-                format!(
-                    "persist json '{}' -> '{}'",
-                    tmp_path.display(),
-                    path.display()
-                ),
-                error.error,
-            )
-        })?;
-        Ok(())
+        write_file_durably(path, &bytes)
     }
 
+    /// The marker is what makes a snapshot visible on the next startup, so it
+    /// has to reach the platter with the record that describes it.
     fn write_commit_marker(&self, id: &SnapshotId) -> RepositoryResult<()> {
-        let path = self.commit_marker_path(id);
-        let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
-            message: format!("resolve parent for '{}'", path.display()),
-            source: None,
-        })?;
-        fs::create_dir_all(parent).map_err(|error| {
-            RepositoryError::backend(format!("create '{}'", parent.display()), error)
-        })?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(|error| {
-            RepositoryError::backend(
-                format!("create temp commit marker in '{}'", path.display()),
-                error,
-            )
-        })?;
-        temp.write_all(b"committed").map_err(|error| {
-            RepositoryError::backend(
-                format!("write commit marker '{}'", temp.path().display()),
-                error,
-            )
-        })?;
-        temp.persist(&path).map_err(|error| {
-            RepositoryError::backend(
-                format!("persist commit marker '{}'", path.display()),
-                error.error,
-            )
-        })?;
-        Ok(())
+        write_file_durably(&self.commit_marker_path(id), b"committed")
     }
 
     fn remove_file_if_exists(&self, path: &Path) -> RepositoryResult<()> {
@@ -814,6 +753,56 @@ mod tests {
                 .path(super::super::layout::POSIXFS_SNAPSHOT_COMMIT_MARKER)
                 .exists()
         );
+    }
+
+    /// Everything an acknowledged publish depends on has to be rename-durable:
+    /// a snapshot the client can name but the catalog forgets after a power
+    /// loss is worse than a publish that failed.
+    #[test]
+    fn commit_syncs_every_directory_it_renames_into() {
+        use super::super::durable::probe::{self, Synced};
+
+        let tempdir = TempDir::new().expect("tempdir should exist");
+        let store = PosixFsCatalogStore::new(tempdir.path().to_path_buf());
+        let snapshot_id = SnapshotId::generate();
+        let alias = SnapshotAlias::parse("durable-alias").expect("alias should parse");
+        let session = store
+            .begin_publish(&snapshot_id)
+            .expect("begin should work");
+
+        let _ = probe::take();
+        store
+            .commit_publish(
+                &session,
+                SnapshotPublishMetadata {
+                    id: snapshot_id.clone(),
+                    alias: Some(alias.clone()),
+                    source: SnapshotPublishSource::Template,
+                    ..SnapshotPublishMetadata::mock()
+                },
+                CommittedSnapshot::mock(),
+            )
+            .expect("commit should work");
+        let synced = probe::take();
+
+        let layout = PosixFsSnapshotArtifactLayout::new(tempdir.path(), &snapshot_id);
+        let marker = layout.path(super::super::layout::POSIXFS_SNAPSHOT_COMMIT_MARKER);
+        let record = PosixFsSnapshotArtifactLayout::record_path(tempdir.path(), &snapshot_id);
+        let alias_path = PosixFsSnapshotArtifactLayout::alias_path(tempdir.path(), &alias);
+
+        for path in [&marker, &record, &alias_path] {
+            assert!(
+                synced.contains(&Synced::File(path.clone())),
+                "contents of '{}' were never synced: {synced:?}",
+                path.display()
+            );
+            let parent = path.parent().expect("published files have a parent");
+            assert!(
+                synced.contains(&Synced::Dir(parent.to_path_buf())),
+                "'{}' was renamed into an unsynced directory: {synced:?}",
+                parent.display()
+            );
+        }
     }
 
     fn committed_metadata(

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
@@ -54,6 +54,16 @@ struct NetworkManagerConfig {
 pub(crate) struct NetworkManager {
     /// Bitmap tracking allocated slots.
     allocated: AtomicBitSet<{ slot_count::from_bits(MAX_SLOTS) }>,
+
+    /// How many bits `allocated` holds.
+    ///
+    /// Carried alongside the bitmap rather than read out of it: `AtomicBitSet`
+    /// exposes no popcount that does not walk all 512 words, and the admission
+    /// gate reads this on every create. Maintained only by
+    /// [`NetworkManager::take_slot_bit`], [`NetworkManager::take_next_slot_bit`]
+    /// and [`NetworkManager::free_slot_bit`], which are the only places a bit
+    /// moves.
+    allocated_count: AtomicUsize,
 
     /// Warm slots ready for immediate reuse.
     pool: WarmPool<Slot>,
@@ -159,6 +169,7 @@ impl NetworkManager {
         let egress_proxy = EgressProxy::new();
         let manager = Self {
             allocated: AtomicBitSet::new(),
+            allocated_count: AtomicUsize::new(0),
             pool: WarmPool::new(config.pool),
             address_plan: config.address_plan,
             netns_dir: config.netns_dir,
@@ -168,7 +179,7 @@ impl NetworkManager {
         };
 
         // Reserve slot 0 (invalid for IP addresses)
-        manager.allocated.insert(0);
+        let _ = manager.take_slot_bit(0);
         let existing_slots = manager.reserve_existing_host_veth_slots();
         manager.log_external_conflicts(&existing_slots);
 
@@ -247,12 +258,45 @@ impl NetworkManager {
         self.shutting_down.load(Ordering::Acquire)
     }
 
+    /// Takes the bit for `idx`, keeping [`Self::allocated_count`] in step.
+    ///
+    /// Returns what the bitmap returns: `Some(false)` when this call took the
+    /// bit, `Some(true)` when it was already taken, `None` when `idx` is out of
+    /// range. Only the transition counts, so a duplicate insert cannot inflate
+    /// the total.
+    fn take_slot_bit(&self, idx: usize) -> Option<bool> {
+        let was_set = self.allocated.insert(idx)?;
+        if !was_set {
+            self.allocated_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(was_set)
+    }
+
+    /// Takes the next free bit, keeping [`Self::allocated_count`] in step.
+    fn take_next_slot_bit(&self) -> Option<usize> {
+        let idx = self.allocated.set_next_free_bit()?;
+        self.allocated_count.fetch_add(1, Ordering::Relaxed);
+        Some(idx)
+    }
+
+    /// Releases the bit for `idx`, keeping [`Self::allocated_count`] in step.
+    ///
+    /// Returns `Some(true)` when this call released a set bit, `Some(false)`
+    /// when it was already clear, `None` when `idx` is out of range.
+    fn free_slot_bit(&self, idx: usize) -> Option<bool> {
+        let was_set = self.allocated.remove(idx)?;
+        if was_set {
+            self.allocated_count.fetch_sub(1, Ordering::Relaxed);
+        }
+        Some(was_set)
+    }
+
     /// Current slot capacity. See [`NetworkSlotCapacity`] for why pooled slots
     /// count as available rather than as consumed.
     pub(crate) fn slot_capacity(&self) -> NetworkSlotCapacity {
         NetworkSlotCapacity {
             total: MAX_SLOTS,
-            allocated: self.allocated.len(),
+            allocated: self.allocated_count.load(Ordering::Relaxed),
             pooled: self.pool.len(),
         }
     }
@@ -276,7 +320,7 @@ impl NetworkManager {
             ));
         }
 
-        match self.allocated.insert(idx as usize) {
+        match self.take_slot_bit(idx as usize) {
             // insert returns true when the bit WAS already set (duplicate)
             Some(false) => Ok(Slot::new(
                 idx,
@@ -306,7 +350,7 @@ impl NetworkManager {
             return Err(anyhow!("Slot index {} out of range", idx));
         }
 
-        match self.allocated.remove(idx as usize) {
+        match self.free_slot_bit(idx as usize) {
             // remove returns true when the bit WAS set (successful release)
             Some(true) => Ok(()),
             Some(false) => Err(anyhow!("Slot {} not allocated", idx)),
@@ -343,6 +387,17 @@ impl NetworkManager {
     /// Fast path: reuse a warm slot from the pool.
     /// Slow path: allocate a new index and set up kernel network resources.
     pub fn allocate_any(&self) -> Result<Slot> {
+        let result = self.acquire_any_slot();
+        // Republished here rather than only from the maintenance cycle: that
+        // cycle runs on a worker that does not start at all when pool
+        // maintenance is off, and even when it is on it wakes only on a
+        // watermark crossing. Occupancy has to move with the load that changes
+        // it, not with the refill.
+        self.publish_pool_metrics();
+        result
+    }
+
+    fn acquire_any_slot(&self) -> Result<Slot> {
         if self.shutting_down() {
             return Err(anyhow!(ERR_SHUTTING_DOWN));
         }
@@ -376,7 +431,7 @@ impl NetworkManager {
                 .map_err(NetworkError::HostIptablesError)?;
         }
 
-        match self.allocated.set_next_free_bit() {
+        match self.take_next_slot_bit() {
             Some(idx) => {
                 let mut slot = Slot::new(
                     idx as u32,
@@ -386,7 +441,7 @@ impl NetworkManager {
                 )
                 .expect("BitSet index within valid range");
                 if let Err(e) = slot.create_network() {
-                    self.allocated.remove(idx);
+                    let _ = self.free_slot_bit(idx);
                     return Err(anyhow!("Failed to create network: {e}"));
                 }
 
@@ -520,6 +575,12 @@ impl NetworkManager {
     /// When pool maintenance is disabled, this keeps the previous bounded-pool
     /// behavior and cleans up immediately once the pool reaches high watermark.
     pub fn release(&self, slot: Slot) -> Result<()> {
+        let result = self.release_slot(slot);
+        self.publish_pool_metrics();
+        result
+    }
+
+    fn release_slot(&self, slot: Slot) -> Result<()> {
         if self.shutting_down() {
             return self.cleanup_slot_and_release_bit(slot);
         }
@@ -605,7 +666,7 @@ impl NetworkManager {
                 continue;
             };
 
-            let _ = self.allocated.insert(slot_idx);
+            let _ = self.take_slot_bit(slot_idx);
             reserved_slots.push(slot_idx);
         }
 
@@ -892,9 +953,78 @@ fn run_command(command: &str, args: &[&str], capabilities: &'static [i32]) -> Op
 mod tests {
     use super::*;
     use index_set::BitSet;
-    use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    /// Captures gauge sets so a test can read back what was actually emitted.
+    /// Installed per-thread, so it does not disturb the process-wide recorder
+    /// the server installs.
+    #[derive(Default)]
+    struct GaugeSpy {
+        gauges: Arc<Mutex<HashMap<String, f64>>>,
+    }
+
+    struct SpyGauge {
+        name: String,
+        gauges: Arc<Mutex<HashMap<String, f64>>>,
+    }
+
+    impl metrics::GaugeFn for SpyGauge {
+        fn increment(&self, _value: f64) {}
+        fn decrement(&self, _value: f64) {}
+        fn set(&self, value: f64) {
+            self.gauges.lock().unwrap().insert(self.name.clone(), value);
+        }
+    }
+
+    impl metrics::Recorder for GaugeSpy {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+        fn register_gauge(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            metrics::Gauge::from_arc(Arc::new(SpyGauge {
+                name: key.name().to_string(),
+                gauges: Arc::clone(&self.gauges),
+            }))
+        }
+        fn register_histogram(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
 
     fn manager_with_capacity(capacity: usize) -> NetworkManager {
         NetworkManager::new(false, capacity, capacity)
@@ -978,6 +1108,109 @@ mod tests {
         }
     }
 
+    /// Admission's `min_free_network_slots` floor and the capacity gauges both
+    /// read this. It was the bitmap's word count for a while — a compile-time
+    /// 512 whatever the node was doing — which is a floor that can never fire
+    /// and a dashboard that never moves.
+    #[test]
+    fn slot_capacity_tracks_what_is_actually_allocated() {
+        let manager = manager_with_capacity(0);
+        // Slot 0 is reserved during construction, and any host `veth-<idx>`
+        // left by another process is reserved with it, so the count is read
+        // relative to what construction produced.
+        let baseline = manager.slot_capacity();
+        assert_eq!(baseline.total, MAX_SLOTS);
+        assert!(baseline.allocated >= 1, "slot 0 is reserved on init");
+
+        let first = manager.allocate_test_slot().unwrap();
+        let second = manager.allocate_test_slot().unwrap();
+        let second_idx = second.idx as usize;
+        assert_eq!(
+            manager.slot_capacity().allocated,
+            baseline.allocated + 2,
+            "an allocation must consume capacity"
+        );
+        assert_eq!(
+            manager.slot_capacity().available(),
+            MAX_SLOTS - baseline.allocated - 2
+        );
+
+        assert_eq!(
+            manager.take_slot_bit(first.idx as usize),
+            Some(true),
+            "the bit is already taken"
+        );
+        assert_eq!(
+            manager.slot_capacity().allocated,
+            baseline.allocated + 2,
+            "a duplicate take is not a new slot"
+        );
+
+        manager.release(first).unwrap();
+        assert_eq!(manager.slot_capacity().allocated, baseline.allocated + 1);
+
+        manager.release(second).unwrap();
+        assert_eq!(
+            manager.free_slot_bit(second_idx),
+            Some(false),
+            "the bit is already free"
+        );
+        assert_eq!(
+            manager.slot_capacity().allocated,
+            baseline.allocated,
+            "a double release must not double-count"
+        );
+    }
+
+    /// The gauges have to move with the load that changes them. Publishing
+    /// only from the maintenance cycle leaves them frozen between watermark
+    /// crossings, and absent entirely on a node with `[pool.network]`
+    /// maintenance off — that worker never starts.
+    #[test]
+    fn allocation_and_release_publish_the_slot_gauges() {
+        let spy = GaugeSpy::default();
+        let gauges = Arc::clone(&spy.gauges);
+        let manager = manager_with_capacity(2);
+
+        // Warm one slot first so `allocate_any` can take the pooled path;
+        // building a fresh one needs netlink privileges a unit test lacks.
+        let slot = manager.allocate_test_slot().unwrap();
+        let idx = slot.idx;
+        manager.release(slot).unwrap();
+        let allocated = manager.slot_capacity().allocated;
+
+        let reused = metrics::with_local_recorder(&spy, || manager.allocate_any().unwrap());
+        assert_eq!(reused.idx, idx);
+        {
+            let published = gauges.lock().unwrap();
+            assert_eq!(
+                published.get("agentenv_pool_size").copied(),
+                Some(0.0),
+                "allocating must publish occupancy without waiting for a refill cycle"
+            );
+            assert_eq!(
+                published.get("agentenv_network_slots_available").copied(),
+                Some((MAX_SLOTS - allocated) as f64)
+            );
+        }
+
+        metrics::with_local_recorder(&spy, || manager.release(reused).unwrap());
+        let published = gauges.lock().unwrap();
+        assert_eq!(
+            published.get("agentenv_pool_size").copied(),
+            Some(1.0),
+            "releasing must republish occupancy"
+        );
+        assert_eq!(
+            published.get("agentenv_network_slots_allocated").copied(),
+            Some(allocated as f64)
+        );
+        assert_eq!(
+            published.get("agentenv_network_slots_available").copied(),
+            Some((MAX_SLOTS - allocated + 1) as f64)
+        );
+    }
+
     #[test]
     fn slot_zero_is_reserved_on_init() {
         let manager = manager_with_capacity(0);
@@ -990,11 +1223,20 @@ mod tests {
     fn allocate_any_never_returns_slot_zero() {
         let manager = manager_with_capacity(0);
         // First allocation must skip the reserved slot 0
+        let before = manager.slot_capacity().allocated;
         let idx = manager
-            .allocated
-            .set_next_free_bit()
+            .take_next_slot_bit()
             .expect("at least one free slot");
         assert!(idx >= 1, "allocate_any returned reserved slot 0");
+        // take_next_slot_bit is the only path a real node takes to a brand-new
+        // slot, so the accounting has to move here or slot_capacity reports the
+        // construction baseline forever: min_free_network_slots could never
+        // fire and both gauges would sit flat while the node filled up.
+        assert_eq!(
+            manager.slot_capacity().allocated,
+            before + 1,
+            "a fresh allocation must be counted"
+        );
     }
 
     #[test]
@@ -1124,7 +1366,7 @@ mod tests {
     fn maintenance_cycle_drains_excess_warm_slots() {
         let manager = NetworkManager::new(true, 0, 2);
         for idx in 1..=4u32 {
-            manager.allocated.insert(idx as usize);
+            let _ = manager.take_slot_bit(idx as usize);
             manager.pool.release(test_slot(idx)).unwrap();
         }
 
@@ -1144,7 +1386,7 @@ mod tests {
         // Pre-populate the pool so allocate_any() always uses the fast path (no create_network).
         let manager = Arc::new(manager_with_capacity(n));
         for idx in 1..=(n as u32) {
-            manager.allocated.insert(idx as usize);
+            let _ = manager.take_slot_bit(idx as usize);
             manager.pool.try_push_bounded(test_slot(idx)).unwrap();
         }
 
@@ -1172,7 +1414,7 @@ mod tests {
     fn release_returns_slot_to_pool_when_under_capacity() {
         let manager = manager_with_capacity(5);
         // Pre-insert a slot into the bitset (simulating a prior allocation)
-        manager.allocated.insert(10);
+        let _ = manager.take_slot_bit(10);
         let slot = test_slot(10);
         // release() should push the slot into the pool (capacity=5, pool is empty)
         manager.release(slot).unwrap();
@@ -1182,14 +1424,14 @@ mod tests {
         while let Some(s) = manager.pool.try_drain_one() {
             drop(s);
         }
-        manager.allocated.remove(10);
+        let _ = manager.free_slot_bit(10);
     }
 
     #[test]
     fn allocate_any_prefers_pool_over_bitset() {
         let manager = manager_with_capacity(5);
         // Manually put a slot (idx=42) in the pool and mark it allocated in the bitset
-        manager.allocated.insert(42);
+        let _ = manager.take_slot_bit(42);
         let pooled = test_slot(42);
         manager.pool.try_push_bounded(pooled).unwrap();
 
@@ -1199,14 +1441,14 @@ mod tests {
         assert_eq!(slot.idx, 42, "allocate_any must return the pooled slot");
         assert!(manager.pool.is_empty(), "pool must be empty after pop");
         drop(slot);
-        manager.allocated.remove(42);
+        let _ = manager.free_slot_bit(42);
     }
 
     #[test]
     fn release_cleans_up_when_pool_is_full() {
         // high_watermark = 0: release() must NOT push to pool, must call cleanup() instead
         let manager = manager_with_capacity(0);
-        manager.allocated.insert(7);
+        let _ = manager.take_slot_bit(7);
         let slot = test_slot(7);
         manager.release(slot).unwrap();
         // Pool must be empty (slot was NOT cached)
@@ -1221,7 +1463,7 @@ mod tests {
     #[test]
     fn release_enqueues_above_high_watermark_and_drains_async() {
         let manager = NetworkManager::new(true, 0, 0);
-        manager.allocated.insert(17);
+        let _ = manager.take_slot_bit(17);
         let slot = test_slot(17);
 
         manager.release(slot).unwrap();
@@ -1248,8 +1490,8 @@ mod tests {
     #[test]
     fn shutdown_cleanup_drains_pool_and_releases_bits() {
         let manager = manager_with_capacity(4);
-        manager.allocated.insert(11);
-        manager.allocated.insert(12);
+        let _ = manager.take_slot_bit(11);
+        let _ = manager.take_slot_bit(12);
 
         manager.pool.try_push_bounded(test_slot(11)).unwrap();
         manager.pool.try_push_bounded(test_slot(12)).unwrap();
@@ -1270,7 +1512,7 @@ mod tests {
     #[test]
     fn shutdown_cleanup_is_idempotent() {
         let manager = manager_with_capacity(4);
-        manager.allocated.insert(14);
+        let _ = manager.take_slot_bit(14);
         manager.pool.try_push_bounded(test_slot(14)).unwrap();
 
         manager.shutdown().unwrap();
@@ -1283,7 +1525,7 @@ mod tests {
     #[test]
     fn allocate_any_is_rejected_after_shutdown_cleanup() {
         let manager = manager_with_capacity(4);
-        manager.allocated.insert(9);
+        let _ = manager.take_slot_bit(9);
         manager.pool.try_push_bounded(test_slot(9)).unwrap();
 
         manager.shutdown().unwrap();
@@ -1297,7 +1539,7 @@ mod tests {
         let manager = manager_with_capacity(4);
         manager.shutdown().unwrap();
 
-        manager.allocated.insert(13);
+        let _ = manager.take_slot_bit(13);
         let slot = test_slot(13);
         manager.release(slot).unwrap();
 
@@ -1311,7 +1553,7 @@ mod tests {
     #[test]
     fn release_race_with_shutdown_does_not_recache_slot() {
         let manager = Arc::new(manager_with_capacity(4));
-        manager.allocated.insert(15);
+        let _ = manager.take_slot_bit(15);
         let slot = test_slot(15);
 
         let release_manager = manager.clone();
@@ -1342,7 +1584,7 @@ mod tests {
         // We bypass allocate_any() because create_network() requires host capabilities.
         // Instead we manually mark slots as allocated in the bitset.
         for idx in 1u32..=50 {
-            manager.allocated.insert(idx as usize);
+            let _ = manager.take_slot_bit(idx as usize);
         }
         let slot_values: Vec<Slot> = (1u32..=50).map(test_slot).collect();
 
@@ -1370,7 +1612,7 @@ mod tests {
         }
         // Free any remaining bitset bits (for slots that were cleaned up, not pooled).
         for idx in 1u32..=50 {
-            manager.allocated.remove(idx as usize);
+            let _ = manager.free_slot_bit(idx as usize);
         }
     }
 
@@ -1380,7 +1622,7 @@ mod tests {
         // Pre-populate the pool so allocate_any() uses the fast path (no create_network).
         let manager = Arc::new(manager_with_capacity(total));
         for idx in 1..=(total as u32) {
-            manager.allocated.insert(idx as usize);
+            let _ = manager.take_slot_bit(idx as usize);
             manager.pool.try_push_bounded(test_slot(idx)).unwrap();
         }
 
@@ -1415,7 +1657,7 @@ mod tests {
         // Phase 3: Re-allocate the released slots (slow path — bitset only, no create_network in test)
         // Re-add them to the pool so the test remains root-free.
         for idx in first_batch.iter().copied().filter(|i| i % 2 == 0) {
-            manager.allocated.insert(idx as usize); // re-mark as allocated
+            let _ = manager.take_slot_bit(idx as usize); // re-mark as allocated
             manager.pool.try_push_bounded(test_slot(idx)).unwrap();
         }
         let handles: Vec<_> = (0..release_count)

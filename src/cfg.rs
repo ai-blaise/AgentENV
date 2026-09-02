@@ -205,9 +205,14 @@ pub struct SchedulerReportKillSwitchConfig {
     /// partition, so that action would pause the fleet on every deploy.
     #[config(default = "disabled")]
     pub action: String,
-    /// Seconds without a successful heartbeat before the action applies. Zero
-    /// disables the switch regardless of the action.
-    #[config(default = 0u64)]
+    /// Seconds without a successful heartbeat before the action applies.
+    ///
+    /// Zero is not an off switch. An operator who names an action and leaves
+    /// this alone means the action to happen, so the default is twelve missed
+    /// heartbeats at the default 5s interval, and turning the switch off is
+    /// only ever `action = "disabled"`. A zero here with an action set is
+    /// refused at startup rather than silently arming nothing.
+    #[config(default = 60u64)]
     pub after_secs: u64,
 }
 
@@ -251,9 +256,9 @@ pub struct PoolComponentConfig {
     ///
     /// Slot creation is dominated by RTNL-serialized netlink work, so this
     /// trades refill latency against peak kernel lock pressure rather than
-    /// scaling linearly. Raising it is only safe once `iptables-restore` is
-    /// invoked with `--wait`; without that, concurrent invocations fail on the
-    /// xtables lock and the refill loop abandons the fill.
+    /// scaling linearly. It has no `iptables-restore` precondition: the nft
+    /// backend takes no xtables lock, and the legacy one blocks for it with or
+    /// without `--wait`.
     #[config(default = 4usize)]
     pub fill_concurrency: usize,
 }
@@ -419,6 +424,20 @@ impl SnapshotConfig {
     /// migration decision.
     pub fn artifact_reach(&self) -> crate::snapshot::ArtifactReach {
         self.repository_backend.into()
+    }
+
+    /// The transport the snapshot manager is given, or `None` when snapshot
+    /// P2P is switched off.
+    ///
+    /// A method rather than an expression at its one call site in
+    /// `src/bin/server.rs`, because that call site is the switch's only
+    /// enforcement point and nothing in a binary's wiring is reachable from a
+    /// test. `src/offswitch.rs` asserts both directions here instead.
+    pub fn p2p_transport_for<T: ?Sized>(
+        &self,
+        transport: &std::sync::Arc<T>,
+    ) -> Option<std::sync::Arc<T>> {
+        self.p2p_enabled.then(|| std::sync::Arc::clone(transport))
     }
 }
 
@@ -1042,6 +1061,36 @@ impl AppConfig {
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
+        self.validate_kill_switch()?;
+        Ok(())
+    }
+
+    /// Refuse a kill switch that cannot fire.
+    ///
+    /// The switch is enabled by naming an action, and its window is a separate
+    /// field the docs do not mention. Both ways of getting that wrong — a
+    /// misspelled action, or an action with a zero window — used to resolve
+    /// silently to a switch that never fires, which is the failure mode a
+    /// partition-safety gate can least afford: an operator reads the config as
+    /// armed and nothing is.
+    fn validate_kill_switch(&self) -> Result<()> {
+        let cfg = &self.observability.scheduler_report.kill_switch;
+        let action = cfg.action.trim().to_ascii_lowercase();
+        if !matches!(action.as_str(), "disabled" | "block_creates") {
+            bail!(
+                "observability.scheduler_report.kill_switch.action {:?} is not a known action; \
+                 use \"disabled\" or \"block_creates\"",
+                cfg.action
+            );
+        }
+        if action != "disabled" && cfg.after_secs == 0 {
+            bail!(
+                "observability.scheduler_report.kill_switch.after_secs must be > 0 when action \
+                 is {:?}; a zero window is a switch that never fires — disable with \
+                 action = \"disabled\"",
+                cfg.action
+            );
+        }
         Ok(())
     }
 
@@ -1593,6 +1642,50 @@ mod tests {
         config
             .validate()
             .expect("consistent disk rate limit config passes");
+    }
+
+    /// The enable recipe an operator actually types: name the action, touch
+    /// nothing else. The window lives in a second field the off-switch table
+    /// did not put in front of them, and it used to default to a value that
+    /// disabled the switch — a documented rollback that would not roll back.
+    #[test]
+    fn validate_accepts_the_documented_kill_switch_recipe() {
+        let mut config = AppConfig::default();
+        config.observability.scheduler_report.kill_switch.action = "block_creates".to_string();
+        config
+            .validate()
+            .expect("an action with the default window must load");
+        assert!(
+            config.observability.scheduler_report.kill_switch.after_secs > 0,
+            "the default window must be able to elapse"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_an_armed_kill_switch_with_no_window() {
+        let mut config = AppConfig::default();
+        config.observability.scheduler_report.kill_switch.action = "block_creates".to_string();
+        config.observability.scheduler_report.kill_switch.after_secs = 0;
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("after_secs must be > 0"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// A misspelled action used to fall through to Disabled, which is the same
+    /// silent no-op reached by a different route.
+    #[test]
+    fn validate_rejects_an_unknown_kill_switch_action() {
+        let mut config = AppConfig::default();
+        config.observability.scheduler_report.kill_switch.action = "block_create".to_string();
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("is not a known action"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

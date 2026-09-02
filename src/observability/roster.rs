@@ -36,8 +36,26 @@
 //! `roster_complete` describes the message, not just the node. Carrying no
 //! roster and simultaneously asserting the node holds nothing is a false
 //! statement, and it is precisely the statement an older scheduler acts on.
-//! Withdrawing it means a misread elision reconciles nothing instead of
-//! deleting everything.
+//!
+//! # The floor this rests on
+//!
+//! Withdrawing `roster_complete` only helps against a scheduler that acts on
+//! it. `a54bacd` is where reconcile started gating an empty roster on the flag;
+//! before it — every scheduler up to and including `v0.1.3` — the field is an
+//! unknown one, discarded, and an elided heartbeat reconciles as "this node
+//! owns nothing" and deletes every binding it holds, with no grace.
+//!
+//! The remaining defence there is that the permission to elide expires with
+//! each response, so the pre-`a54bacd` process answers without granting it and
+//! the next heartbeat is full again. That still concedes the one elided
+//! heartbeat that discovered the change: roughly one heartbeat interval (5s by
+//! default) of 404s for every sandbox on the node, per grant.
+//!
+//! So `a54bacd` is an operational floor, not just a nicety. Once any eliding
+//! node is deployed, no scheduler below it may serve heartbeats — no rollback
+//! past it, and no pre-floor replica left in the load-balancer rotation, since
+//! a shared binding store lets one stale replica wipe what the rest are
+//! serving.
 
 use sha2::{Digest, Sha256};
 

@@ -127,7 +127,7 @@ PVM currently requires x86_64 and the `kvm_pvm` host module.
 | Subsystem | Location | Responsibility |
 |-----------|----------|---------------|
 | API layer | `src/api/` | Axum HTTP server, OpenAPI endpoints, reverse proxy to sandbox services, node/admin APIs |
-| Orchestrator | `src/orchestrator/` | Sandbox lifecycle state machine (Creating, Running, Pausing, Paused, Resuming, Killing), auto-eviction, incremental runtime metrics, paused-sandbox persistence across restarts |
+| Orchestrator | `src/orchestrator/` | Sandbox lifecycle state machine (Creating, Running, Pausing, Paused, Resuming, Killing), auto-eviction, runtime metrics derived on request, paused-sandbox persistence across restarts |
 | Observability | `src/observability/` | Node identity, machine info, request-time host metrics collection, node snapshot projection for admin APIs, optional scheduler heartbeat reporting |
 | Sandbox | `src/sandbox/` | Firecracker VM management, network namespaces, rootfs, envd communication, ublk devices (rootfs + memory), warm network/block/Firecracker pools |
 | Snapshot + Template Builder | `src/snapshot/`, `src/template/` | `src/snapshot/` owns committed snapshot storage/runtime resolution; `src/template/` provides the user-facing builder that publishes snapshots |
@@ -144,9 +144,9 @@ Snapshot resume can also use `[pool.firecracker]` to pre-spawn `(network slot, F
 
 The node observability path combines request-time host collection with request-time projection:
 
-- `src/orchestrator/metrics.rs` maintains incremental runtime counters during lifecycle operations, including running sandbox count, starting sandbox count, allocated CPU/memory, and create success/failure totals.
-- `src/orchestrator/service.rs` publishes those counters through a `tokio::sync::watch` channel whenever lifecycle state changes affect the node's runtime accounting.
-- `src/observability/identity.rs` resolves stable node identity fields such as node ID, cluster ID, service instance ID, package version, and build-time commit.
+- `src/orchestrator/metrics.rs` keeps monotonic create success/failure counters (`OrchestratorCounters`). Running and starting sandbox counts and allocated/paused CPU and memory are not counters: `Orchestrator::metrics_snapshot()` derives them per call from live sandbox metadata (`SandboxContribution` + `aggregate_resource_metrics`), so they cannot drift from store state the way the earlier incremental counters could.
+- `src/orchestrator/service.rs` exposes `metrics_snapshot()`, sampled per request; push-style consumers subscribe to the `tokio::sync::broadcast` `SandboxLifecycleEvent` stream via `subscribe_sandbox_events()`. The only `watch` channel in that file is shutdown signalling.
+- `src/identity.rs` (`crate::identity::NodeIdentity`) resolves stable node identity fields such as node ID, cluster ID, service instance ID, package version, and build-time commit.
 - `src/observability/machine.rs` captures static machine descriptors from `/proc/cpuinfo`.
 - `src/observability/host.rs` collects host CPU, memory, and disk usage each time a node snapshot is requested. CPU percent is derived from two `/proc/stat` samples; on the first request it takes both samples with a 100ms window to avoid returning a synthetic zero.
 - `src/observability/service.rs` merges the latest orchestrator counters, identity, machine info, request-time host metrics, and current sandbox ID roster into a `NodeSnapshot` returned by the admin endpoints and reused by heartbeat reporting.
@@ -154,7 +154,7 @@ The node observability path combines request-time host collection with request-t
 - Scheduler report config can be provided from TOML (`[observability.scheduler_report]`) and uses `[cluster].scheduler_endpoint` as the shared scheduler address. The reporter enable flag, address, and interval can be overridden by env vars (`AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED`, `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT`, `AENV_OBSERVABILITY_REPORT_INTERVAL_SECS`).
 - If a P2P transport exposes a local endpoint, the reporter includes it in the scheduler heartbeat so other nodes can discover it.
 
-This keeps node requests lightweight on orchestrator data: they avoid re-listing and sorting all sandboxes on every API call while still returning fresh host metrics.
+This keeps node requests lightweight on orchestrator data: a snapshot scans the metadata store through a callback rather than listing, sorting, and cloning every sandbox, while still returning fresh host metrics.
 
 The observability subsystem has two configuration-controlled scopes:
 
@@ -211,12 +211,12 @@ flowchart LR
 
 **Gateway** (`services/gateway/`): HTTP reverse proxy. Extracts sandbox data-plane routes from headers (`x-agentenv-sandbox-id` / `e2b-sandbox-id`) or configured host-based proxy domains (`{port}-{sandboxID}.{domain}`). Host-based routes are only enabled for explicit `gateway.sandbox_proxy_domains` entries, require RFC 952/1123 DNS-label-compatible sandbox IDs, and require the full `{port}-{sandboxID}` label to fit the 63-character DNS label limit. Runtime nodes have their own `[sandbox_proxy].domains` setting for the same host-based URL shape and return the first configured domain in sandbox metadata. In multi-node deployments, repository helpers can apply one `SANDBOX_PROXY_DOMAINS` value to both gateway and runtime node configuration. Sandbox control-plane routes such as `/sandboxes/{id}/pause` are routed by sandbox ID from the URL path; sandbox data-plane traffic is not inferred from URL path alone. For new sandboxes, calls `Schedule()` to pick a node. For existing sandboxes, calls `LookupNode()`. After sandbox creation, calls `RecordAssignment()` to seed a sandbox-to-node binding. Without explicit routing headers, it also handles cluster aggregation of `GET /sandboxes`, `GET /v2/sandboxes`, `GET /nodes`, and resolves `GET /nodes/{id}` via scheduler before proxying to the resolved node.
 
-**Scheduler** (`services/scheduler/`): gRPC service with pluggable node discovery and in-memory sandbox-to-node bindings, plus observed-node snapshots reported by runtime nodes. RPCs include `Schedule`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ListObservedNodes`, `ListP2pPeers`, `GetNode`, and `UnregisterNode`. Strategies: round_robin (default), random. Proto contract: `services/api/proto/scheduler.proto`. For P2P, scheduler stores and returns opaque peer endpoints from heartbeat records; artifact catalog lookup and byte transfer stay node-to-node.
+**Scheduler** (`services/scheduler/`): gRPC service with pluggable node discovery and sandbox-to-node bindings — in memory by default, Redis-backed when `scheduler.redis_addr` is set — plus observed-node snapshots reported by runtime nodes. The full RPC set is the `service Scheduler` block in `services/api/proto/scheduler.proto`; the routing-relevant ones are `Schedule`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ListObservedNodes`, `ListP2pPeers`, `GetNode`, and `UnregisterNode`. Strategies: `round_robin` (default), `random`, `least_loaded_of_two` (alias `p2c`), and `bin_pack`. For P2P, scheduler stores and returns opaque peer endpoints from heartbeat records; artifact catalog lookup and byte transfer stay node-to-node.
 
 Binding lifecycle:
 
 - `RecordAssignment` creates the initial binding immediately after sandbox creation succeeds.
-- Runtime heartbeats include the node's full sandbox ID roster. Scheduler treats that roster as the source of truth for that node and removes bindings missing from the latest heartbeat.
+- Runtime heartbeats carry the node's sandbox ID roster, elided to a digest while it has not changed. Scheduler resolves the digest against its cached roster and treats the result as the source of truth for that node, removing bindings missing from it. The elision protocol, and the scheduler version floor it depends on, are documented in [Operating AgentENV at scale](./scale-operations.md).
 - `binding_ttl` is a freshness TTL for routing information, not a copy of sandbox timeout. If a binding stops being refreshed by gateway or heartbeats, scheduler drops it on the next lookup or roster reconcile.
 - `UnregisterNode` removes the observed node record and proactively clears bindings owned by that node.
 
@@ -225,7 +225,7 @@ Discovery modes:
 - `static`: explicit `scheduler.nodes` list from config
 - `kubernetes`: EndpointSlice watch over the headless `agentenv-nodes` Service, using ready DaemonSet Pod IPs as backend endpoints
 
-**Limitations**: All bindings are in-memory (lost on scheduler restart). After a scheduler restart, bindings are rebuilt from new sandbox creations plus the next heartbeat roster from each runtime node. Kubernetes discovery updates the schedulable node set dynamically, but binding persistence is still not replicated.
+**Limitations**: With the default in-memory store, bindings are lost on scheduler restart and rebuilt from new sandbox creations plus the next heartbeat roster from each runtime node. Setting `scheduler.redis_addr` moves them to Redis (cluster mode included), which survives a restart and is what query-only replicas read. Observed-node state and the P2P artifact index stay in-memory and ephemeral either way.
 
 **Deployment**:
 

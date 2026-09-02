@@ -541,8 +541,8 @@ mod tests {
         let advertised =
             SnapshotP2pArtifact::local_overlaybd_layers(&image_config_path, &registry_digests)
                 .into_iter()
-            .map(|artifact| artifact.key)
-            .collect::<Vec<_>>();
+                .map(|artifact| artifact.key)
+                .collect::<Vec<_>>();
 
         assert_eq!(
             advertised, want_advertised,

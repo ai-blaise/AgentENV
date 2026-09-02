@@ -1,6 +1,7 @@
 mod artifacts;
 mod backend;
 mod catalog;
+mod durable;
 mod layout;
 mod runtime;
 

@@ -5,11 +5,11 @@ The multi-node control plane lives in `services/` as a separate Go module. It ro
 ## Components
 
 - **Gateway** (`services/gateway/`): HTTP reverse proxy that routes by sandbox ID
-- **Scheduler** (`services/scheduler/`): gRPC service for node selection, sandbox-to-node binding, observed node snapshots, and P2P peer endpoint discovery
+- **Scheduler** (`services/scheduler/`): gRPC service for node selection, sandbox-to-node binding (in memory, or Redis-backed via `scheduler.redis_addr`), observed node snapshots, and P2P peer endpoint discovery
 
 ## Build and Test
 
-Prerequisites: Go 1.21+
+Prerequisites: Go 1.25+ (`services/go.mod` pins toolchain `go1.26.6`, the first without the standard-library advisories govulncheck reports against the gateway and scheduler listeners)
 
 ```bash
 # From services/
@@ -67,7 +67,7 @@ Deployment model:
 
 Proto contract: `services/api/proto/scheduler.proto`
 
-RPCs: `Schedule`, `ListNodes`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ListObservedNodes`, `ListP2pPeers`, `GetNode`, `UnregisterNode`
+RPCs: see the `service Scheduler` block in the proto for the full set. The routing-relevant ones are `Schedule`, `ListNodes`, `LookupNode`, `RecordAssignment`, `Heartbeat`, `ListObservedNodes`, `ListP2pPeers`, `GetNode`, `UnregisterNode`
 
 Runtime node heartbeats may include an opaque `P2pEndpoint` containing a backend name and backend-specific address. The scheduler stores that endpoint with the observed-node record and returns ready peers through `ListP2pPeers(cluster_id, backend, exclude_node_id)`. The scheduler does not query artifact catalogs and never forwards artifact data.
 

@@ -153,10 +153,7 @@ async fn main() -> anyhow::Result<()> {
     }
     agentenv::snapshot::sealing::set_global_snapshot_sealing(snapshot_sealing);
 
-    let snapshot_p2p_transport = config
-        .snapshot
-        .p2p_enabled
-        .then(|| Arc::clone(&p2p_transport));
+    let snapshot_p2p_transport = config.snapshot.p2p_transport_for(&p2p_transport);
     let snapshot_manager = Arc::new(SnapshotManager::new(snapshot_p2p_transport)?);
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     let template_builder = Arc::new(TemplateBuilder::with_cpu_config(Arc::clone(

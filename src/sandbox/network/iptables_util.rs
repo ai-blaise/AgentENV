@@ -3,7 +3,7 @@ use std::io::Write as IoWrite;
 use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, Context, Result};
-use tracing::warn;
+use tracing::{debug, warn};
 
 pub(super) enum IptablesRestoreCommand {
     NewChain {
@@ -106,35 +106,74 @@ fn build_restore_script(commands: &[IptablesRestoreCommand]) -> String {
 
 /// Seconds `iptables-restore` may block waiting for the xtables lock.
 ///
-/// Without `--wait`, concurrent invocations fail outright on /run/xtables.lock
-/// rather than queueing. Slot setup runs one `iptables-restore` per namespace
-/// and the pool refill loop abandons its fill on any error, so under
-/// concurrency the failures did not merely retry — they stopped the pool from
-/// refilling at all.
+/// Only the legacy backend takes /run/xtables.lock at all — the nft backend
+/// never opens it — and since 1.8 the legacy `iptables-restore` blocks for the
+/// lock whether or not `--wait` is given. Passing it makes the wait bounded and
+/// explicit rather than indefinite, which is what the pool refill loop needs:
+/// slot setup runs one `iptables-restore` per namespace, and the loop abandons
+/// its fill on any error.
 const IPTABLES_LOCK_WAIT_SECS: &str = "5";
 
-/// Whether the installed `iptables-restore` understands `--wait`.
+/// The invocation the `--wait` capability probe runs.
 ///
-/// Every build since iptables 1.6 does, including the nft backend, where it is
-/// accepted and harmless. The probe exists so an unexpectedly old binary
-/// degrades to the previous behavior instead of failing every call.
+/// `--noflush` over an empty table body parses and commits nothing, so the
+/// probe is safe to take at any point, and a trailing `5` that was *not*
+/// consumed by `--wait` would be read as an input filename and fail — so a zero
+/// exit means the flag was understood.
+fn wait_probe_command() -> Command {
+    let mut command = Command::new("iptables-restore");
+    command
+        .arg("--wait")
+        .arg(IPTABLES_LOCK_WAIT_SECS)
+        .arg("--noflush")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// Whether the installed `iptables-restore` accepts `--wait`.
+///
+/// Asked by running it, not by reading `--help`. The nft backend — the default
+/// on the shipped runtime image — accepts `--wait` and does not advertise it,
+/// so the help text answers "no" for a binary that means "yes", and every node
+/// logged a lock warning for a lock its backend never takes.
+///
+/// The probe exists so an unexpectedly old binary degrades to the previous
+/// behavior instead of failing every call.
 fn iptables_restore_supports_wait() -> bool {
     static SUPPORTS_WAIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTS_WAIT.get_or_init(|| {
-        let Ok(output) = Command::new("iptables-restore").arg("--help").output() else {
+    *SUPPORTS_WAIT.get_or_init(|| wait_supported(probe_iptables_restore_wait()))
+}
+
+/// Turns the probe's answer into the decision, and is the whole decision.
+///
+/// Split out so a test can pin it without running iptables. The answer is the
+/// probe and nothing else: the help text cannot be consulted here, which is
+/// the defect this replaced -- `iptables-restore --help` on the nf_tables
+/// backend prints no `--wait` at all, so reading it reported "unsupported" on
+/// every modern host while the flag in fact works.
+fn wait_supported(probe: bool) -> bool {
+    if !probe {
+        debug!(
+            "iptables-restore did not accept --wait; falling back to the backend's own lock handling"
+        );
+    }
+    probe
+}
+
+fn probe_iptables_restore_wait() -> bool {
+    let Ok(mut child) = wait_probe_command().spawn() else {
+        return false;
+    };
+    if let Some(stdin) = child.stdin.as_mut() {
+        if stdin.write_all(b"*filter\nCOMMIT\n").is_err() {
             return false;
-        };
-        // --help exits non-zero on some builds, so inspect the text, not status.
-        let help = String::from_utf8_lossy(&output.stdout);
-        let help_err = String::from_utf8_lossy(&output.stderr);
-        let supported = help.contains("--wait") || help_err.contains("--wait");
-        if !supported {
-            warn!(
-                "iptables-restore does not support --wait; concurrent network setup may fail on the xtables lock"
-            );
         }
-        supported
-    })
+    }
+    child
+        .wait_with_output()
+        .is_ok_and(|output| output.status.success())
 }
 
 fn apply_restore_script(script: &str) -> Result<()> {
@@ -247,6 +286,27 @@ fn is_missing_iptables_rule_error(error: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The probe has to ask `iptables-restore` to wait, not ask it what it can
+    /// do. `iptables-restore v1.8.10 (nf_tables)` — the binary on the shipped
+    /// runtime image — accepts `--wait` and omits it from `--help`, so a
+    /// help-text probe answers "unsupported" on every node and the flag is
+    /// never passed.
+    /// The decision must be the probe's answer, never the help text. On the
+    /// nf_tables backend `iptables-restore --help` prints no `--wait` even
+    /// though the flag works, so a help-reading implementation reports
+    /// "unsupported" on every modern host and silently drops the lock wait.
+    #[test]
+    fn wait_support_follows_the_probe_and_never_the_help_text() {
+        assert!(
+            wait_supported(true),
+            "a probe that succeeded must be believed"
+        );
+        assert!(
+            !wait_supported(false),
+            "a probe that failed must be believed"
+        );
+    }
 
     #[test]
     fn build_restore_script_renders_commands_in_order() {

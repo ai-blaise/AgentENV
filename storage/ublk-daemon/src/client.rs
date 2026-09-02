@@ -180,6 +180,16 @@ impl UblkDaemonClient {
         // shutdown.
         cmd.process_group(0);
 
+        // Deliberately no kill_on_drop: tokio only clears that flag once the
+        // watchdog's wait() returns, i.e. after the daemon is already dead, so
+        // it arms SIGKILL for the daemon's whole life. Dropping the runtime at
+        // the end of main would then kill it mid-teardown -- shutdown() returns
+        // as soon as the daemon acknowledges, before stop_all_devices() has
+        // quiesced and removed each device -- stranding ublk devices with no
+        // queue server behind them. It would also contradict the process group
+        // above and KillMode=process in the unit file. The explicit kills in
+        // wait_for_ready already cover every reachable error arm.
+
         if let Some(path) = config.app_config {
             cmd.arg("--config").arg(path);
         }
@@ -293,7 +303,15 @@ impl UblkDaemonClient {
 
         match ready {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
+            // The caller drops the handle on error, which does not stop the
+            // process: without this the daemon would keep running detached
+            // with CAP_SYS_ADMIN, owning the socket path, for the rest of the
+            // degraded server's life. On the EOF sub-path the child has
+            // already been waited, so the failure here is expected.
+            Ok(Err(e)) => {
+                let _ = child.kill().await;
+                Err(e)
+            }
             Err(_) => {
                 let _ = child.kill().await;
                 bail!("ublk daemon did not become ready within {READY_TIMEOUT:?}");
@@ -329,6 +347,21 @@ impl UblkDaemonClient {
     /// The socket path this client connects to.
     pub fn socket_path(&self) -> &Path {
         &self.inner.socket_path
+    }
+
+    /// Whether the daemon process has exited.
+    ///
+    /// Once true it stays true: there is no respawn path, and the kernel drops
+    /// the ublk devices whose queue servers died, so nothing the client can do
+    /// brings them back. Callers use this to stop advertising block storage
+    /// rather than to decide whether to retry.
+    pub fn is_dead(&self) -> bool {
+        self.inner.daemon_dead.load(Ordering::Acquire)
+    }
+
+    /// How the daemon died, once it has.
+    pub fn death_reason(&self) -> Option<String> {
+        self.inner.death_reason.lock().unwrap().clone()
     }
 
     /// Create a raw overlaybd-backed ublk device.
@@ -654,6 +687,36 @@ impl UblkDaemonClient {
 mod tests {
     use super::*;
 
+    /// A daemon that fails startup must not be left running: it holds
+    /// CAP_SYS_ADMIN and owns the socket path for the rest of the degraded
+    /// server's life.
+    #[tokio::test]
+    async fn stdout_read_failure_kills_the_spawned_daemon() {
+        let mut cmd = tokio::process::Command::new("/bin/sh");
+        // Non-UTF-8 ahead of the readiness line fails read_line, which is the
+        // arm that used to return without killing the child.
+        cmd.arg("-c")
+            .arg("printf '\\377\\376garbage\\n'; echo ready; sleep 300")
+            .stdout(std::process::Stdio::piped());
+        let mut child = cmd.spawn().expect("spawn stand-in daemon");
+        let stdout = child.stdout.take().expect("piped stdout");
+
+        let err = UblkDaemonClient::wait_for_ready(stdout, &mut child)
+            .await
+            .expect_err("invalid stdout should fail readiness");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("read ublk daemon stdout"),
+            "expected the stdout read error, got: {msg}"
+        );
+
+        match child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("daemon left running after a failed readiness handshake"),
+            Err(err) => panic!("could not inspect the spawned daemon: {err}"),
+        }
+    }
+
     #[tokio::test]
     async fn daemon_dead_fails_immediately() {
         let client = UblkDaemonClient::new_for_test(
@@ -676,6 +739,19 @@ mod tests {
 
         let err = client.restack_snapshot(0, Path::new("/out")).await;
         assert!(err.is_err());
+    }
+
+    /// A dead daemon must report itself dead so callers stop advertising
+    /// block storage that no longer exists.
+    #[test]
+    fn liveness_is_reported_from_the_death_flag() {
+        let live = UblkDaemonClient::new_for_test(PathBuf::from("/tmp/live.sock"), false);
+        assert!(!live.is_dead());
+        assert_eq!(live.death_reason(), None);
+
+        let dead = UblkDaemonClient::new_for_test(PathBuf::from("/tmp/dead.sock"), true);
+        assert!(dead.is_dead());
+        assert!(dead.death_reason().is_some());
     }
 
     #[test]

@@ -194,6 +194,45 @@ impl UVMUblkQueue {
     }
 }
 
+/// Waits for a queue's slot tasks to finish, giving up as soon as the ring's
+/// completion reaper stops.
+///
+/// The reaper is the only thing that drains the completion queue, so if it
+/// exits first every pending `RingFuture` is left without a waker: draining
+/// would park the queue thread forever, silently wedging all guest block I/O
+/// on this queue instead of failing the device. Reporting the error lets the
+/// caller's oneshot carry it to `wait_for_bg_tasks` and device teardown.
+pub(crate) async fn drain_slot_tasks(
+    join_set: &mut tokio::task::JoinSet<Result<()>>,
+    completion_task: tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    let drain = async {
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok(Ok(_)) => {}
+                Ok(Err(err)) => {
+                    tracing::info!(err = format_args!("{err:#}"), "queue slot task finished");
+                }
+                Err(err) => {
+                    tracing::error!(?err, "join slot_task failed");
+                }
+            }
+        }
+    };
+    tokio::pin!(drain);
+
+    tokio::select! {
+        _ = &mut drain => Ok(()),
+        reaped = completion_task => match reaped {
+            Ok(Ok(())) => bail!("io uring completion reaper stopped while the queue was live"),
+            Ok(Err(err)) => Err(err).context("io uring completion reaper failed"),
+            Err(err) => Err(anyhow!(
+                "io uring completion reaper task did not finish: {err}"
+            )),
+        },
+    }
+}
+
 impl<T: UVMUblkTarget> UVMUblkDev<T> {
     fn spawn_queue_worker_thread(
         inner: Arc<UVMUblkDevInner>,
@@ -241,27 +280,18 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
             tgt.init(qid, &queue.ring)
                 .await
                 .context("init target for uvm ublk queue")?;
-            let queue = Rc::new(queue);
+            let shared = Rc::new(queue);
             let mut join_set = tokio::task::JoinSet::new();
-            for tag in 0..queue.iodepth() as u16 {
+            for tag in 0..shared.iodepth() as u16 {
                 let tgt = tgt.clone();
-                let queue = queue.clone();
+                let queue = shared.clone();
                 join_set.spawn_local(queue.slot_task(tag, tgt));
             }
             // we only wait for the slot_task, after that, we just drop the runtime and
             // background task, to close the UBLK_QUEUE_URING.
-            while let Some(res) = join_set.join_next().await {
-                match res {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(err)) => {
-                        tracing::info!(err = format_args!("{err:#}"), "queue slot task finished");
-                    }
-                    Err(err) => {
-                        tracing::error!(?err, "join slot_task failed");
-                    }
-                }
-            }
-            Ok(())
+            let mut queue =
+                Rc::try_unwrap(shared).map_err(|_| anyhow!("queue still shared when draining"))?;
+            queue.drain_with_reaper(&mut join_set).await
         })
     }
 
@@ -438,4 +468,84 @@ pub trait UVMUblkTarget: Send + Sync + 'static {
         extra: Option<&mut IOBuffer>,
         io_ring: &AsyncIoRing,
     ) -> i32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs `body` the way a queue thread does: a current-thread runtime with
+    /// a `LocalSet`, so `spawn_local` and `JoinSet::spawn_local` behave as they
+    /// do in `queue_work`.
+    fn on_local_set<F>(body: F) -> Result<()>
+    where
+        F: std::future::Future<Output = Result<()>>,
+    {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&rt, body)
+    }
+
+    /// A dead completion reaper leaves every slot task awaiting a `RingFuture`
+    /// that can never be woken. The queue must fail instead of parking.
+    #[test]
+    fn reaper_failure_ends_the_drain_instead_of_wedging_the_queue() {
+        let outcome = on_local_set(async {
+            let mut join_set = tokio::task::JoinSet::new();
+            for _ in 0..4 {
+                // Stands in for a slot task blocked on an unreaped completion.
+                join_set.spawn_local(async {
+                    std::future::pending::<()>().await;
+                    Ok(())
+                });
+            }
+            let completion_task = tokio::task::spawn_local(async {
+                Err(anyhow!("dup ring fd: Too many open files"))
+            });
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                drain_slot_tasks(&mut join_set, completion_task),
+            )
+            .await
+            .expect("a dead completion reaper must not leave the queue draining forever")
+        });
+
+        let err = outcome.expect_err("reaper failure must fail the queue");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("completion reaper"),
+            "error should name the completion reaper: {msg}"
+        );
+        assert!(
+            msg.contains("Too many open files"),
+            "error should carry the reaper's cause: {msg}"
+        );
+    }
+
+    /// The normal path: slot tasks finish, the still-running reaper is left to
+    /// be cancelled with the `LocalSet`.
+    #[test]
+    fn drain_returns_when_slot_tasks_finish_under_a_live_reaper() {
+        let outcome = on_local_set(async {
+            let mut join_set = tokio::task::JoinSet::new();
+            join_set.spawn_local(async { Ok(()) });
+            join_set.spawn_local(async { Err(anyhow!("slot 1 stopped")) });
+            let completion_task = tokio::task::spawn_local(async {
+                std::future::pending::<()>().await;
+                Ok(())
+            });
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                drain_slot_tasks(&mut join_set, completion_task),
+            )
+            .await
+            .expect("drain should return once every slot task has finished")
+        });
+
+        outcome.expect("finished slot tasks are a clean queue exit");
+    }
 }

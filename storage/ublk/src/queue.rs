@@ -64,6 +64,10 @@ pub struct UVMUblkQueue {
     pub ring: AsyncIoRing,
     io_desc: UblkQueueIoDesc,
     cdev_idx: u32,
+    /// Reaper task for `ring`'s completion queue. Nothing else drains the CQ,
+    /// so once it stops every in-flight `RingFuture` is unwakeable and the
+    /// queue thread parks for good. The owner must watch it, never detach it.
+    completion_task: Option<tokio::task::JoinHandle<Result<()>>>,
 }
 
 /// The io descriptor array for a queue
@@ -182,12 +186,12 @@ impl UVMUblkQueue {
             .cqe_entries(depth * 2)
             .build()
             .with_context(|| format!("create io uring for queue {queue_id}"))?;
-        tokio::task::spawn_local({
+        let completion_task = tokio::task::spawn_local({
             let ring = ring.clone();
             async move {
-                if let Err(err) = ring.handle_completion().await {
-                    panic!("UVMUblkQueue uring handle_completion has exited unexpectly: {err:?}",);
-                }
+                ring.handle_completion()
+                    .await
+                    .with_context(|| format!("reap completions for queue {queue_id}"))
             }
         });
         if UBLK_QUEUE_URING
@@ -208,7 +212,28 @@ impl UVMUblkQueue {
             ring,
             io_desc,
             cdev_idx,
+            completion_task: Some(completion_task),
         })
+    }
+
+    /// Drains `join_set` while watching the completion reaper, and returns
+    /// whichever finishes first.
+    ///
+    /// The reaper is not handed out. It is the only thing draining the
+    /// completion queue, so if it dies first every pending `RingFuture` is
+    /// left without a waker and the drain parks forever, wedging all guest
+    /// block I/O on this queue instead of failing the device. Owning the
+    /// select here means a caller cannot hold the handle and forget to watch
+    /// it -- the shape that defect took -- because there is no handle to hold.
+    pub async fn drain_with_reaper(
+        &mut self,
+        join_set: &mut tokio::task::JoinSet<Result<()>>,
+    ) -> Result<()> {
+        let completion_task = self
+            .completion_task
+            .take()
+            .context("uvm ublk queue has no completion reaper")?;
+        crate::dev::drain_slot_tasks(join_set, completion_task).await
     }
 
     pub fn is_zero_copy(&self) -> bool {

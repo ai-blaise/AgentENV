@@ -210,6 +210,28 @@ auto_resume_min_sandbox_timeout_secs = 300
 # Durable paused-sandbox metadata restored after a server restart.
 # persisted_sandbox_store_path = "$AENV_HOME/persisted-sandboxes"
 
+[orchestrator.admission]
+# Node-local admission control. Off, every create is admitted whatever the node
+# is already carrying; the gate exists so a burst is refused at the door with a
+# Retry-After instead of failing deep in the create path.
+enabled = false
+# Every limit below is unset by default. A limit that is set applies to the sum
+# of what the store holds and what in-flight creates have reserved, so
+# concurrent admissions cannot both see pre-reservation capacity.
+# max_sandbox_count = 0
+# max_sandbox_starting_count = 0
+# max_allocated_cpu = 0
+# max_allocated_memory_bytes = 0
+# max_sandbox_count_including_paused = 0
+# Refuse a create when fewer than this many network slots would remain.
+# min_free_network_slots = 0
+# Retry-After seconds returned with a rejection.
+retry_after_secs = 2
+# How long one node-metrics reading may be reused across admission decisions.
+# Collecting metrics walks every sandbox, so re-reading per decision would make
+# the gate the bottleneck under the burst it exists to survive.
+snapshot_max_age_ms = 200
+
 [snapshot]
 # Node-local cache for snapshot artifacts.
 # local_cache_path = "$AENV_HOME/snapshot-local-cache"
@@ -318,11 +340,22 @@ low_watermark = 2
 high_watermark = 64
 
 [pool.network]
+# Enable the warm network-slot pool at all. ANDed with maintenance_enabled:
+# either one off means no background refill.
+enabled = true
 # Refill the network-slot pool in the background.
 maintenance_enabled = true
+# Populate the slot pool during server startup.
+startup_prewarm = true
+# Slots built concurrently per refill batch. Slot creation is dominated by
+# RTNL-serialized netlink work, so this does not scale linearly.
+fill_concurrency = 4
 
 [pool.block]
-# Enable the reusable OverlayBD ublk-device pool.
+# Enable the reusable OverlayBD ublk-device pool. This is its only switch:
+# maintenance_enabled and fill_concurrency do not apply, because the ublk
+# daemon refills asynchronously from request paths rather than from a
+# background worker — a reusable device's shape is image/size dependent.
 enabled = true
 # Omit to prewarm only when the kernel supports UBLK_F_UPDATE_SIZE. Set an
 # explicit boolean to override capability-based selection.
@@ -384,6 +417,17 @@ enabled = true
 enabled = false
 # Scheduler report interval in seconds.
 interval_secs = 5
+
+[observability.scheduler_report.kill_switch]
+# What the node does once it has lost contact with the scheduler for longer
+# than after_secs: "disabled" or "block_creates". Pausing running sandboxes is
+# deliberately not offered — with one scheduler replica a restart looks like a
+# partition, so that action would pause the fleet on every deploy.
+action = "disabled"
+# Seconds without a successful heartbeat before the action applies. Not an off
+# switch: zero alongside an action is refused at startup. Turn the switch off
+# with action = "disabled".
+after_secs = 60
 
 [node_identity]
 # Stable node identifier returned by node APIs and scheduler heartbeats.

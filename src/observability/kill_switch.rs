@@ -123,9 +123,11 @@ impl KillSwitch {
     }
 
     fn tripped(&self) -> bool {
-        if self.threshold.is_zero() {
-            return false;
-        }
+        // No zero-is-off sentinel. A zero threshold used to disable the switch
+        // regardless of the action, which turned the documented enable recipe —
+        // name an action, leave the undocumented window alone — into a switch
+        // that armed nothing. Config validation refuses that combination now,
+        // and disabling is only `action = "disabled"`.
         match self.since_last_success() {
             Some(elapsed) => elapsed > self.threshold,
             // Never connected: see `ever_succeeded`.
@@ -188,11 +190,37 @@ mod tests {
         );
     }
 
+    /// A zero window is not a second way to disable the switch. Treating it as
+    /// one is what made the documented enable recipe — set `action`, leave
+    /// `after_secs` at its default — produce a switch that never fired.
     #[test]
-    fn zero_threshold_never_trips() {
+    fn a_zero_window_is_not_an_off_switch() {
         let switch = KillSwitch::new(KillSwitchAction::BlockCreates, Duration::ZERO);
         switch.record_success();
         std::thread::sleep(Duration::from_millis(5));
-        assert!(!switch.blocks_creates());
+        assert!(
+            switch.blocks_creates(),
+            "an action with a zero window must fire, not silently disable"
+        );
+    }
+
+    /// The kill switch's own default window, checked against the config
+    /// default that feeds it. An operator who names an action and touches
+    /// nothing else must get a switch that fires.
+    #[test]
+    fn the_configured_default_window_arms_the_switch() {
+        let cfg = crate::cfg::ObservabilitySchedulerReportConfig::default().kill_switch;
+        assert_eq!(cfg.action, "disabled");
+        assert!(
+            cfg.after_secs > 0,
+            "a default window of zero would leave `action = \"block_creates\"` inert"
+        );
+
+        let switch = KillSwitch::new(
+            KillSwitchAction::BlockCreates,
+            Duration::from_secs(cfg.after_secs),
+        );
+        switch.record_success();
+        assert!(!switch.blocks_creates(), "a fresh heartbeat must not trip");
     }
 }

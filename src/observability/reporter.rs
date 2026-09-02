@@ -20,6 +20,14 @@ use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
 const MAX_REPORT_BACKOFF: Duration = Duration::from_secs(60);
 const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The scheduler's wire text for a heartbeat naming a node it does not know.
+///
+/// Mirrors `NodeNotInRegistryMessage` in
+/// `services/scheduler/internal/node_registry.go`. Kept as a named constant on
+/// this side too so the two halves of the contract are greppable from each
+/// other; both sides pin it in a test.
+const NODE_NOT_IN_REGISTRY_MESSAGE: &str = "node is not in scheduler node list";
+
 /// Returned by [`ObservabilityReporter::send_heartbeat`] when the scheduler
 /// rejects the heartbeat because this node's ID is not in its configured node
 /// list. Detected in [`ObservabilityReporter::record_heartbeat_failure`] to
@@ -169,12 +177,25 @@ impl ObservabilityReporter {
                         let Some(events) = events else {
                             return;
                         };
-                        if let Err(err) = Self::send_sandbox_events(
+                        let batch_size = events.len() as u64;
+                        let outcome = Self::send_sandbox_events(
                             &event_config,
                             &event_service,
                             &event_scheduler_channel,
                             events,
-                        ).await {
+                        ).await;
+                        // Counted once the RPC has resolved rather than when
+                        // the batch was drained, because the heartbeat that
+                        // reports the count is a separate RPC on a separate
+                        // task with no ordering against this one. Counting at
+                        // drain time lets a heartbeat overtake a batch still in
+                        // flight, and the scheduler reports the whole batch as
+                        // lost and then reads its arrival as a node restart.
+                        //
+                        // On both outcomes: a failed RPC is real loss, and the
+                        // scheduler is the only place it can be accounted.
+                        emitted_events.fetch_add(batch_size, Ordering::Relaxed);
+                        if let Err(err) = outcome {
                             warn!(error = %err, "observability sandbox event batch report failed");
                         }
                     }
@@ -283,15 +304,7 @@ impl ObservabilityReporter {
         let response = SchedulerClient::new(scheduler_channel.clone())
             .heartbeat(request)
             .await
-            .map_err(|s| {
-                if s.code() == tonic::Code::InvalidArgument
-                    && s.message().contains("node is not in scheduler node list")
-                {
-                    anyhow::Error::new(HeartbeatNodeNotConfigured)
-                } else {
-                    anyhow::Error::from(s).context("heartbeat rpc failed")
-                }
-            })?
+            .map_err(Self::classify_heartbeat_status)?
             .into_inner();
 
         *cpu_config_json = None;
@@ -312,6 +325,26 @@ impl ObservabilityReporter {
         );
 
         Ok(())
+    }
+
+    /// Turns a rejected heartbeat into the error the failure log reads.
+    ///
+    /// The scheduler has no machine-readable discriminator for "this node id is
+    /// not in my node list", so the diagnosis rides on the wire text. That text
+    /// is a cross-language contract, not a log line: the producer is the
+    /// exported `NodeNotInRegistryMessage` in
+    /// `services/scheduler/internal/node_registry.go`, and
+    /// `TestUnknownNodeRejectionCarriesTheWireMessage` pins it there against
+    /// this matcher. Matching on the code alone is not an option — the same RPC
+    /// returns `InvalidArgument` for a missing node id or service instance id.
+    fn classify_heartbeat_status(status: tonic::Status) -> anyhow::Error {
+        if status.code() == tonic::Code::InvalidArgument
+            && status.message().contains(NODE_NOT_IN_REGISTRY_MESSAGE)
+        {
+            anyhow::Error::new(HeartbeatNodeNotConfigured)
+        } else {
+            anyhow::Error::from(status).context("heartbeat rpc failed")
+        }
     }
 
     /// Logs a heartbeat that did not land, and forgets what the scheduler
@@ -354,14 +387,15 @@ impl ObservabilityReporter {
         }
     }
 
-    /// Drains a batch of lifecycle events, counting every event the node
-    /// produced — including ones dropped before they could be batched.
+    /// Drains a batch of lifecycle events, counting the ones dropped before
+    /// they could be batched.
     ///
     /// `emitted` is what the heartbeat reports so the scheduler can compare it
-    /// against what arrived. It counts production rather than successful
-    /// delivery, because both ways an event goes missing — a lagged receiver
-    /// here, a failed RPC later — leave the scheduler's view of this node
-    /// behind reality, and only the node can see the first.
+    /// against what arrived, and events lost to a lagged receiver never reach
+    /// an RPC at all — only the node can see them, so they are counted here.
+    /// The events that do get batched are counted by the caller once their RPC
+    /// has resolved; counting them here would let a heartbeat outrun the batch
+    /// it describes.
     async fn recv_sandbox_event_batch(
         rx: &mut broadcast::Receiver<SandboxLifecycleEvent>,
         emitted: &AtomicU64,
@@ -397,7 +431,6 @@ impl ObservabilityReporter {
             }
         }
 
-        emitted.fetch_add(events.len() as u64, Ordering::Relaxed);
         Some(events)
     }
 
@@ -412,7 +445,12 @@ impl ObservabilityReporter {
         }
 
         let event_count = events.len();
-        let mut request = Request::new(Self::build_sandbox_event_request(service, events));
+        let mut request = Request::new(Self::build_sandbox_event_request(
+            service.node_id(),
+            service.cluster_id(),
+            service.service_instance_id(),
+            events,
+        ));
         request.set_timeout(GRPC_CALL_TIMEOUT);
         SchedulerClient::new(scheduler_channel.clone())
             .report_sandbox_event(request)
@@ -500,14 +538,20 @@ impl ObservabilityReporter {
         }
     }
 
+    /// Takes the identity fields rather than the service that holds them, so
+    /// the wire mapping — including the MiB-to-bytes conversions the scheduler
+    /// accounts capacity with — is exercisable without standing up an
+    /// orchestrator.
     fn build_sandbox_event_request(
-        service: &ObservabilityService,
+        node_id: &str,
+        cluster_id: uuid::Uuid,
+        service_instance_id: &str,
         events: Vec<SandboxLifecycleEvent>,
     ) -> scheduler::ReportSandboxEventRequest {
         scheduler::ReportSandboxEventRequest {
-            node_id: service.node_id().to_string(),
-            cluster_id: service.cluster_id().to_string(),
-            service_instance_id: service.service_instance_id().to_string(),
+            node_id: node_id.to_string(),
+            cluster_id: cluster_id.to_string(),
+            service_instance_id: service_instance_id.to_string(),
             events: events
                 .into_iter()
                 .map(|event| scheduler::SandboxEvent {
@@ -580,6 +624,367 @@ impl ReporterConfig {
 mod tests {
     use super::*;
     use crate::cfg::{ClusterConfig, ObservabilitySchedulerReportConfig};
+    use crate::observability::{
+        DiskMetric, MachineInfo, NodeMetricsSnapshot, NodeSnapshot, RosterReport,
+    };
+    use crate::types::{SandboxId, SandboxResources};
+
+    /// A snapshot whose every field is distinct, so a builder that drops or
+    /// swaps one is visible rather than absorbed by a shared default.
+    fn make_snapshot(draining: bool) -> NodeSnapshot {
+        NodeSnapshot {
+            version: "1.2.3".to_string(),
+            commit: "deadbeef".to_string(),
+            node_id: "node-a".to_string(),
+            service_instance_id: "instance-7".to_string(),
+            cluster_id: uuid::Uuid::from_u128(0x2a),
+            machine_info: MachineInfo {
+                cpu_family: "6".to_string(),
+                cpu_model: "143".to_string(),
+                cpu_model_name: "Xeon".to_string(),
+                cpu_architecture: "x86_64".to_string(),
+                cpu_config_json: Some("{\"cpuid\":1}".to_string()),
+                sandbox_backend: "firecracker".to_string(),
+            },
+            sandbox_count: 11,
+            sandbox_ids: Vec::new(),
+            metrics: NodeMetricsSnapshot {
+                allocated_cpu: 12,
+                allocated_memory_bytes: 13,
+                cpu_percent: 14,
+                cpu_count: 15,
+                memory_used_bytes: 16,
+                memory_total_bytes: 17,
+                disks: vec![DiskMetric {
+                    mount_point: "/".to_string(),
+                    device: "/dev/vda1".to_string(),
+                    filesystem_type: "ext4".to_string(),
+                    used_bytes: 18,
+                    total_bytes: 19,
+                }],
+                paused_allocated_cpu: 20,
+                paused_allocated_memory_bytes: 21,
+            },
+            create_successes: 22,
+            create_fails: 23,
+            sandbox_starting_count: 24,
+            paused_sandbox_count: 25,
+            roster_complete: true,
+            draining,
+        }
+    }
+
+    fn full_roster(ids: &[&str]) -> RosterReport {
+        RosterReport {
+            digest: "digest-1".to_string(),
+            sandbox_ids: Some(ids.iter().map(|id| (*id).to_string()).collect()),
+            roster_complete: true,
+        }
+    }
+
+    fn elided_roster() -> RosterReport {
+        RosterReport {
+            digest: "digest-1".to_string(),
+            sandbox_ids: None,
+            roster_complete: false,
+        }
+    }
+
+    fn heartbeat(snapshot: NodeSnapshot, roster: RosterReport) -> scheduler::HeartbeatRequest {
+        ObservabilityReporter::build_heartbeat_request(
+            snapshot,
+            1_700_000_000_123,
+            Some(&P2pEndpoint {
+                backend: "iroh".to_string(),
+                address: "node-key".to_string(),
+            }),
+            Duration::from_millis(4500),
+            roster,
+            77,
+        )
+    }
+
+    /// Every field the scheduler reads off a heartbeat, pinned in one place.
+    /// The reporter is the only producer of this message and no Rust test
+    /// reaches the RPC, so a field dropped or crossed here is otherwise
+    /// invisible until a fleet misreports itself.
+    #[test]
+    fn a_heartbeat_carries_the_whole_node_snapshot() {
+        let req = heartbeat(make_snapshot(false), full_roster(&["sbx-1", "sbx-2"]));
+
+        assert_eq!(req.node_id, "node-a");
+        assert_eq!(req.cluster_id, uuid::Uuid::from_u128(0x2a).to_string());
+        assert_eq!(req.service_instance_id, "instance-7");
+        assert_eq!(req.version, "1.2.3");
+        assert_eq!(req.commit, "deadbeef");
+        assert_eq!(req.emitted_event_count, 77);
+        assert_eq!(req.heartbeat_interval_ms, 4500);
+
+        let machine = req.machine_info.expect("machine info");
+        assert_eq!(machine.cpu_family, "6");
+        assert_eq!(machine.cpu_model, "143");
+        assert_eq!(machine.cpu_model_name, "Xeon");
+        assert_eq!(machine.cpu_architecture, "x86_64");
+        assert_eq!(machine.cpu_config_json, "{\"cpuid\":1}");
+        assert_eq!(machine.sandbox_backend, "firecracker");
+
+        let snapshot = req.snapshot.expect("node snapshot");
+        assert_eq!(snapshot.allocated_cpu, 12);
+        assert_eq!(snapshot.allocated_memory_bytes, 13);
+        assert_eq!(snapshot.cpu_percent, 14);
+        assert_eq!(snapshot.cpu_count, 15);
+        assert_eq!(snapshot.memory_used_bytes, 16);
+        assert_eq!(snapshot.memory_total_bytes, 17);
+        assert_eq!(snapshot.sandbox_count, 11);
+        assert_eq!(snapshot.sandbox_starting_count, 24);
+        assert_eq!(snapshot.create_successes, 22);
+        assert_eq!(snapshot.create_fails, 23);
+        assert_eq!(snapshot.reported_at_unix_ms, 1_700_000_000_123);
+        assert_eq!(snapshot.paused_sandbox_count, 25);
+        assert_eq!(snapshot.paused_allocated_cpu, 20);
+        assert_eq!(snapshot.paused_allocated_memory_bytes, 21);
+
+        let disk = snapshot.disks.first().expect("one disk");
+        assert_eq!(disk.mount_point, "/");
+        assert_eq!(disk.device, "/dev/vda1");
+        assert_eq!(disk.filesystem_type, "ext4");
+        assert_eq!(disk.used_bytes, 18);
+        assert_eq!(disk.total_bytes, 19);
+
+        let endpoint = req.p2p_endpoint.expect("p2p endpoint");
+        assert_eq!(endpoint.backend, "iroh");
+        assert_eq!(endpoint.address, "node-key");
+    }
+
+    /// A node with no cpu template dump must send an empty string, not fail to
+    /// build the message.
+    #[test]
+    fn an_absent_cpu_config_becomes_an_empty_string() {
+        let mut snapshot = make_snapshot(false);
+        snapshot.machine_info.cpu_config_json = None;
+        let req = heartbeat(snapshot, full_roster(&[]));
+        assert_eq!(req.machine_info.expect("machine info").cpu_config_json, "");
+    }
+
+    /// The drain contract's only producer. `filter.go` drops LINGERING nodes
+    /// from placement candidates, so a draining node that reports Ready keeps
+    /// being handed sandboxes it is shedding. Asserted through the enum rather
+    /// than the numeric values so renumbering the proto cannot quietly satisfy
+    /// it.
+    #[test]
+    fn a_draining_node_heartbeats_lingering() {
+        for (draining, want) in [
+            (true, scheduler::NodeStatus::Lingering),
+            (false, scheduler::NodeStatus::Ready),
+        ] {
+            let req = heartbeat(make_snapshot(draining), full_roster(&[]));
+            assert_eq!(
+                req.snapshot.expect("node snapshot").status,
+                i32::from(want),
+                "draining={draining} must heartbeat {want:?}"
+            );
+        }
+    }
+
+    /// The roster fields decide whether the scheduler reaps this node's
+    /// bindings, so the report has to reach the wire exactly as
+    /// `RosterDigestState` decided it.
+    #[test]
+    fn the_roster_report_reaches_the_wire_intact() {
+        let full = heartbeat(make_snapshot(false), full_roster(&["sbx-1", "sbx-2"]));
+        assert!(full.roster_full);
+        assert_eq!(full.sandbox_ids, vec!["sbx-1", "sbx-2"]);
+        assert_eq!(full.roster_digest, "digest-1");
+        assert!(full.roster_complete);
+
+        let elided = heartbeat(make_snapshot(false), elided_roster());
+        assert!(!elided.roster_full);
+        assert!(
+            elided.sandbox_ids.is_empty(),
+            "an elided roster carries no ids"
+        );
+        assert_eq!(elided.roster_digest, "digest-1");
+        assert!(
+            !elided.roster_complete,
+            "an elided heartbeat must not claim authority over ids it did not send"
+        );
+    }
+
+    /// The scheduler accounts node capacity in bytes from these fields. The
+    /// MiB values are chosen so a `+` or `/` in place of either `* 1024`
+    /// produces a different number.
+    #[test]
+    fn a_sandbox_event_reports_resources_in_bytes() {
+        let cluster_id = uuid::Uuid::from_u128(0x2a);
+        let sandbox_id = SandboxId::new();
+        let req = ObservabilityReporter::build_sandbox_event_request(
+            "node-a",
+            cluster_id,
+            "instance-7",
+            vec![SandboxLifecycleEvent {
+                event_type: SandboxLifecycleEventType::Create,
+                sandbox_id,
+                resources: SandboxResources {
+                    cpu_count: 3,
+                    memory_mib: 3,
+                    disk_size_mib: 5,
+                },
+            }],
+        );
+
+        assert_eq!(req.node_id, "node-a");
+        assert_eq!(req.cluster_id, cluster_id.to_string());
+        assert_eq!(req.service_instance_id, "instance-7");
+
+        let event = req.events.first().expect("one event");
+        assert_eq!(event.sandbox_id, sandbox_id.to_string());
+        assert_eq!(
+            event.event_type,
+            i32::from(scheduler::SandboxEventType::Create)
+        );
+        assert_eq!(event.requested_cpu, 3);
+        assert_eq!(event.requested_memory_bytes, 3 * 1024 * 1024);
+        assert_eq!(event.requested_disk_bytes, 5 * 1024 * 1024);
+    }
+
+    /// Every arm, because a wrong one is a lifecycle the scheduler accounts
+    /// under the wrong verb and nothing else notices.
+    #[test]
+    fn every_lifecycle_event_maps_to_its_own_wire_type() {
+        for (event_type, want) in [
+            (
+                SandboxLifecycleEventType::Create,
+                scheduler::SandboxEventType::Create,
+            ),
+            (
+                SandboxLifecycleEventType::Delete,
+                scheduler::SandboxEventType::Delete,
+            ),
+            (
+                SandboxLifecycleEventType::Pause,
+                scheduler::SandboxEventType::Pause,
+            ),
+            (
+                SandboxLifecycleEventType::Resume,
+                scheduler::SandboxEventType::Resume,
+            ),
+            (
+                SandboxLifecycleEventType::Fork,
+                scheduler::SandboxEventType::Fork,
+            ),
+        ] {
+            assert_eq!(
+                ObservabilityReporter::map_sandbox_event_type(event_type),
+                want,
+                "{event_type:?} must map to {want:?}"
+            );
+        }
+    }
+
+    fn lifecycle_event() -> SandboxLifecycleEvent {
+        SandboxLifecycleEvent {
+            event_type: SandboxLifecycleEventType::Create,
+            sandbox_id: SandboxId::new(),
+            resources: SandboxResources::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_drains_everything_already_queued() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let emitted = AtomicU64::new(0);
+        for _ in 0..3 {
+            tx.send(lifecycle_event()).expect("receiver alive");
+        }
+
+        let batch = ObservabilityReporter::recv_sandbox_event_batch(&mut rx, &emitted)
+            .await
+            .expect("a batch");
+        assert_eq!(batch.len(), 3, "one wake must take the whole backlog");
+        assert_eq!(
+            emitted.load(Ordering::Relaxed),
+            0,
+            "delivered events are counted once their RPC resolves, not at drain time"
+        );
+    }
+
+    /// Events dropped by a lagged receiver never reach an RPC, so the drain is
+    /// the only place they can be accounted at all.
+    #[tokio::test]
+    async fn lagged_events_are_counted_where_they_are_lost() {
+        let (tx, mut rx) = broadcast::channel(2);
+        let emitted = AtomicU64::new(0);
+        for _ in 0..5 {
+            tx.send(lifecycle_event()).expect("receiver alive");
+        }
+
+        let batch = ObservabilityReporter::recv_sandbox_event_batch(&mut rx, &emitted)
+            .await
+            .expect("a batch");
+        assert_eq!(batch.len(), 2, "only the two still buffered survive");
+        assert_eq!(
+            emitted.load(Ordering::Relaxed),
+            3,
+            "the three overwritten events are loss the scheduler cannot see"
+        );
+    }
+
+    /// A closed channel ends the event task. Returning an empty batch instead
+    /// would spin it.
+    #[tokio::test]
+    async fn a_closed_channel_ends_the_batch_stream() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let emitted = AtomicU64::new(0);
+        drop(tx);
+
+        assert!(
+            ObservabilityReporter::recv_sandbox_event_batch(&mut rx, &emitted)
+                .await
+                .is_none()
+        );
+    }
+
+    /// The other half of the contract pinned by
+    /// `TestUnknownNodeRejectionCarriesTheWireMessage` in
+    /// `services/scheduler/internal/heartbeat_ordering_test.go`. If either side
+    /// is reworded alone, both suites stay green and every misconfigured node
+    /// loses its `AENV_NODE_ID` remediation hint.
+    #[test]
+    fn an_unknown_node_rejection_is_diagnosed_from_the_wire_message() {
+        // The literal rather than the constant, so this pins the contract
+        // instead of comparing the matcher against itself. The Go half asserts
+        // the same literal against its own exported constant.
+        const WIRE: &str = "node is not in scheduler node list";
+        assert_eq!(
+            NODE_NOT_IN_REGISTRY_MESSAGE, WIRE,
+            "reword this and services/scheduler/internal/node_registry.go together, or neither"
+        );
+
+        let err =
+            ObservabilityReporter::classify_heartbeat_status(tonic::Status::invalid_argument(WIRE));
+        assert!(
+            err.is::<HeartbeatNodeNotConfigured>(),
+            "the scheduler's rejection must raise the actionable diagnosis"
+        );
+    }
+
+    /// Neither half alone is the diagnosis: the same RPC returns
+    /// `InvalidArgument` for a missing node id, and an unreachable scheduler
+    /// returns other codes.
+    #[test]
+    fn other_rejections_stay_generic() {
+        for status in [
+            tonic::Status::invalid_argument("node_id is required"),
+            tonic::Status::unavailable(NODE_NOT_IN_REGISTRY_MESSAGE),
+        ] {
+            let code = status.code();
+            let err = ObservabilityReporter::classify_heartbeat_status(status);
+            assert!(
+                !err.is::<HeartbeatNodeNotConfigured>(),
+                "{code:?} must not be read as a misconfigured node id"
+            );
+        }
+    }
 
     fn make_cluster_config(endpoint: Option<&str>) -> ClusterConfig {
         ClusterConfig {
