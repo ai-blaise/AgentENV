@@ -36,10 +36,17 @@ impl OverlaybdP2pRuntime {
         }
 
         let overlaybd_config = &config.ublk.overlaybd;
+        // Today the only publishable root is the image cache's commit store,
+        // whose files the cache keeps alive for as long as they are
+        // advertised, so every root is also a commit-store root. Naming the
+        // two separately is what makes adding a third root — an evictable
+        // download cache, say — a copy rather than a dangling reference.
+        let publishable_roots = local_image_services_from_app_config(config)
+            .overlaybd_layers
+            .publishable_roots();
         let mut facade_config = P2pHttpFacadeConfig {
-            allowed_publish_roots: local_image_services_from_app_config(config)
-                .overlaybd_layers
-                .publishable_roots(),
+            commit_store_roots: publishable_roots.clone(),
+            allowed_publish_roots: publishable_roots.clone(),
             ..Default::default()
         };
         facade_config.lookup_timeout =
@@ -52,9 +59,7 @@ impl OverlaybdP2pRuntime {
         // commits were ever advertised.
         set_global_layer_publish_sink(Arc::new(TransportLayerPublishSink::new(
             Arc::clone(&transport),
-            local_image_services_from_app_config(config)
-                .overlaybd_layers
-                .publishable_roots(),
+            publishable_roots,
         )));
 
         match start_http_facade_with_config(transport, facade_config).await {

@@ -3,7 +3,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,22 +21,28 @@ use iroh_blobs::api::proto::ExportRangesItem;
 use iroh_blobs::protocol::{ChunkRanges, ChunkRangesExt, GetRequest};
 use iroh_blobs::store::fs::{options::Options as FsStoreOptions, FsStore};
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
+use iroh_blobs::util::connection_pool::{
+    ConnectionPool, Options as ConnectionPoolOptions, PoolConnectError,
+};
 use iroh_blobs::{BlobFormat, BlobsProtocol, HashAndFormat};
 use tracing::{debug, info, instrument, trace, warn};
 
 use super::catalog::{
-    CatalogProtocol, CatalogRequest, CatalogResponse, PublishedArtifactCatalog, CATALOG_ALPN,
-    MAX_CATALOG_RESPONSE_BYTES,
+    CatalogProtocol, CatalogRequest, CatalogResponse, OwnerRelease, PublishedArtifactCatalog,
+    CATALOG_ALPN, MAX_CATALOG_RESPONSE_BYTES,
 };
 use super::IROH_BACKEND_ID;
 use crate::digest;
 use crate::p2p::config::ResolvedP2pConfig;
 use crate::p2p::discovery::P2pPeerDiscovery;
 use crate::p2p::error::{Error, Result};
+use crate::p2p::metrics::{
+    self as p2p_metrics, LookupConnection, LookupResult, PublishStatus, UnpublishStatus,
+};
 use crate::p2p::transport::P2pTransport;
 use crate::p2p::types::{
     P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProvider, P2pArtifactProviderHint,
-    P2pEndpoint, P2pPeer, P2pPublishMode, P2pPublishRequest, P2pPublishSource,
+    P2pEndpoint, P2pPeer, P2pPublishMode, P2pPublishOwner, P2pPublishRequest, P2pPublishSource,
 };
 use crate::p2p::P2pByteStream;
 
@@ -82,7 +88,21 @@ pub struct IrohBlobsP2pTransport {
     published_catalog: PublishedArtifactCatalog,
     local_endpoint: P2pEndpoint,
     lookup_timeout: Duration,
+    /// Per-peer bound on one catalog lookup, distinct from `lookup_timeout`,
+    /// which bounds a whole multi-peer lookup.
+    catalog_lookup_timeout: Duration,
     fetch_timeout: Duration,
+    /// Pooled catalog connections, or `None` when pooling is turned off.
+    catalog_pool: Option<ConnectionPool>,
+    /// Catalog connections this node has actually dialled.
+    ///
+    /// Incremented from the pool's connect callback, so it counts handshakes
+    /// rather than lookups. That difference is the whole point of pooling, and
+    /// it is not observable any other way: the pool owns connection lifetime
+    /// and exposes no accessor for it.
+    catalog_connections: Arc<AtomicU64>,
+    /// CIDRs a peer endpoint address may name; empty accepts any address.
+    cluster_cidrs: Vec<ipnetwork::IpNetwork>,
     pending_gc: Arc<AtomicBool>,
 }
 
@@ -109,6 +129,7 @@ impl IrohBlobsP2pTransport {
         peer_discovery: Arc<dyn P2pPeerDiscovery>,
         gc_interval: Duration,
     ) -> Result<Self> {
+        let cluster_cidrs = parse_cluster_cidrs(&config.cluster_cidrs)?;
         let store_dir = config.store_dir.join(IROH_BACKEND_ID);
         tokio::fs::create_dir_all(&store_dir)
             .await
@@ -164,8 +185,14 @@ impl IrohBlobsP2pTransport {
             )
             .spawn();
         let downloader = Downloader::new(&store, router.endpoint());
+        let catalog_connections = Arc::new(AtomicU64::new(0));
+        let catalog_pool = build_catalog_pool(
+            router.endpoint().clone(),
+            &config,
+            Arc::clone(&catalog_connections),
+        );
 
-        Self::spawn_gc_arming_task(Arc::clone(&pending_gc), gc_interval);
+        Self::spawn_gc_arming_task(Arc::clone(&pending_gc), gc_interval, store_dir.clone());
         Self::spawn_reannounce_task(
             published_catalog.keys_handle(),
             Arc::clone(&peer_discovery),
@@ -189,7 +216,11 @@ impl IrohBlobsP2pTransport {
             published_catalog,
             local_endpoint,
             lookup_timeout: config.lookup_timeout,
+            catalog_lookup_timeout: config.catalog_lookup_timeout,
             fetch_timeout: config.fetch_timeout,
+            catalog_pool,
+            catalog_connections,
+            cluster_cidrs,
             pending_gc,
         })
     }
@@ -199,18 +230,46 @@ impl IrohBlobsP2pTransport {
         &self,
         peer: &P2pPeer,
         key: &P2pArtifactKey,
-    ) -> Result<Option<P2pArtifactDescriptor>> {
+    ) -> Result<(Option<P2pArtifactDescriptor>, LookupConnection)> {
         // Scheduler endpoints are opaque until this backend parses them. Add
         // the peer address to iroh's in-memory lookup before dialing.
         let addr = peer.endpoint.to_iroh_addr()?;
+        self.validate_endpoint_addr(&addr)?;
         self.lookup.add_endpoint_info(addr.clone());
-        let conn = self
-            .router
-            .endpoint()
-            .connect(addr, CATALOG_ALPN)
+
+        let (connection, reuse) = match &self.catalog_pool {
+            Some(pool) => {
+                let dialled_before = self.catalog_connections.load(Ordering::Acquire);
+                let connection = pool
+                    .get_or_connect(addr.id)
+                    .await
+                    .map_err(|err| pool_connect_error(&peer.node_id, err))?;
+                // Approximate under concurrency, because another lookup may
+                // have dialled in between. It is a label, not a decision, and
+                // the reading that matters — one dial for many lookups — is
+                // exact in the counter it is derived from.
+                let reuse = if self.catalog_connections.load(Ordering::Acquire) == dialled_before {
+                    LookupConnection::Reused
+                } else {
+                    LookupConnection::New
+                };
+                (CatalogConnection::Pooled(connection), reuse)
+            }
+            None => {
+                let connection = self
+                    .router
+                    .endpoint()
+                    .connect(addr, CATALOG_ALPN)
+                    .await
+                    .with_context(|| format!("connect to P2P catalog peer {}", peer.node_id))?;
+                (CatalogConnection::Owned(connection), LookupConnection::New)
+            }
+        };
+
+        let (mut send, mut recv) = connection
+            .open_bi()
             .await
-            .with_context(|| format!("connect to P2P catalog peer {}", peer.node_id))?;
-        let (mut send, mut recv) = conn.open_bi().await.context("open P2P catalog stream")?;
+            .context("open P2P catalog stream")?;
         let request = CatalogRequest { key: key.clone() };
         let request_bytes =
             serde_json::to_vec(&request).context("serialize P2P catalog lookup request")?;
@@ -224,10 +283,16 @@ impl IrohBlobsP2pTransport {
             .context("read P2P catalog lookup response")?;
         let response: CatalogResponse =
             serde_json::from_slice(&response_bytes).context("parse P2P catalog response")?;
-        conn.close(0_u32.into(), b"done");
-        Ok(response
-            .descriptor
-            .and_then(|descriptor| resolve_remote_local_providers(descriptor, peer)))
+        // A pooled connection is closed by the pool when it goes idle, not
+        // here: closing it after one lookup is exactly the handshake-per-lookup
+        // the pool exists to remove.
+        connection.close_if_owned();
+        Ok((
+            response
+                .descriptor
+                .and_then(|descriptor| resolve_remote_local_providers(descriptor, peer)),
+            reuse,
+        ))
     }
 
     async fn lookup_peer_with_timeout(
@@ -235,11 +300,43 @@ impl IrohBlobsP2pTransport {
         peer: &P2pPeer,
         key: &P2pArtifactKey,
     ) -> Result<Option<P2pArtifactDescriptor>> {
-        tokio::time::timeout(self.lookup_timeout, self.lookup_peer(peer, key))
-            .await
+        let started = std::time::Instant::now();
+        let outcome =
+            tokio::time::timeout(self.catalog_lookup_timeout, self.lookup_peer(peer, key)).await;
+        let (result, connection) = match &outcome {
+            Ok(Ok((Some(_), reuse))) => (LookupResult::Hit, *reuse),
+            Ok(Ok((None, reuse))) => (LookupResult::Miss, *reuse),
+            Ok(Err(_)) => (LookupResult::Error, LookupConnection::New),
+            Err(_) => (LookupResult::Timeout, LookupConnection::New),
+        };
+        p2p_metrics::record_catalog_lookup(result, connection, started.elapsed());
+        outcome
             .map_err(|_| Error::Timeout {
                 operation: "lookup P2P artifact from peer",
             })?
+            .map(|(descriptor, _)| descriptor)
+    }
+
+    /// Bounds a whole multi-peer lookup.
+    ///
+    /// `catalog_lookup_timeout` bounds one peer; this is the caller-facing
+    /// budget for the lookup as a whole, so a long tail of candidates cannot
+    /// keep a caller waiting past what it asked for.
+    async fn lookup_peers_bounded(
+        &self,
+        peers: Vec<P2pPeer>,
+        key: &P2pArtifactKey,
+    ) -> Option<P2pArtifactDescriptor> {
+        match tokio::time::timeout(self.lookup_timeout, self.lookup_peers(peers, key)).await {
+            Ok(descriptor) => descriptor,
+            Err(_) => {
+                debug!(
+                    timeout_ms = self.lookup_timeout.as_millis(),
+                    "P2P multi-peer lookup exceeded its budget"
+                );
+                None
+            }
+        }
     }
 
     async fn lookup_peers(
@@ -421,12 +518,14 @@ impl IrohBlobsP2pTransport {
         key: &P2pArtifactKey,
         blob_hash: iroh_blobs::Hash,
         metadata: &serde_json::Value,
+        owner: P2pPublishOwner,
     ) -> Result<()> {
         self.store
             .tags()
             .set(publish_tag_name(key), HashAndFormat::raw(blob_hash))
             .await
             .map_err(|err| Error::internal_message("retain local P2P artifact blob", err))?;
+        self.published_catalog.add_owner(key, owner).await?;
 
         let local_descriptor = P2pArtifactDescriptor {
             key: key.clone(),
@@ -444,8 +543,15 @@ impl IrohBlobsP2pTransport {
         descriptor: &P2pArtifactDescriptor,
         blob_hash: iroh_blobs::Hash,
     ) {
+        // A blob this node fetched for its own use is retained on the node's
+        // own account, not on behalf of whoever published it upstream.
         if let Err(err) = self
-            .advertise_local_blob(&descriptor.key, blob_hash, &descriptor.metadata)
+            .advertise_local_blob(
+                &descriptor.key,
+                blob_hash,
+                &descriptor.metadata,
+                P2pPublishOwner::Unscoped,
+            )
             .await
         {
             warn!(error = %err, "failed to advertise fetched P2P artifact");
@@ -540,6 +646,10 @@ impl IrohBlobsP2pTransport {
                     return None;
                 };
                 let addr = peer.endpoint.to_iroh_addr().ok()?;
+                // A descriptor names its own providers, and a descriptor is
+                // whatever a peer chose to send, so this is the second place a
+                // node can be told where to dial.
+                self.validate_endpoint_addr(&addr).ok()?;
                 let provider_id = addr.id;
                 self.lookup.add_endpoint_info(addr);
                 Some(provider_id)
@@ -560,6 +670,118 @@ impl IrohBlobsP2pTransport {
             providers,
         })
     }
+
+    /// Refuses an endpoint address outside the cluster's own network.
+    ///
+    /// Endpoint addresses travel as opaque blobs through the scheduler and
+    /// inside descriptors, and every node parses one and dials it. Artifact
+    /// bytes are safe either way — they are named by hash and verified on
+    /// arrival — but connection targeting is not, so a compromised node can
+    /// point its peers wherever it likes. Naming the cluster's own networks
+    /// bounds that to addresses the node would already have talked to.
+    fn validate_endpoint_addr(&self, addr: &EndpointAddr) -> Result<()> {
+        if self.cluster_cidrs.is_empty() {
+            return Ok(());
+        }
+        let mut saw_addr = false;
+        for socket_addr in addr.ip_addrs() {
+            saw_addr = true;
+            if !self
+                .cluster_cidrs
+                .iter()
+                .any(|cidr| cidr.contains(socket_addr.ip()))
+            {
+                return Err(Error::InvalidDescriptor {
+                    reason: format!(
+                        "P2P endpoint address {} is outside the configured cluster networks",
+                        socket_addr.ip()
+                    ),
+                });
+            }
+        }
+        if !saw_addr {
+            // With no relay and no discovery configured, an address that names
+            // no IP cannot be dialled at all; refusing it here keeps the
+            // failure at the check rather than in a timeout.
+            return Err(Error::InvalidDescriptor {
+                reason: "P2P endpoint address names no IP address".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn parse_cluster_cidrs(raw: &[String]) -> Result<Vec<ipnetwork::IpNetwork>> {
+    raw.iter()
+        .map(|cidr| {
+            cidr.parse::<ipnetwork::IpNetwork>()
+                .with_context(|| format!("parse p2p.cluster_cidrs entry {cidr:?}"))
+                .map_err(Error::from)
+        })
+        .collect()
+}
+
+/// Builds the catalog connection pool, or `None` when pooling is off.
+///
+/// The pool's own defaults are tuned for short bursts: a 5 s idle timeout is
+/// shorter than the peer refresh interval, so a connection to a peer this node
+/// polls every 5 s would be torn down and re-handshaken between reads of the
+/// same layer.
+fn build_catalog_pool(
+    endpoint: Endpoint,
+    config: &ResolvedP2pConfig,
+    connections: Arc<AtomicU64>,
+) -> Option<ConnectionPool> {
+    if config.catalog_max_connections == 0 {
+        info!("P2P catalog connection pooling is disabled; dialing per lookup");
+        return None;
+    }
+    let options = ConnectionPoolOptions {
+        idle_timeout: config.catalog_connection_idle,
+        max_connections: config.catalog_max_connections,
+        ..ConnectionPoolOptions::default()
+    }
+    .with_on_connected(move |_endpoint, _connection| {
+        let connections = Arc::clone(&connections);
+        async move {
+            connections.fetch_add(1, Ordering::Release);
+            p2p_metrics::record_catalog_connection_established();
+            Ok(())
+        }
+    });
+    Some(ConnectionPool::new(endpoint, CATALOG_ALPN, options))
+}
+
+fn pool_connect_error(node_id: &str, err: PoolConnectError) -> Error {
+    Error::Internal(anyhow::anyhow!(
+        "connect to P2P catalog peer {node_id}: {err}"
+    ))
+}
+
+/// A catalog connection whose lifetime belongs either to the pool or to us.
+enum CatalogConnection {
+    Pooled(iroh_blobs::util::connection_pool::ConnectionRef),
+    Owned(iroh::endpoint::Connection),
+}
+
+impl CatalogConnection {
+    async fn open_bi(
+        &self,
+    ) -> std::result::Result<
+        (iroh::endpoint::SendStream, iroh::endpoint::RecvStream),
+        iroh::endpoint::ConnectionError,
+    > {
+        match self {
+            Self::Pooled(connection) => connection.open_bi().await,
+            Self::Owned(connection) => connection.open_bi().await,
+        }
+    }
+
+    fn close_if_owned(&self) {
+        if let Self::Owned(connection) = self {
+            connection.close(0_u32.into(), b"done");
+        }
+    }
 }
 
 #[async_trait]
@@ -577,7 +799,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
 
         match self.peer_discovery.peers_for_key(key).await {
             Ok(peers) => {
-                if let Some(descriptor) = self.lookup_peers(peers, key).await {
+                if let Some(descriptor) = self.lookup_peers_bounded(peers, key).await {
                     trace!("P2P lookup found descriptor through scheduler artifact index");
                     // Currently use short-circuit provider discovery for simplicity.
                     return Ok(Some(descriptor));
@@ -592,7 +814,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
         }
 
         let peers = self.peer_discovery.peers_with_hints(hints).await?;
-        if let Some(descriptor) = self.lookup_peers(peers, key).await {
+        if let Some(descriptor) = self.lookup_peers_bounded(peers, key).await {
             return Ok(Some(descriptor));
         }
         trace!("P2P lookup completed without descriptor");
@@ -743,6 +965,57 @@ impl P2pTransport for IrohBlobsP2pTransport {
         fields(key = %request.key, source = %request.source, publish_mode = ?request.publish_mode)
     )]
     async fn publish(&self, request: &P2pPublishRequest) -> Result<()> {
+        let result = self.publish_inner(request).await;
+        p2p_metrics::record_publish(
+            &request.key,
+            request.owner,
+            if result.is_ok() {
+                PublishStatus::Published
+            } else {
+                PublishStatus::Failed
+            },
+        );
+        result
+    }
+
+    #[instrument(skip(self), fields(key = %key))]
+    async fn unpublish(&self, key: &P2pArtifactKey) -> Result<bool> {
+        self.unpublish_owned(key, P2pPublishOwner::Unscoped).await
+    }
+
+    #[instrument(skip(self), fields(key = %key, owner = owner.as_str()))]
+    async fn unpublish_owned(&self, key: &P2pArtifactKey, owner: P2pPublishOwner) -> Result<bool> {
+        let result = self.unpublish_inner(key, owner).await;
+        p2p_metrics::record_unpublish(
+            key,
+            match &result {
+                Ok(OwnerRelease::Withdrawn) => UnpublishStatus::Withdrawn,
+                Ok(OwnerRelease::Retained) => UnpublishStatus::Retained,
+                Ok(OwnerRelease::Absent) => UnpublishStatus::Absent,
+                Err(_) => UnpublishStatus::Failed,
+            },
+        );
+        Ok(matches!(result?, OwnerRelease::Withdrawn))
+    }
+
+    async fn request_gc(&self) {
+        self.pending_gc.store(true, Ordering::Release);
+    }
+
+    fn local_endpoint(&self) -> Option<P2pEndpoint> {
+        Some(self.local_endpoint.clone())
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        self.router
+            .shutdown()
+            .await
+            .map_err(|err| Error::internal_message("shutdown embedded P2P endpoint", err))
+    }
+}
+
+impl IrohBlobsP2pTransport {
+    async fn publish_inner(&self, request: &P2pPublishRequest) -> Result<()> {
         let imported = match &request.source {
             P2pPublishSource::Path(source) => {
                 let import_mode = match request.publish_mode {
@@ -770,8 +1043,13 @@ impl P2pTransport for IrohBlobsP2pTransport {
                     Error::internal_message("import bytes into iroh-blobs store", err)
                 })?,
         };
-        self.advertise_local_blob(&request.key, imported.hash(), &request.metadata)
-            .await?;
+        self.advertise_local_blob(
+            &request.key,
+            imported.hash(),
+            &request.metadata,
+            request.owner,
+        )
+        .await?;
         if let Err(err) = self.peer_discovery.record_key(&request.key).await {
             warn!(error = %err, "failed to record P2P artifact in scheduler");
         }
@@ -779,11 +1057,32 @@ impl P2pTransport for IrohBlobsP2pTransport {
         Ok(())
     }
 
-    #[instrument(skip(self), fields(key = %key))]
-    async fn unpublish(&self, key: &P2pArtifactKey) -> Result<bool> {
+    /// Releases one owner, withdrawing the artifact only when it was the last.
+    ///
+    /// The retention tag is one deterministic name per key, so deleting it on
+    /// any owner's release would hand the collector a blob another publisher
+    /// is still advertising. The catalog entry has the same problem: peers
+    /// would keep resolving a descriptor whose bytes had been swept.
+    async fn unpublish_inner(
+        &self,
+        key: &P2pArtifactKey,
+        owner: P2pPublishOwner,
+    ) -> Result<OwnerRelease> {
+        match self.published_catalog.release_owner(key, owner).await? {
+            OwnerRelease::Absent => {
+                debug!("P2P unpublish skipped missing local artifact");
+                return Ok(OwnerRelease::Absent);
+            }
+            OwnerRelease::Retained => {
+                debug!("P2P artifact still held by another publisher; keeping it advertised");
+                return Ok(OwnerRelease::Retained);
+            }
+            OwnerRelease::Withdrawn => {}
+        }
+
         if self.published_catalog.remove(key).await?.is_none() {
             debug!("P2P unpublish skipped missing local artifact");
-            return Ok(false);
+            return Ok(OwnerRelease::Absent);
         };
 
         self.store
@@ -796,18 +1095,7 @@ impl P2pTransport for IrohBlobsP2pTransport {
             warn!(error = %err, "failed to forget P2P artifact in scheduler");
         }
         debug!("unpublished artifact from P2P transport");
-        Ok(true)
-    }
-
-    fn local_endpoint(&self) -> Option<P2pEndpoint> {
-        Some(self.local_endpoint.clone())
-    }
-
-    async fn shutdown(&self) -> Result<()> {
-        self.router
-            .shutdown()
-            .await
-            .map_err(|err| Error::internal_message("shutdown embedded P2P endpoint", err))
+        Ok(OwnerRelease::Withdrawn)
     }
 }
 
@@ -970,12 +1258,22 @@ impl IrohBlobsP2pTransport {
         });
     }
 
-    /// Arms the collector gate periodically.
+    /// Arms the collector gate periodically and reports the store's size.
     ///
     /// Arming slightly ahead of the collector's own interval means each sweep
     /// finds the gate open, so retention actually converges instead of
     /// depending on an unpublish having happened to race the last tick.
-    fn spawn_gc_arming_task(pending_gc: Arc<AtomicBool>, gc_interval: Duration) {
+    ///
+    /// Store size is sampled from the same tick because it is the series that
+    /// says whether that convergence is real: the store grows on every publish
+    /// and every fetched blob and shrinks only when a sweep runs, so a flat
+    /// create/delete loop that ratchets the gauge upward is a retention leak
+    /// no other signal would show.
+    fn spawn_gc_arming_task(
+        pending_gc: Arc<AtomicBool>,
+        gc_interval: Duration,
+        store_dir: std::path::PathBuf,
+    ) {
         if gc_interval.is_zero() {
             return;
         }
@@ -991,9 +1289,40 @@ impl IrohBlobsP2pTransport {
                     return;
                 }
                 pending_gc.store(true, Ordering::Release);
+                sample_store_bytes(store_dir.clone()).await;
             }
         });
     }
+}
+
+/// Reports the on-disk size of the transport's blob store.
+///
+/// Walked on a blocking thread: the store is a directory tree of blob files
+/// and its stat calls have no business on a runtime worker.
+async fn sample_store_bytes(store_dir: std::path::PathBuf) {
+    let measured = tokio::task::spawn_blocking(move || directory_size(&store_dir)).await;
+    match measured {
+        Ok(bytes) => p2p_metrics::set_store_bytes(bytes),
+        Err(err) => debug!(error = %err, "failed to measure P2P store size"),
+    }
+}
+
+fn directory_size(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            total += directory_size(&entry.path());
+        } else if let Ok(metadata) = entry.metadata() {
+            total += metadata.len();
+        }
+    }
+    total
 }
 
 fn gated_gc_config(interval: Duration, pending_gc: Arc<AtomicBool>) -> GcConfig {
@@ -1147,6 +1476,10 @@ mod tests {
             listen_addr: "127.0.0.1:0".to_string(),
             lookup_timeout_ms: 10_000,
             fetch_timeout_ms: 10_000,
+            // Test peers are on loopback but the gate machine is heavily
+            // loaded; the shipped 100 ms per-peer bound is not a property any
+            // of these tests are about.
+            catalog_lookup_timeout_ms: 10_000,
             ..P2pConfig::default()
         }
     }
@@ -1754,6 +2087,396 @@ mod tests {
             .shutdown()
             .await
             .context("shutdown restarted provider P2P")?;
+        Ok(())
+    }
+
+    /// Captures the label sets a counter was incremented under. Installed per
+    /// thread, which is why the tests using it drive a current-thread runtime.
+    #[derive(Default, Clone)]
+    struct CounterSpy {
+        observed: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    struct SpyCounter {
+        rendered: String,
+        observed: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl metrics::CounterFn for SpyCounter {
+        fn increment(&self, _value: u64) {
+            self.observed.lock().unwrap().push(self.rendered.clone());
+        }
+        fn absolute(&self, _value: u64) {}
+    }
+
+    impl metrics::Recorder for CounterSpy {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            let mut labels: Vec<String> = key
+                .labels()
+                .map(|label| format!("{}={}", label.key(), label.value()))
+                .collect();
+            labels.sort();
+            metrics::Counter::from_arc(Arc::new(SpyCounter {
+                rendered: format!("{} {}", key.name(), labels.join(" ")),
+                observed: Arc::clone(&self.observed),
+            }))
+        }
+        fn register_gauge(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    /// Publication and withdrawal have to be readable per publisher, because
+    /// the sha256 namespace has two of them and "the store is bounded" is an
+    /// assertion about their sum. The labels are drawn from closed sets: the
+    /// key contributes its namespace and never its digest.
+    #[test]
+    fn publish_and_withdraw_are_counted_per_publisher() {
+        let spy = CounterSpy::default();
+        let observed = Arc::clone(&spy.observed);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+
+        metrics::with_local_recorder(&spy, || {
+            runtime.block_on(async {
+                let temp = tempfile::tempdir().expect("temp dir");
+                let transport = test_transport(
+                    &p2p_config(temp.path().join("store")),
+                    "counted-node",
+                    Arc::new(NoopP2pPeerDiscovery),
+                )
+                .await
+                .expect("start transport");
+
+                let key = "overlaybd-layer/v1/sha256:counted".to_string();
+                transport
+                    .publish(
+                        &P2pPublishRequest::bytes(key.clone(), b"counted bytes".as_slice())
+                            .with_owner(P2pPublishOwner::ImageCache),
+                    )
+                    .await
+                    .expect("publish");
+                transport
+                    .unpublish_owned(&key, P2pPublishOwner::ImageCache)
+                    .await
+                    .expect("unpublish");
+
+                transport.shutdown().await.expect("shutdown");
+            })
+        });
+
+        let observed = observed.lock().unwrap();
+        assert!(
+            observed.iter().any(|rendered| rendered
+                == "agentenv_p2p_publish_total key_class=overlaybd_layer source=image_cache status=published"),
+            "a publish must be attributed to its publisher, saw {observed:?}"
+        );
+        assert!(
+            observed.iter().any(|rendered| rendered
+                == "agentenv_p2p_unpublish_total key_class=overlaybd_layer status=withdrawn"),
+            "the last withdrawal must be recorded as such, saw {observed:?}"
+        );
+    }
+
+    /// Catalog lookups used to dial, ask one question and close, so a layer
+    /// read at block granularity paid a QUIC handshake per block. The pool has
+    /// to turn many lookups into one connection, and the server has to keep
+    /// accepting streams on it.
+    #[tokio::test]
+    async fn repeated_lookups_against_one_peer_dial_once() -> Result<()> {
+        let temp = tempfile::tempdir().context("create temp test dir")?;
+        let (provider, consumer) = test_provider_consumer(&temp).await?;
+        let key = "test/p2p/iroh/pooled-lookup".to_string();
+        provider
+            .publish(&P2pPublishRequest::bytes(
+                key.clone(),
+                b"pooled lookup bytes".as_slice(),
+            ))
+            .await
+            .context("publish artifact")?;
+
+        for _ in 0..20 {
+            assert!(
+                consumer.lookup(&key).await?.is_some(),
+                "consumer should resolve the provider's descriptor"
+            );
+        }
+
+        assert_eq!(
+            consumer.catalog_connections.load(Ordering::Acquire),
+            1,
+            "twenty lookups against one peer must ride one connection"
+        );
+        consumer.shutdown().await.context("shutdown consumer P2P")?;
+        provider.shutdown().await.context("shutdown provider P2P")?;
+        Ok(())
+    }
+
+    /// Zero connections is the documented escape hatch for a cluster where
+    /// some nodes still serve one catalog stream per connection, so it has to
+    /// actually restore the old dial-per-lookup path.
+    #[tokio::test]
+    async fn pooling_can_be_turned_off() -> Result<()> {
+        let temp = tempfile::tempdir().context("create temp test dir")?;
+        let provider = test_transport(
+            &p2p_config(temp.path().join("provider-store")),
+            "provider-node",
+            Arc::new(NoopP2pPeerDiscovery),
+        )
+        .await
+        .context("start provider P2P transport")?;
+        let provider_endpoint = provider
+            .local_endpoint()
+            .context("provider transport should expose a local endpoint")?;
+        let mut config = p2p_config(temp.path().join("consumer-store"));
+        config.catalog_max_connections = 0;
+        let consumer = test_transport(
+            &config,
+            "consumer-node",
+            Arc::new(StaticP2pPeerDiscovery::new(vec![P2pPeer {
+                node_id: "provider-node".to_string(),
+                endpoint: provider_endpoint,
+            }])),
+        )
+        .await
+        .context("start consumer P2P transport")?;
+
+        let key = "test/p2p/iroh/unpooled-lookup".to_string();
+        provider
+            .publish(&P2pPublishRequest::bytes(
+                key.clone(),
+                b"unpooled lookup bytes".as_slice(),
+            ))
+            .await
+            .context("publish artifact")?;
+
+        assert!(consumer.lookup(&key).await?.is_some());
+        assert_eq!(
+            consumer.catalog_connections.load(Ordering::Acquire),
+            0,
+            "with pooling off the pool is never built, so it dials nothing"
+        );
+        consumer.shutdown().await.context("shutdown consumer P2P")?;
+        provider.shutdown().await.context("shutdown provider P2P")?;
+        Ok(())
+    }
+
+    /// A peer's endpoint address is an opaque blob the scheduler relays and
+    /// every node dials. Naming the cluster's networks is what stops a
+    /// compromised node steering its peers at an address outside them.
+    #[tokio::test]
+    async fn an_endpoint_outside_the_cluster_networks_is_refused() -> Result<()> {
+        let temp = tempfile::tempdir().context("create temp test dir")?;
+        let mut config = p2p_config(temp.path().join("guarded-store"));
+        config.cluster_cidrs = vec!["10.0.0.0/8".to_string()];
+        let transport = test_transport(&config, "guarded-node", Arc::new(NoopP2pPeerDiscovery))
+            .await
+            .context("start guarded P2P transport")?;
+
+        let outside = EndpointAddr::new(iroh::SecretKey::generate().public())
+            .with_ip_addr("203.0.113.7:4433".parse::<SocketAddr>().expect("addr"));
+        let inside = EndpointAddr::new(iroh::SecretKey::generate().public())
+            .with_ip_addr("10.1.2.3:4433".parse::<SocketAddr>().expect("addr"));
+
+        assert!(
+            matches!(
+                transport.validate_endpoint_addr(&outside),
+                Err(Error::InvalidDescriptor { .. })
+            ),
+            "an address outside the cluster networks must be refused"
+        );
+        transport
+            .validate_endpoint_addr(&inside)
+            .context("an address inside the cluster networks must be accepted")?;
+
+        transport.shutdown().await.context("shutdown P2P")?;
+        Ok(())
+    }
+
+    /// Two publishers share the `overlaybd-layer/v1/sha256:` namespace — the
+    /// image cache when a layer lands in the commit store, and snapshot
+    /// publication for every lower of a committed chain — and each has its own
+    /// removal edge. Retention is one tag and one catalog entry per key, so
+    /// the first edge to run must not take the artifact out from under the
+    /// other.
+    #[tokio::test]
+    async fn an_artifact_survives_until_its_last_owner_releases_it() -> Result<()> {
+        let temp = tempfile::tempdir().context("create temp test dir")?;
+        let provider = test_transport(
+            &p2p_config(temp.path().join("provider-store")),
+            "provider-node",
+            Arc::new(NoopP2pPeerDiscovery),
+        )
+        .await
+        .context("start provider P2P transport")?;
+
+        let key = "overlaybd-layer/v1/sha256:shared".to_string();
+        for owner in [P2pPublishOwner::ImageCache, P2pPublishOwner::Unscoped] {
+            provider
+                .publish(
+                    &P2pPublishRequest::bytes(key.clone(), b"shared layer bytes".as_slice())
+                        .with_owner(owner),
+                )
+                .await
+                .context("publish artifact")?;
+        }
+        let descriptor = provider
+            .get_local(&key)
+            .await
+            .context("descriptor after publish")?;
+        let blob_hash = blob_hash_from_descriptor(&descriptor)?;
+        let tag_name = publish_tag_name(&key);
+
+        assert!(
+            !provider
+                .unpublish_owned(&key, P2pPublishOwner::ImageCache)
+                .await?,
+            "releasing one of two owners must not withdraw the artifact"
+        );
+        assert!(
+            provider.get_local(&key).await.is_some(),
+            "the other owner is still advertising this key"
+        );
+        assert!(
+            provider
+                .store
+                .tags()
+                .get(&tag_name)
+                .await
+                .map_err(|err| Error::internal_message("get publish tag", err))?
+                .is_some(),
+            "the retention tag protects bytes the remaining owner still needs"
+        );
+
+        assert!(
+            provider.unpublish(&key).await?,
+            "releasing the last owner must withdraw the artifact"
+        );
+        assert!(provider.get_local(&key).await.is_none());
+        assert!(
+            provider
+                .store
+                .tags()
+                .get(&tag_name)
+                .await
+                .map_err(|err| Error::internal_message("get publish tag", err))?
+                .is_none(),
+            "the last release must drop the retention tag"
+        );
+        let _ = blob_hash;
+
+        provider.shutdown().await.context("shutdown provider P2P")?;
+        Ok(())
+    }
+
+    /// The owner set is what keeps a shared artifact alive, so it has to
+    /// survive a process restart the same way the catalog entry does.
+    #[tokio::test]
+    async fn owner_sets_survive_a_transport_restart() -> Result<()> {
+        let temp = tempfile::tempdir().context("create temp test dir")?;
+        let config = p2p_config(temp.path().join("provider-store"));
+        let provider = test_transport(&config, "provider-node", Arc::new(NoopP2pPeerDiscovery))
+            .await
+            .context("start provider P2P transport")?;
+
+        let key = "overlaybd-layer/v1/sha256:restart-shared".to_string();
+        for owner in [P2pPublishOwner::ImageCache, P2pPublishOwner::Unscoped] {
+            provider
+                .publish(
+                    &P2pPublishRequest::bytes(key.clone(), b"shared layer bytes".as_slice())
+                        .with_owner(owner),
+                )
+                .await
+                .context("publish artifact")?;
+        }
+        provider.shutdown().await.context("shutdown provider P2P")?;
+        drop(provider);
+
+        let restarted = test_transport(&config, "provider-node", Arc::new(NoopP2pPeerDiscovery))
+            .await
+            .context("restart provider P2P transport")?;
+        assert_eq!(
+            restarted.published_catalog.owners_of(&key).await,
+            std::collections::BTreeSet::from([
+                P2pPublishOwner::ImageCache,
+                P2pPublishOwner::Unscoped
+            ]),
+            "both owners must be recovered from the persisted catalog"
+        );
+        assert!(
+            !restarted
+                .unpublish_owned(&key, P2pPublishOwner::ImageCache)
+                .await?,
+            "a restart must not collapse two owners into one"
+        );
+        assert!(restarted.get_local(&key).await.is_some());
+        restarted
+            .shutdown()
+            .await
+            .context("shutdown restarted provider P2P")?;
+        Ok(())
+    }
+
+    /// The transport's collector is gated so it only sweeps when something
+    /// asks it to, which is what makes the image cache's maintenance pass a
+    /// reachable arming event rather than a comment.
+    #[tokio::test]
+    async fn requesting_gc_arms_the_collector_gate() -> Result<()> {
+        let temp = tempfile::tempdir().context("create temp test dir")?;
+        let provider = test_transport(
+            &p2p_config(temp.path().join("provider-store")),
+            "provider-node",
+            Arc::new(NoopP2pPeerDiscovery),
+        )
+        .await
+        .context("start provider P2P transport")?;
+
+        provider.pending_gc.store(false, Ordering::Release);
+        provider.request_gc().await;
+
+        assert!(
+            provider.pending_gc.load(Ordering::Acquire),
+            "a maintenance signal must arm the collector"
+        );
+        provider.shutdown().await.context("shutdown provider P2P")?;
         Ok(())
     }
 

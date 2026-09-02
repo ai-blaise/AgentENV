@@ -76,6 +76,8 @@ pub struct P2pPublishRequest {
     pub metadata: serde_json::Value,
     /// Hint for how the transport should retain/import a path-backed local artifact.
     pub publish_mode: P2pPublishMode,
+    /// Which subsystem's retention this publication belongs to.
+    pub owner: P2pPublishOwner,
 }
 
 impl P2pPublishRequest {
@@ -85,6 +87,7 @@ impl P2pPublishRequest {
             source: P2pPublishSource::Path(source.into()),
             metadata: serde_json::Value::Null,
             publish_mode: P2pPublishMode::default(),
+            owner: P2pPublishOwner::default(),
         }
     }
 
@@ -94,6 +97,7 @@ impl P2pPublishRequest {
             source: P2pPublishSource::Bytes(bytes.into()),
             metadata: serde_json::Value::Null,
             publish_mode: P2pPublishMode::Copy,
+            owner: P2pPublishOwner::default(),
         }
     }
 
@@ -105,6 +109,47 @@ impl P2pPublishRequest {
     pub fn with_publish_mode(mut self, publish_mode: P2pPublishMode) -> Self {
         self.publish_mode = publish_mode;
         self
+    }
+
+    pub fn with_owner(mut self, owner: P2pPublishOwner) -> Self {
+        self.owner = owner;
+        self
+    }
+}
+
+/// Which subsystem's retention a publication belongs to.
+///
+/// The `overlaybd-layer/v1/sha256:<digest>` namespace has two independent
+/// publishers — the image cache, when a layer lands in the commit store, and
+/// snapshot publication, for every lower of a committed chain — and each has
+/// its own removal edge. Retention is per key, so without an owner the first
+/// removal to run would drop the shared entry and hand the collector a blob
+/// the other publisher is still advertising. An artifact is withdrawn once the
+/// last owner releases it.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum P2pPublishOwner {
+    /// Publishers that have exactly one publish and one unpublish edge and so
+    /// need no scoping of their own. Also what a catalog written before
+    /// ownership existed resolves to.
+    #[default]
+    Unscoped,
+    /// The local image cache's commit store.
+    ImageCache,
+    /// The overlaybd facade's control endpoint.
+    Facade,
+}
+
+impl P2pPublishOwner {
+    /// Stable, bounded label for metrics and for the persisted owner set.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unscoped => "unscoped",
+            Self::ImageCache => "image_cache",
+            Self::Facade => "facade",
+        }
     }
 }
 

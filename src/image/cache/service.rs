@@ -491,6 +491,12 @@ impl ImageCacheService {
         };
         let live_refs = self.live_refs_from_running(running).await?;
         let report = self.run_gc(live_refs, !reconciled).await?;
+        // The P2P collector is gated so it sweeps on events rather than every
+        // interval, and a commit-store sweep is the one moment its retention is
+        // most likely to have just gone stale.
+        crate::overlaybd::p2p::global_layer_publish_sink()
+            .commit_store_maintained()
+            .await;
         Ok(ImageCacheGcSummary::from_report(&report))
     }
 
@@ -642,6 +648,13 @@ impl ImageCacheService {
         digest: &HardCommitId,
         file: &Path,
     ) -> Result<()> {
+        // Ordered before the unlink and awaited, not queued. A layer is
+        // advertised to peers by reference to this exact file, so a withdrawal
+        // that lands after the unlink leaves peers resolving a descriptor whose
+        // bytes are already gone.
+        crate::overlaybd::p2p::global_layer_publish_sink()
+            .unpublish_layer(digest.as_str())
+            .await;
         tokio::fs::remove_file(file)
             .await
             .with_context(|| format!("remove image cache commit file {}", file.display()))?;

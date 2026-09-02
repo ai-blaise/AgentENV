@@ -13,8 +13,8 @@ use tracing::{debug, warn};
 
 use super::{
     P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProvider, P2pArtifactProviderHint,
-    P2pByteStream, P2pEndpoint, P2pError, P2pPublishRequest, P2pPublishSource, P2pResult,
-    P2pTransport,
+    P2pByteStream, P2pEndpoint, P2pError, P2pPublishOwner, P2pPublishRequest, P2pPublishSource,
+    P2pResult, P2pTransport,
 };
 
 #[derive(Clone, Default)]
@@ -26,6 +26,10 @@ pub(crate) struct MockTransport {
     pub(crate) fetch_bytes_count: Arc<AtomicUsize>,
     pub(crate) fetch_range_count: Arc<AtomicUsize>,
     pub(crate) publish_count: Arc<AtomicUsize>,
+    /// Every publish request the facade sent, so a test can assert the mode
+    /// and owner it chose rather than only that it published.
+    pub(crate) published: Arc<RwLock<Vec<P2pPublishRequest>>>,
+    pub(crate) gc_requests: Arc<AtomicUsize>,
     pub(crate) lookup_delay: Option<Duration>,
     pub(crate) fetch_range_delay: Option<Duration>,
     pub(crate) fail_lookup: Arc<AtomicBool>,
@@ -168,6 +172,7 @@ impl P2pTransport for MockTransport {
     async fn publish(&self, request: &P2pPublishRequest) -> P2pResult<()> {
         debug!(key = ?request.key, "publishing");
         self.publish_count.fetch_add(1, Ordering::Relaxed);
+        self.published.write().await.push(request.clone());
         if self.fail_publish.load(Ordering::Relaxed) {
             warn!(key = ?request.key, "publish forced failure");
             return Err(P2pError::Internal(anyhow!("forced publish failure")));
@@ -195,10 +200,22 @@ impl P2pTransport for MockTransport {
     }
 
     async fn unpublish(&self, key: &P2pArtifactKey) -> P2pResult<bool> {
+        self.unpublish_owned(key, P2pPublishOwner::Unscoped).await
+    }
+
+    async fn unpublish_owned(
+        &self,
+        key: &P2pArtifactKey,
+        owner: P2pPublishOwner,
+    ) -> P2pResult<bool> {
         let removed = self.descriptors.write().await.remove(key).is_some();
         self.blobs.write().await.remove(key);
-        debug!(?key, removed, "unpublished");
+        debug!(?key, owner = owner.as_str(), removed, "unpublished");
         Ok(removed)
+    }
+
+    async fn request_gc(&self) {
+        self.gc_requests.fetch_add(1, Ordering::Relaxed);
     }
 
     fn local_endpoint(&self) -> Option<P2pEndpoint> {

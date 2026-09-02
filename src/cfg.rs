@@ -720,6 +720,41 @@ pub struct P2pConfig {
     /// the life of that scheduler process. Zero disables re-announcement.
     #[config(default = 60u64)]
     pub reannounce_interval_secs: u64,
+    /// How long an idle catalog connection to a peer is kept open.
+    ///
+    /// Catalog lookups used to dial, ask one question and close, paying a QUIC
+    /// handshake per lookup per peer. The pool's own default of 5 s is shorter
+    /// than `peer_discovery_refresh_interval_secs`, so it would tear the
+    /// connection down between reads of the same layer.
+    #[config(default = 60u64)]
+    pub catalog_connection_idle_secs: u64,
+    /// Peers the catalog connection pool may hold connections to at once.
+    ///
+    /// Zero turns pooling off and restores the dial-per-lookup behaviour,
+    /// which is the escape hatch for a cluster where some nodes still run a
+    /// catalog server that serves one stream per connection.
+    #[config(default = 1024usize)]
+    pub catalog_max_connections: usize,
+    /// Per-peer bound on a single catalog lookup, in milliseconds.
+    ///
+    /// `lookup_timeout_ms` bounds a whole multi-peer lookup for callers that
+    /// have a budget of seconds. The overlaybd facade's budget is 300 ms for
+    /// everything, so a per-peer bound of the same size means the first
+    /// unresponsive candidate consumes it all. Over a pooled connection a warm
+    /// lookup is one round trip, so this can be small enough for several
+    /// candidates to be tried inside the facade's budget.
+    #[config(default = 100u64)]
+    pub catalog_lookup_timeout_ms: u64,
+    /// CIDRs a peer endpoint address is allowed to name.
+    ///
+    /// A peer's endpoint address is an opaque JSON blob the scheduler stores
+    /// and hands to every other node, which parses it and dials what it says.
+    /// Artifact content is safe regardless — it is verified by hash — but
+    /// nothing checks where a node is being pointed, so a compromised node can
+    /// steer the whole mesh's dials. Empty accepts any address, which is the
+    /// shipped default because a wrong CIDR silently disables P2P discovery.
+    #[config(default = [])]
+    pub cluster_cidrs: Vec<String>,
 }
 
 macro_rules! impl_config_default {

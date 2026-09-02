@@ -3,7 +3,8 @@ use std::pin::Pin;
 
 use super::error::{Error, Result};
 use super::types::{
-    P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProviderHint, P2pEndpoint, P2pPublishRequest,
+    P2pArtifactDescriptor, P2pArtifactKey, P2pArtifactProviderHint, P2pEndpoint, P2pPublishOwner,
+    P2pPublishRequest,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -77,6 +78,28 @@ pub trait P2pTransport: Send + Sync {
     ///
     /// Returns `true` when a local publication was removed, `false` when no local artifact existed for the key.
     async fn unpublish(&self, key: &P2pArtifactKey) -> Result<bool>;
+
+    /// Release one owner's claim on a local artifact.
+    ///
+    /// The artifact is withdrawn once no owner still holds it; until then the
+    /// key stays advertised and its bytes stay retained. Returns `true` only
+    /// when this release was the one that withdrew it, so a caller cannot read
+    /// its own edge as having reclaimed space another publisher still needs.
+    ///
+    /// The default treats every publication as unscoped, which is correct for
+    /// a transport that does not track owners at all.
+    async fn unpublish_owned(&self, key: &P2pArtifactKey, owner: P2pPublishOwner) -> Result<bool> {
+        let _ = owner;
+        self.unpublish(key).await
+    }
+
+    /// Ask the transport to sweep unreferenced artifact bytes when it next can.
+    ///
+    /// Collection is gated rather than continuous, so it needs an event to arm
+    /// it. The image cache's own maintenance pass is the one moment the P2P
+    /// store's retention is most likely to have just gone stale, which is why
+    /// that pass reaches through here.
+    async fn request_gc(&self) {}
 
     /// Return the local endpoint if this transport exposes one.
     fn local_endpoint(&self) -> Option<P2pEndpoint> {

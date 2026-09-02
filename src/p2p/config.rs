@@ -31,6 +31,14 @@ pub(crate) struct ResolvedP2pConfig {
     pub peer_discovery_refresh_interval: Duration,
     /// How often this node re-announces its published artifacts.
     pub reannounce_interval: Duration,
+    /// How long an idle pooled catalog connection is kept.
+    pub catalog_connection_idle: Duration,
+    /// Peers the catalog pool may hold connections to; zero disables pooling.
+    pub catalog_max_connections: usize,
+    /// Per-peer bound on one catalog lookup.
+    pub catalog_lookup_timeout: Duration,
+    /// CIDRs a peer endpoint address may name; empty accepts any address.
+    pub cluster_cidrs: Vec<String>,
 }
 
 impl ResolvedP2pConfig {
@@ -54,6 +62,10 @@ impl ResolvedP2pConfig {
                 p2p.peer_discovery_refresh_interval_secs,
             )
             .max(Duration::from_secs(1)),
+            catalog_connection_idle: Duration::from_secs(p2p.catalog_connection_idle_secs),
+            catalog_max_connections: p2p.catalog_max_connections,
+            catalog_lookup_timeout: Duration::from_millis(p2p.catalog_lookup_timeout_ms),
+            cluster_cidrs: p2p.cluster_cidrs.clone(),
         }
     }
 }

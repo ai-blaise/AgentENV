@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 use std::sync::{Arc, Weak};
 
@@ -10,14 +10,21 @@ use tokio::sync::RwLock;
 
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::p2p::error::Result;
-use crate::p2p::types::{P2pArtifactDescriptor, P2pArtifactKey, P2pEndpoint, P2pPeer};
+use crate::p2p::types::{
+    P2pArtifactDescriptor, P2pArtifactKey, P2pEndpoint, P2pPeer, P2pPublishOwner,
+};
 
 pub(super) const CATALOG_ALPN: &[u8] = b"/agentenv/artifact-catalog/v1";
 pub(super) const MAX_CATALOG_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CATALOG_REQUEST_BYTES: usize = 1024 * 1024;
-/// Time to wait for the client to close the connection after we finish
-/// sending. Prevents a slow or misbehaving peer from holding a handler task open.
-const CONNECTION_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Prefix under which the owner set of a key is stored, in the same database
+/// as the descriptors.
+///
+/// Artifact keys are printable and namespace-prefixed, so a leading NUL cannot
+/// collide with one; an entry that does not start with it is a descriptor,
+/// which is also what makes a catalog written before ownership existed load
+/// unchanged.
+const OWNERS_KEY_PREFIX: &[u8] = b"\x00owners\x00";
 
 #[cfg(not(test))]
 const DB_DURABILITY: LocalStoreDurability = LocalStoreDurability::Wal;
@@ -37,8 +44,25 @@ pub(crate) struct CatalogResponse {
 #[derive(Debug, Clone)]
 pub(crate) struct PublishedArtifactCatalog {
     inner: Arc<RwLock<HashMap<P2pArtifactKey, P2pArtifactDescriptor>>>,
+    /// Publishers still holding each advertised key.
+    ///
+    /// Kept beside the descriptors rather than inside them because a
+    /// descriptor is what goes out on the wire, and who locally retains an
+    /// artifact is nobody else's business.
+    owners: Arc<RwLock<HashMap<P2pArtifactKey, BTreeSet<P2pPublishOwner>>>>,
     store: LocalKvStore,
     local_provider: P2pPeer,
+}
+
+/// What releasing one owner did to an artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnerRelease {
+    /// The last owner released it; the caller must now withdraw the artifact.
+    Withdrawn,
+    /// At least one other owner still holds it.
+    Retained,
+    /// Nothing was advertised under this key.
+    Absent,
 }
 
 impl PublishedArtifactCatalog {
@@ -51,17 +75,40 @@ impl PublishedArtifactCatalog {
             .await
             .with_context(|| format!("open P2P catalog {}", db_path.display()))?;
 
-        let loaded = store
-            .fold(HashMap::new(), |loaded, key, bytes| {
-                let descriptor: P2pArtifactDescriptor = serde_json::from_slice(&bytes)
-                    .with_context(|| {
-                        format!("parse P2P catalog entry {}", String::from_utf8_lossy(&key))
-                    })?;
-                loaded.insert(descriptor.key.clone(), descriptor);
-                Ok(())
-            })
+        let (loaded, mut owners) = store
+            .fold(
+                (HashMap::new(), HashMap::new()),
+                |(descriptors, owners), key, bytes| {
+                    if let Some(artifact_key) = key.strip_prefix(OWNERS_KEY_PREFIX) {
+                        let artifact_key = String::from_utf8(artifact_key.to_vec())
+                            .context("parse P2P catalog owner key")?;
+                        let held: BTreeSet<P2pPublishOwner> = serde_json::from_slice(&bytes)
+                            .with_context(|| {
+                                format!("parse P2P catalog owner set {artifact_key}")
+                            })?;
+                        owners.insert(artifact_key, held);
+                        return Ok(());
+                    }
+                    let descriptor: P2pArtifactDescriptor = serde_json::from_slice(&bytes)
+                        .with_context(|| {
+                            format!("parse P2P catalog entry {}", String::from_utf8_lossy(&key))
+                        })?;
+                    descriptors.insert(descriptor.key.clone(), descriptor);
+                    Ok(())
+                },
+            )
             .await
             .with_context(|| format!("scan P2P catalog {}", db_path.display()))?;
+
+        // A descriptor with no owner record was written before ownership
+        // existed, or by a publisher that never named itself. Either way it has
+        // exactly one claim on the artifact, which is what unscoped means.
+        for key in loaded.keys() {
+            owners
+                .entry(key.clone())
+                .or_insert_with(|| BTreeSet::from([P2pPublishOwner::Unscoped]));
+        }
+        owners.retain(|key, held| loaded.contains_key(key) && !held.is_empty());
 
         tracing::debug!(
             catalog = %db_path.display(),
@@ -70,6 +117,7 @@ impl PublishedArtifactCatalog {
         );
         Ok(Self {
             inner: Arc::new(RwLock::new(loaded)),
+            owners: Arc::new(RwLock::new(owners)),
             store,
             local_provider: P2pPeer {
                 node_id: node_id.to_string(),
@@ -120,9 +168,75 @@ impl PublishedArtifactCatalog {
             .delete(key.as_bytes())
             .await
             .with_context(|| format!("delete P2P catalog entry {key}"))?;
+        self.store
+            .delete(owners_store_key(key))
+            .await
+            .with_context(|| format!("delete P2P catalog owner set {key}"))?;
+        self.owners.write().await.remove(key);
         let removed = self.inner.write().await.remove(key);
         Ok(removed)
     }
+
+    /// Record that `owner` is advertising `key`.
+    pub(crate) async fn add_owner(
+        &self,
+        key: &P2pArtifactKey,
+        owner: P2pPublishOwner,
+    ) -> Result<()> {
+        let mut owners = self.owners.write().await;
+        let held = owners.entry(key.clone()).or_default();
+        if !held.insert(owner) {
+            return Ok(());
+        }
+        let bytes = serde_json::to_vec(held).context("serialize P2P catalog owner set")?;
+        // Written under the same lock as the in-memory set so a concurrent
+        // release cannot persist a set that has already been superseded.
+        self.store
+            .put(owners_store_key(key), bytes)
+            .await
+            .with_context(|| format!("persist P2P catalog owner set {key}"))?;
+        Ok(())
+    }
+
+    /// Drop `owner`'s claim on `key`, reporting whether anyone still holds it.
+    pub(crate) async fn release_owner(
+        &self,
+        key: &P2pArtifactKey,
+        owner: P2pPublishOwner,
+    ) -> Result<OwnerRelease> {
+        let mut owners = self.owners.write().await;
+        let Some(held) = owners.get_mut(key) else {
+            return Ok(OwnerRelease::Absent);
+        };
+        held.remove(&owner);
+        if held.is_empty() {
+            owners.remove(key);
+            return Ok(OwnerRelease::Withdrawn);
+        }
+        let bytes = serde_json::to_vec(held).context("serialize P2P catalog owner set")?;
+        self.store
+            .put(owners_store_key(key), bytes)
+            .await
+            .with_context(|| format!("persist P2P catalog owner set {key}"))?;
+        Ok(OwnerRelease::Retained)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn owners_of(&self, key: &P2pArtifactKey) -> BTreeSet<P2pPublishOwner> {
+        self.owners
+            .read()
+            .await
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+fn owners_store_key(key: &P2pArtifactKey) -> Vec<u8> {
+    let mut store_key = Vec::with_capacity(OWNERS_KEY_PREFIX.len() + key.len());
+    store_key.extend_from_slice(OWNERS_KEY_PREFIX);
+    store_key.extend_from_slice(key.as_bytes());
+    store_key
 }
 
 #[derive(Debug, Clone)]
@@ -147,25 +261,44 @@ impl CatalogProtocol {
 }
 
 impl ProtocolHandler for CatalogProtocol {
+    /// Serves lookups until the peer closes the connection.
+    ///
+    /// This used to answer exactly one stream and then wait out a five-second
+    /// close timeout. Clients now hold catalog connections in a pool and ask
+    /// many questions over one of them, and the second question on a reused
+    /// connection would open a stream nobody was left to accept.
+    ///
+    /// Requests are served one at a time. A lookup is a map read and a small
+    /// write, so pipelining them would buy nothing and would let one peer fan
+    /// out unbounded work on this node.
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
-        let (mut send, mut recv) = connection.accept_bi().await?;
-        let request_bytes = recv
-            .read_to_end(MAX_CATALOG_REQUEST_BYTES)
-            .await
-            .map_err(AcceptError::from_err)?;
-        let request: CatalogRequest =
-            serde_json::from_slice(&request_bytes).map_err(AcceptError::from_err)?;
-        let descriptor = self.descriptor_for_response(&request.key).await;
-        let found = descriptor.is_some();
-        let response = CatalogResponse { descriptor };
-        let response_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
-        send.write_all(&response_bytes)
-            .await
-            .map_err(AcceptError::from_err)?;
-        send.finish()?;
-        tracing::trace!(key = %request.key, found, "served P2P catalog request");
-        let _ = tokio::time::timeout(CONNECTION_CLOSE_TIMEOUT, connection.closed()).await;
-        Ok(())
+        loop {
+            let (mut send, mut recv) = match connection.accept_bi().await {
+                Ok(streams) => streams,
+                // Every way a connection ends arrives here, including the
+                // ordinary one where the peer is simply done with it, so this
+                // is the end of the handler rather than a failure to report.
+                Err(err) => {
+                    tracing::trace!(error = %err, "P2P catalog connection closed");
+                    return Ok(());
+                }
+            };
+            let request_bytes = recv
+                .read_to_end(MAX_CATALOG_REQUEST_BYTES)
+                .await
+                .map_err(AcceptError::from_err)?;
+            let request: CatalogRequest =
+                serde_json::from_slice(&request_bytes).map_err(AcceptError::from_err)?;
+            let descriptor = self.descriptor_for_response(&request.key).await;
+            let found = descriptor.is_some();
+            let response = CatalogResponse { descriptor };
+            let response_bytes = serde_json::to_vec(&response).map_err(AcceptError::from_err)?;
+            send.write_all(&response_bytes)
+                .await
+                .map_err(AcceptError::from_err)?;
+            send.finish()?;
+            tracing::trace!(key = %request.key, found, "served P2P catalog request");
+        }
     }
 }
 

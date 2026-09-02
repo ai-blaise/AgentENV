@@ -126,6 +126,24 @@ lookup_timeout_ms = 5000
 fetch_timeout_ms = 30000
 # Seconds between scheduler peer-list refreshes; values below 1 clamp to 1.
 peer_discovery_refresh_interval_secs = 5
+# How long an idle catalog connection to a peer is kept open, in seconds.
+# Must exceed peer_discovery_refresh_interval_secs, or the connection is torn
+# down between reads of the same layer and every lookup re-pays a handshake.
+catalog_connection_idle_secs = 60
+# Peers the catalog connection pool may hold connections to at once.
+# Set to 0 to disable pooling and dial per lookup; that is the escape hatch for
+# a cluster where some nodes still serve one catalog stream per connection.
+catalog_max_connections = 1024
+# Per-peer catalog lookup timeout in milliseconds. lookup_timeout_ms bounds a
+# whole multi-peer lookup; this bounds one peer, so several candidates fit
+# inside a caller's budget.
+catalog_lookup_timeout_ms = 100
+# CIDRs a peer's advertised endpoint address may name. Empty accepts any
+# address. The transport runs on presets::Minimal with no relay and no NAT
+# traversal, so it already assumes a flat L3 network with direct reachability
+# between nodes; naming that network here also stops a compromised node from
+# steering its peers' dials at an address outside it.
+cluster_cidrs = []
 
 [custom_extension]
 # HTTP base URL for sandbox lifecycle hooks. Leave unset to disable the

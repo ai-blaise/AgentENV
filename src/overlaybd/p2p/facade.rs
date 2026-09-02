@@ -20,18 +20,24 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::digest;
+use crate::p2p::metrics::{self as p2p_metrics, FacadeDescriptorSource, FacadeOutcome, FacadePath};
 use crate::p2p::{
-    P2pArtifactDescriptor, P2pArtifactKey, P2pPublishMode, P2pPublishRequest, P2pTransport,
+    P2pArtifactKey, P2pPublishMode, P2pPublishOwner, P2pPublishRequest, P2pTransport,
 };
 
 use super::artifact::{layer_artifact_key, CanonicalBlobIdentity, LayerMetadata, SHA256_HEX_LEN};
-use super::cache::DescriptorCache;
+use super::cache::{DescriptorCache, OriginIdentity, OriginKeyCache, ResolvedLayer};
 
 const DEFAULT_LOOKUP_TIMEOUT: Duration = Duration::from_millis(300);
 const DEFAULT_FETCH_RANGE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_DESCRIPTOR_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_DESCRIPTOR_MISS_CACHE_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_DESCRIPTOR_CACHE_MAX_ENTRIES: usize = 16 * 1024;
+/// Origin URLs whose derived identity is remembered.
+///
+/// One entry per distinct layer URL the node is reading, so the bound only has
+/// to cover the layers of the images open at once, not their blocks.
+const DEFAULT_ORIGIN_KEY_CACHE_MAX_ENTRIES: usize = 4 * 1024;
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const ADDRESS_PREFIX: &str = "/p2p-http";
 const UUID_ADDRESS_PREFIX: &str = "/p2p-uuid";
@@ -45,6 +51,15 @@ pub struct P2pHttpFacadeConfig {
     pub descriptor_miss_cache_ttl: Duration,
     pub descriptor_cache_max_entries: usize,
     pub allowed_publish_roots: Vec<PathBuf>,
+    /// The subset of `allowed_publish_roots` whose files the image cache keeps
+    /// alive for as long as they are advertised.
+    ///
+    /// Publication by reference hands the transport a path it reads from
+    /// later, which is only safe where something guarantees the file outlives
+    /// the advertisement. Anything else — a background-download cache, say,
+    /// whose entries are evicted by `remove_dir_all` — has to be copied into
+    /// the transport's own store instead.
+    pub commit_store_roots: Vec<PathBuf>,
 }
 
 impl Default for P2pHttpFacadeConfig {
@@ -56,6 +71,7 @@ impl Default for P2pHttpFacadeConfig {
             descriptor_miss_cache_ttl: DEFAULT_DESCRIPTOR_MISS_CACHE_TTL,
             descriptor_cache_max_entries: DEFAULT_DESCRIPTOR_CACHE_MAX_ENTRIES,
             allowed_publish_roots: Vec::new(),
+            commit_store_roots: Vec::new(),
         }
     }
 }
@@ -134,7 +150,9 @@ struct P2pHttpFacadeState {
     lookup_timeout: Duration,
     fetch_range_timeout: Duration,
     descriptor_cache: DescriptorCache,
+    origin_keys: OriginKeyCache,
     allowed_publish_roots: Arc<Vec<PathBuf>>,
+    commit_store_roots: Arc<Vec<PathBuf>>,
 }
 
 struct P2pHttpFacadeServer;
@@ -155,6 +173,7 @@ impl P2pHttpFacadeServer {
         let publish_address = format!("http://{addr}{PUBLISH_LAYER_PATH}");
         let allowed_publish_roots =
             canonicalize_publish_roots(config.allowed_publish_roots).await?;
+        let commit_store_roots = canonicalize_publish_roots(config.commit_store_roots).await?;
         let state = P2pHttpFacadeState {
             transport,
             client: Client::new(),
@@ -165,7 +184,9 @@ impl P2pHttpFacadeServer {
                 config.descriptor_miss_cache_ttl,
                 config.descriptor_cache_max_entries,
             ),
+            origin_keys: OriginKeyCache::new(DEFAULT_ORIGIN_KEY_CACHE_MAX_ENTRIES),
             allowed_publish_roots: Arc::new(allowed_publish_roots),
+            commit_store_roots: Arc::new(commit_store_roots),
         };
         let app = Router::new()
             .route(
@@ -226,7 +247,8 @@ async fn handle_http_facade(
     State(state): State<P2pHttpFacadeState>,
     request: Request,
 ) -> Response<Body> {
-    match handle_http_facade_result(state, request).await {
+    let mut timing = FacadeRequestTiming::new(FacadePath::Http);
+    match handle_http_facade_result(state, request, &mut timing).await {
         Ok(response) => response,
         Err(err) => err.into_response(),
     }
@@ -237,30 +259,74 @@ async fn handle_uuid_facade(
     axum::extract::Path(uuid): axum::extract::Path<String>,
     request: Request,
 ) -> Response<Body> {
-    match handle_uuid_facade_result(state, uuid, request).await {
+    let mut timing = FacadeRequestTiming::new(FacadePath::Uuid);
+    match handle_uuid_facade_result(state, uuid, request, &mut timing).await {
         Ok(response) => response,
         Err(err) => err.into_response(),
+    }
+}
+
+/// Records how a facade request was served, on the way out.
+///
+/// The interesting label is `outcome`: a P2P miss is a fallback to the origin
+/// and must read as ordinary traffic, not as an error. Nothing in the existing
+/// instrumentation could tell those apart, so "P2P failure is invisible" was
+/// an assertion rather than a measurement.
+///
+/// The duration ends when the response headers are committed, not when the
+/// body finishes: both sources stream, and what this exists to measure is the
+/// resolution work in front of the stream rather than the transfer itself.
+struct FacadeRequestTiming {
+    path: FacadePath,
+    start: std::time::Instant,
+    outcome: FacadeOutcome,
+    descriptor: FacadeDescriptorSource,
+}
+
+impl FacadeRequestTiming {
+    fn new(path: FacadePath) -> Self {
+        Self {
+            path,
+            start: std::time::Instant::now(),
+            // Overwritten by whichever arm actually serves the request; a
+            // request that returns before then failed before choosing a source.
+            outcome: FacadeOutcome::Error,
+            descriptor: FacadeDescriptorSource::Unresolved,
+        }
+    }
+}
+
+impl Drop for FacadeRequestTiming {
+    fn drop(&mut self) {
+        p2p_metrics::record_facade_request(
+            self.path,
+            self.outcome,
+            self.descriptor,
+            self.start.elapsed(),
+        );
     }
 }
 
 async fn handle_http_facade_result(
     state: P2pHttpFacadeState,
     request: Request,
+    timing: &mut FacadeRequestTiming,
 ) -> std::result::Result<Response<Body>, HttpFacadeError> {
     reject_conditional_headers(request.headers())?;
 
-    let origin_url = reconstruct_origin_url(request.uri())
+    let (origin_path, origin_url) = split_origin_url(request.uri())
         .map_err(|err| HttpFacadeError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
-    validate_origin_url(&origin_url)?;
     let request_range = parse_single_range(request.headers())?;
     let len = request_range.len()?;
-    let canonical = CanonicalBlobIdentity::from_origin_url(&origin_url)
-        .map_err(|err| HttpFacadeError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
-    let artifact_key = layer_artifact_key(&canonical);
+    let identity = resolve_origin_identity(&state, &origin_path)?;
 
-    if let Some(descriptor) = lookup_descriptor(&state, &artifact_key, &canonical).await {
-        match fetch_p2p_range(&state, &descriptor, &canonical, &request_range, len).await {
+    let (layer, descriptor_source) =
+        lookup_descriptor(&state, &identity.key, &identity.canonical).await;
+    timing.descriptor = descriptor_source;
+    if let Some(layer) = layer {
+        match fetch_p2p_range(&state, &layer, &request_range, len).await {
             Ok(range_body) => {
+                timing.outcome = FacadeOutcome::P2p;
                 return build_range_body_response(
                     &request_range,
                     range_body.response_len,
@@ -270,7 +336,7 @@ async fn handle_http_facade_result(
             }
             Err(err) => {
                 warn!(
-                    key = %artifact_key,
+                    key = %identity.key,
                     origin_url = %origin_url,
                     error = ?err,
                     "p2p layer range fetch failed; falling back to origin"
@@ -290,6 +356,7 @@ async fn handle_http_facade_result(
         warn!(origin_url = %origin_url, error = ?err, "origin range fetch failed");
         HttpFacadeError::new(StatusCode::BAD_GATEWAY, "failed to fetch origin range")
     })?;
+    timing.outcome = FacadeOutcome::Origin;
     build_range_body_response(
         &request_range,
         origin.response_len,
@@ -298,10 +365,37 @@ async fn handle_http_facade_result(
     )
 }
 
+/// Derives the artifact identity of an origin URL, remembering the answer.
+///
+/// The derivation is a pure function of the URL path — the presigned query is
+/// deliberately excluded from the canonical identity — so it is memoised on the
+/// path. Validation runs before an entry is stored, which is what lets a later
+/// hit skip it: the same path always yields the same scheme.
+fn resolve_origin_identity(
+    state: &P2pHttpFacadeState,
+    origin_path: &str,
+) -> std::result::Result<OriginIdentity, HttpFacadeError> {
+    if let Some(identity) = state.origin_keys.get(origin_path) {
+        return Ok(identity);
+    }
+    validate_origin_url(origin_path)?;
+    let canonical = CanonicalBlobIdentity::from_origin_url(origin_path)
+        .map_err(|err| HttpFacadeError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
+    let identity = OriginIdentity {
+        key: layer_artifact_key(&canonical),
+        canonical,
+    };
+    state
+        .origin_keys
+        .insert(origin_path.to_string(), identity.clone());
+    Ok(identity)
+}
+
 async fn handle_uuid_facade_result(
     state: P2pHttpFacadeState,
     uuid: String,
     request: Request,
+    timing: &mut FacadeRequestTiming,
 ) -> std::result::Result<Response<Body>, HttpFacadeError> {
     reject_conditional_headers(request.headers())?;
     let request_range = parse_single_range(request.headers())?;
@@ -310,14 +404,16 @@ async fn handle_uuid_facade_result(
         .map_err(|err| HttpFacadeError::new(StatusCode::BAD_REQUEST, err.to_string()))?;
     let canonical = CanonicalBlobIdentity::from_uuid(&uuid);
     let artifact_key = layer_artifact_key(&canonical);
-    let Some(descriptor) = lookup_descriptor(&state, &artifact_key, &canonical).await else {
+    let (layer, descriptor_source) = lookup_descriptor(&state, &artifact_key, &canonical).await;
+    timing.descriptor = descriptor_source;
+    let Some(layer) = layer else {
         return Err(HttpFacadeError::new(
             StatusCode::NOT_FOUND,
             format!("p2p uuid layer {uuid} was not found"),
         ));
     };
 
-    let range_body = fetch_p2p_range(&state, &descriptor, &canonical, &request_range, len)
+    let range_body = fetch_p2p_range(&state, &layer, &request_range, len)
         .await
         .map_err(|err| {
             warn!(
@@ -331,6 +427,7 @@ async fn handle_uuid_facade_result(
                 "failed to fetch p2p uuid layer range",
             )
         })?;
+    timing.outcome = FacadeOutcome::P2p;
     build_range_body_response(
         &request_range,
         range_body.response_len,
@@ -339,13 +436,28 @@ async fn handle_uuid_facade_result(
     )
 }
 
+/// True for keys in a namespace no publisher can ever write.
+///
+/// An origin URL with no `sha256:` in its path derives an
+/// `overlaybd-layer/v1/url/<hash>` key, and every publisher emits either a
+/// digest key or a uuid key. Such a lookup is a guaranteed permanent miss that
+/// still costs a full lookup budget, once per block read, for the life of the
+/// device.
+fn is_unpublishable_key(canonical: &CanonicalBlobIdentity) -> bool {
+    canonical.digest.is_none() && !canonical.key.starts_with("uuid/")
+}
+
 async fn lookup_descriptor(
     state: &P2pHttpFacadeState,
     artifact_key: &P2pArtifactKey,
     canonical: &CanonicalBlobIdentity,
-) -> Option<P2pArtifactDescriptor> {
+) -> (Option<ResolvedLayer>, FacadeDescriptorSource) {
+    if is_unpublishable_key(canonical) {
+        debug!(key = %artifact_key, "p2p key namespace has no publisher; skipping lookup");
+        return (None, FacadeDescriptorSource::ShortCircuit);
+    }
     if let Some(cached) = state.descriptor_cache.get(artifact_key) {
-        return cached;
+        return (cached, FacadeDescriptorSource::Cached);
     }
     let descriptor = match tokio::time::timeout(
         state.lookup_timeout,
@@ -373,39 +485,51 @@ async fn lookup_descriptor(
                 "p2p lookup timed out; caching as a short miss"
             );
             state.descriptor_cache.insert(artifact_key.clone(), None);
-            return None;
+            return (None, FacadeDescriptorSource::Resolved);
         }
     };
-    let should_cache = descriptor.as_ref().is_none_or(|descriptor| {
-        LayerMetadata::from_descriptor(descriptor)
-            .and_then(|metadata| metadata.validate(canonical))
-            .is_ok()
-    });
-    if !should_cache {
-        debug!(key = %artifact_key, "p2p descriptor failed static metadata validation; not caching");
-        return descriptor;
-    }
+
+    let Some(descriptor) = descriptor else {
+        state.descriptor_cache.insert(artifact_key.clone(), None);
+        return (None, FacadeDescriptorSource::Resolved);
+    };
+    // Parse and check the metadata once, here, and cache the result. Both used
+    // to happen again on every range request against the cached descriptor.
+    let layer = match LayerMetadata::from_descriptor(&descriptor)
+        .and_then(|metadata| metadata.validate(canonical).map(|()| metadata))
+    {
+        Ok(metadata) => ResolvedLayer {
+            descriptor,
+            metadata,
+        },
+        Err(err) => {
+            debug!(
+                key = %artifact_key,
+                error = %err,
+                "p2p descriptor failed static metadata validation; not caching"
+            );
+            return (None, FacadeDescriptorSource::Resolved);
+        }
+    };
     state
         .descriptor_cache
-        .insert(artifact_key.clone(), descriptor.clone());
-    descriptor
+        .insert(artifact_key.clone(), Some(layer.clone()));
+    (Some(layer), FacadeDescriptorSource::Resolved)
 }
 
 async fn fetch_p2p_range(
     state: &P2pHttpFacadeState,
-    descriptor: &P2pArtifactDescriptor,
-    canonical: &CanonicalBlobIdentity,
+    layer: &ResolvedLayer,
     request_range: &RequestRange,
     len: usize,
 ) -> Result<RangeBody> {
-    let metadata = LayerMetadata::from_descriptor(descriptor)?;
-    metadata.validate(canonical)?;
+    let metadata = &layer.metadata;
     let fetch_len = p2p_fetch_len(request_range, len, metadata.size())?;
     let bytes = tokio::time::timeout(
         state.fetch_range_timeout,
         state
             .transport
-            .fetch_byte_range(descriptor, request_range.start, fetch_len),
+            .fetch_byte_range(&layer.descriptor, request_range.start, fetch_len),
     )
     .await
     .map_err(|_| {
@@ -622,9 +746,22 @@ async fn handle_publish_layer_result(
         .as_deref()
         .map(|source_url| digest::sha256_hex(source_url.as_bytes()));
     let layer_metadata = LayerMetadata::from_digest(digest, Some(request.size), source_url_hash);
+    // Reference mode leaves the bytes where they are and hands the transport
+    // the path, which is only safe under a root whose files outlive the
+    // advertisement. The commit store is such a root: its entries are held by
+    // the image cache's own GC. Anything else is copied, because a root that
+    // evicts — a background-download cache clears its entries with
+    // `remove_dir_all` — would leave peers resolving a descriptor pointing at
+    // nothing.
+    let (publish_mode, owner) = if path_is_under(&source, &state.commit_store_roots) {
+        (P2pPublishMode::Reference, P2pPublishOwner::ImageCache)
+    } else {
+        (P2pPublishMode::Copy, P2pPublishOwner::Facade)
+    };
     let publish = P2pPublishRequest::file(key.clone(), source)
         .with_metadata(layer_metadata.to_value())
-        .with_publish_mode(P2pPublishMode::Reference);
+        .with_publish_mode(publish_mode)
+        .with_owner(owner);
     state.transport.publish(&publish).await.map_err(|err| {
         HttpFacadeError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -649,13 +786,17 @@ fn validate_publish_path(
             "no publish roots are configured",
         ));
     }
-    if allowed_roots.iter().any(|root| path.starts_with(root)) {
+    if path_is_under(path, allowed_roots) {
         return Ok(());
     }
     Err(HttpFacadeError::new(
         StatusCode::FORBIDDEN,
         "publish path is outside allowed roots",
     ))
+}
+
+fn path_is_under(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
 }
 
 fn forwarded_headers(headers: &HeaderMap) -> Vec<(HeaderName, HeaderValue)> {
@@ -677,7 +818,12 @@ fn reject_conditional_headers(headers: &HeaderMap) -> std::result::Result<(), Ht
     Ok(())
 }
 
-fn reconstruct_origin_url(uri: &axum::http::Uri) -> Result<String> {
+/// Splits the routed request into the origin URL's path and the full URL.
+///
+/// The path alone is the cache key and the input to identity derivation: a
+/// presigned query changes on every request and deliberately takes no part in
+/// either. The full URL is what an origin fallback actually fetches.
+fn split_origin_url(uri: &axum::http::Uri) -> Result<(String, String)> {
     let path_and_query = uri
         .path_and_query()
         .ok_or_else(|| anyhow!("request URI missing path"))?
@@ -692,11 +838,11 @@ fn reconstruct_origin_url(uri: &axum::http::Uri) -> Result<String> {
     if origin.is_empty() {
         bail!("missing origin url");
     }
-    if let Some(query) = uri.query() {
-        Ok(format!("{origin}?{query}"))
-    } else {
-        Ok(origin.to_string())
-    }
+    let full = match uri.query() {
+        Some(query) => format!("{origin}?{query}"),
+        None => origin.to_string(),
+    };
+    Ok((origin.to_string(), full))
 }
 
 /// HTTP byte range with an inclusive end offset.
@@ -876,7 +1022,7 @@ impl HttpFacadeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::p2p::{mock::MockTransport, P2pArtifactProvider};
+    use crate::p2p::{mock::MockTransport, P2pArtifactDescriptor, P2pArtifactProvider};
     use axum::extract::State as AxumState;
     use axum::http::HeaderMap as AxumHeaderMap;
     use axum::routing::get;
@@ -951,6 +1097,7 @@ mod tests {
                 descriptor_cache_ttl: Duration::from_secs(60),
                 descriptor_miss_cache_ttl: Duration::from_secs(60),
                 descriptor_cache_max_entries: DEFAULT_DESCRIPTOR_CACHE_MAX_ENTRIES,
+                commit_store_roots: allowed_publish_roots.clone(),
                 allowed_publish_roots,
             },
         )
@@ -1008,8 +1155,10 @@ mod tests {
         let uri = "/p2p-http/https://s3.example.com/bucket/a%2Fb?X-Amz-Signature=abc"
             .parse()
             .unwrap();
+        let (path, full) = split_origin_url(&uri).unwrap();
+        assert_eq!(path, "https://s3.example.com/bucket/a%2Fb");
         assert_eq!(
-            reconstruct_origin_url(&uri).unwrap(),
+            full,
             "https://s3.example.com/bucket/a%2Fb?X-Amz-Signature=abc"
         );
     }
@@ -1252,6 +1401,7 @@ mod tests {
                 descriptor_miss_cache_ttl: Duration::from_millis(10),
                 descriptor_cache_max_entries: DEFAULT_DESCRIPTOR_CACHE_MAX_ENTRIES,
                 allowed_publish_roots: Vec::new(),
+                commit_store_roots: Vec::new(),
             },
         )
         .await;
@@ -1323,6 +1473,7 @@ mod tests {
                 descriptor_miss_cache_ttl: Duration::from_secs(60),
                 descriptor_cache_max_entries: DEFAULT_DESCRIPTOR_CACHE_MAX_ENTRIES,
                 allowed_publish_roots: Vec::new(),
+                commit_store_roots: Vec::new(),
             },
         )
         .await;
@@ -1386,6 +1537,7 @@ mod tests {
                 descriptor_miss_cache_ttl: Duration::from_secs(60),
                 descriptor_cache_max_entries: DEFAULT_DESCRIPTOR_CACHE_MAX_ENTRIES,
                 allowed_publish_roots: Vec::new(),
+                commit_store_roots: Vec::new(),
             },
         )
         .await;
@@ -1449,6 +1601,330 @@ mod tests {
         let key = layer_artifact_key(&CanonicalBlobIdentity::from_digest(&digest));
         assert!(transport.descriptors.read().await.contains_key(&key));
         facade.shutdown().await.unwrap();
+    }
+
+    /// Publishing by reference hands the transport a path it reads from later,
+    /// which only holds where something guarantees the file outlives the
+    /// advertisement. The commit store does; an evictable cache would not, so
+    /// a root outside the commit store has to be copied instead.
+    #[tokio::test]
+    async fn a_publish_root_outside_the_commit_store_is_copied_not_referenced() {
+        let commit_store = tempfile::tempdir().expect("commit store");
+        let evictable = tempfile::tempdir().expect("evictable cache");
+        let layer_path = evictable.path().join("data");
+        let blob = b"downloaded layer bytes".to_vec();
+        tokio::fs::write(&layer_path, &blob).await.unwrap();
+        let digest = digest::sha256_digest(&blob);
+        let transport = Arc::new(MockTransport::default());
+        let facade = start_test_facade_with_config(
+            transport.clone(),
+            P2pHttpFacadeConfig {
+                lookup_timeout: DEFAULT_LOOKUP_TIMEOUT,
+                fetch_range_timeout: DEFAULT_FETCH_RANGE_TIMEOUT,
+                descriptor_cache_ttl: Duration::from_secs(60),
+                descriptor_miss_cache_ttl: Duration::from_secs(60),
+                descriptor_cache_max_entries: DEFAULT_DESCRIPTOR_CACHE_MAX_ENTRIES,
+                allowed_publish_roots: vec![
+                    commit_store.path().to_path_buf(),
+                    evictable.path().to_path_buf(),
+                ],
+                commit_store_roots: vec![commit_store.path().to_path_buf()],
+            },
+        )
+        .await;
+
+        let resp = Client::new()
+            .post(facade.publish_address())
+            .json(&PublishLayerRequest {
+                path: layer_path,
+                digest,
+                size: blob.len() as u64,
+                source_url: None,
+            })
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let published = transport.published.read().await;
+        let request = published.first().expect("one publish");
+        assert_eq!(
+            request.publish_mode,
+            P2pPublishMode::Copy,
+            "a root the image cache does not keep alive must be copied"
+        );
+        assert_eq!(request.owner, P2pPublishOwner::Facade);
+        drop(published);
+        facade.shutdown().await.unwrap();
+    }
+
+    /// A commit-store layer is the case reference mode exists for, and it must
+    /// be attributed to the image cache so the cache's own delete withdraws it.
+    #[tokio::test]
+    async fn a_commit_store_layer_is_published_by_reference_for_the_image_cache() {
+        let commit_store = tempfile::tempdir().expect("commit store");
+        let layer_path = commit_store.path().join("overlaybd.commit");
+        let blob = b"commit store layer".to_vec();
+        tokio::fs::write(&layer_path, &blob).await.unwrap();
+        let transport = Arc::new(MockTransport::default());
+        let facade =
+            start_test_facade(transport.clone(), vec![commit_store.path().to_path_buf()]).await;
+
+        let resp = Client::new()
+            .post(facade.publish_address())
+            .json(&PublishLayerRequest {
+                path: layer_path,
+                digest: digest::sha256_digest(&blob),
+                size: blob.len() as u64,
+                source_url: None,
+            })
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let published = transport.published.read().await;
+        let request = published.first().expect("one publish");
+        assert_eq!(request.publish_mode, P2pPublishMode::Reference);
+        assert_eq!(request.owner, P2pPublishOwner::ImageCache);
+        drop(published);
+        facade.shutdown().await.unwrap();
+    }
+
+    /// An origin URL with no digest in its path derives a `url/` key, and no
+    /// publisher ever writes that namespace. Consulting the transport for it
+    /// is a guaranteed miss paid for once per block read.
+    #[tokio::test]
+    async fn a_url_namespace_key_never_reaches_the_transport() {
+        let blob: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (origin, origin_handle) = spawn_origin(OriginState {
+            blob: Arc::new(blob.clone()),
+            hits: hits.clone(),
+            force_200: false,
+        })
+        .await;
+        let transport = Arc::new(MockTransport::default());
+        let facade = start_test_facade(transport.clone(), Vec::new()).await;
+        let origin_url = format!("{origin}/signed/object/path?sig=one");
+
+        let resp = get_range(&format!("{}/{}", facade.address(), origin_url), 0, 63).await;
+
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.bytes().await.unwrap().as_ref(), &blob[0..64]);
+        assert_eq!(
+            transport.lookup_count.load(Ordering::Relaxed),
+            0,
+            "a key namespace with no publisher must not be looked up"
+        );
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        facade.shutdown().await.unwrap();
+        origin_handle.abort();
+    }
+
+    /// Proves the memo is consulted rather than merely populated.
+    ///
+    /// A memoised identity that nothing reads back is indistinguishable from
+    /// no memo at all, and the saving — two URL parses, a digest scan and a
+    /// key format, once per block read — is not visible in any other signal.
+    /// So the cache is seeded with an answer the derivation would never
+    /// produce, and the request has to come back with it.
+    #[tokio::test]
+    async fn a_memoised_origin_identity_is_used_instead_of_re_deriving() {
+        let transport = Arc::new(MockTransport::default());
+        let state = P2pHttpFacadeState {
+            transport,
+            client: Client::new(),
+            lookup_timeout: DEFAULT_LOOKUP_TIMEOUT,
+            fetch_range_timeout: DEFAULT_FETCH_RANGE_TIMEOUT,
+            descriptor_cache: DescriptorCache::new(
+                Duration::from_secs(60),
+                Duration::from_secs(60),
+                16,
+            ),
+            origin_keys: OriginKeyCache::new(16),
+            allowed_publish_roots: Arc::new(Vec::new()),
+            commit_store_roots: Arc::new(Vec::new()),
+        };
+        let origin_path = "https://example.com/v2/ns/repo/blobs/sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        state.origin_keys.insert(
+            origin_path.to_string(),
+            OriginIdentity {
+                canonical: CanonicalBlobIdentity::from_digest("sha256:memoised"),
+                key: "memoised-key".to_string(),
+            },
+        );
+
+        let identity = resolve_origin_identity(&state, origin_path).expect("identity");
+
+        assert_eq!(
+            identity.key, "memoised-key",
+            "the memo must be read back, not re-derived"
+        );
+    }
+
+    /// The presigned query changes on every request and deliberately takes no
+    /// part in the identity, so a second range on the same layer resolves the
+    /// same key and reuses the same descriptor.
+    #[tokio::test]
+    async fn repeat_ranges_reuse_the_derived_origin_identity() {
+        let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let digest = "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (origin, origin_handle) = spawn_origin(OriginState {
+            blob: Arc::new(blob.clone()),
+            hits: hits.clone(),
+            force_200: false,
+        })
+        .await;
+        let transport = Arc::new(MockTransport::default());
+        let facade = start_test_facade(transport.clone(), Vec::new()).await;
+        // A presigned query that changes between requests, which the canonical
+        // identity must ignore for the memo to hit at all.
+        let first_url = format!("{origin}/v2/ns/repo/blobs/{digest}?sig=one");
+        let second_url = format!("{origin}/v2/ns/repo/blobs/{digest}?sig=two");
+
+        get_range(&format!("{}/{}", facade.address(), first_url), 0, 63).await;
+        get_range(&format!("{}/{}", facade.address(), second_url), 64, 127).await;
+
+        assert_eq!(
+            transport.lookup_count.load(Ordering::Relaxed),
+            1,
+            "the second range must reuse the cached descriptor"
+        );
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
+        facade.shutdown().await.unwrap();
+        origin_handle.abort();
+    }
+
+    /// Captures the label sets a metric was recorded under, so a test can
+    /// assert what an operator would actually see. Installed per thread, which
+    /// is why the scenario below drives a current-thread runtime: every task it
+    /// spawns is then polled on the thread holding the recorder.
+    #[derive(Default, Clone)]
+    struct MetricSpy {
+        observed: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    struct SpyHistogram {
+        rendered: String,
+        observed: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl metrics::HistogramFn for SpyHistogram {
+        fn record(&self, _value: f64) {
+            self.observed.lock().unwrap().push(self.rendered.clone());
+        }
+    }
+
+    fn render_metric_key(key: &metrics::Key) -> String {
+        let mut labels: Vec<String> = key
+            .labels()
+            .map(|label| format!("{}={}", label.key(), label.value()))
+            .collect();
+        labels.sort();
+        format!("{} {}", key.name(), labels.join(" "))
+    }
+
+    impl metrics::Recorder for MetricSpy {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+        fn register_gauge(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            metrics::Gauge::noop()
+        }
+        fn register_histogram(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::from_arc(Arc::new(SpyHistogram {
+                rendered: render_metric_key(key),
+                observed: Arc::clone(&self.observed),
+            }))
+        }
+    }
+
+    /// Turning P2P on must not turn a peer that cannot answer into an error.
+    /// Nothing in the existing instrumentation could tell a peer hit from a
+    /// fallback to origin, so this property had to be argued rather than read.
+    #[test]
+    fn a_failing_peer_is_recorded_as_an_origin_fallback() {
+        let spy = MetricSpy::default();
+        let observed = Arc::clone(&spy.observed);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+
+        metrics::with_local_recorder(&spy, || {
+            runtime.block_on(async {
+                let blob: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+                let digest =
+                    "sha256:dededededededededededededededededededededededededededededededede";
+                let hits = Arc::new(AtomicUsize::new(0));
+                let (origin, origin_handle) = spawn_origin(OriginState {
+                    blob: Arc::new(blob.clone()),
+                    hits: hits.clone(),
+                    force_200: false,
+                })
+                .await;
+                let transport = Arc::new(MockTransport::default());
+                transport.fail_lookup.store(true, Ordering::Relaxed);
+                let facade = start_test_facade(transport.clone(), Vec::new()).await;
+                let origin_url = format!("{origin}/v2/ns/repo/blobs/{digest}?sig=one");
+
+                let resp = get_range(&format!("{}/{}", facade.address(), origin_url), 0, 63).await;
+
+                assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+                assert_eq!(resp.bytes().await.unwrap().as_ref(), &blob[0..64]);
+                assert_eq!(hits.load(Ordering::Relaxed), 1);
+                facade.shutdown().await.unwrap();
+                origin_handle.abort();
+            })
+        });
+
+        let observed = observed.lock().unwrap();
+        assert!(
+            observed.iter().any(|rendered| rendered
+                == "agentenv_p2p_facade_request_duration_seconds descriptor=resolved outcome=origin path=http"),
+            "a peer that cannot answer must be recorded as an origin fallback, saw {observed:?}"
+        );
+        assert!(
+            !observed
+                .iter()
+                .any(|rendered| rendered.contains("outcome=error")),
+            "a P2P failure that the origin covered is not an error, saw {observed:?}"
+        );
     }
 
     #[tokio::test]

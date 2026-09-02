@@ -91,6 +91,8 @@ The backend uses one local catalog:
 
 - Published catalog: artifact key to the descriptor this node can serve. The in-memory map is loaded from RocksDB on startup; each RocksDB value is a compact JSON descriptor.
 
+Catalog lookups against a peer ride a connection pool over the catalog ALPN, sized by `[p2p].catalog_connection_idle_secs` and `catalog_max_connections`; the catalog server accepts streams in a loop for the life of a connection so a pooled client can ask many questions over one. Setting `catalog_max_connections = 0` restores dialing per lookup, which is the escape hatch while a cluster still runs nodes whose catalog server serves a single stream per connection. `catalog_lookup_timeout_ms` bounds one peer and `lookup_timeout_ms` bounds a whole multi-peer lookup.
+
 Lookup first checks the local published catalog, then asks scheduler for nodes indexed under the artifact key, and finally falls back to discovered peers over the AgentENV catalog ALPN in hint/discovery order. Scheduler-indexed and fallback candidates are still verified by querying each node's catalog; scheduler never stores locators or metadata. The descriptor carries the iroh blob hash in its backend locator, so `fetch` does not depend on prior in-process lookup state.
 
 Fetch parses the descriptor's backend locator as an iroh blob hash, passes all descriptor providers to `iroh-blobs`, downloads that blob into the local `FsStore`, and exports it to the requested destination. Iroh's content-addressed blob transfer validates bytes against that hash. If any descriptor provider is local node, fetch exports directly from the local store.
@@ -99,7 +101,9 @@ After a remote fetch downloads the blob into the local store, the iroh backend b
 
 Publish imports the local file into `FsStore`, applies a deterministic named tag derived from the artifact key (`agentenv:p2p:v1:{sha256(key)}`), builds a descriptor with this node as the only local catalog provider, local endpoint, iroh blob hash locator, and request metadata, upserts that descriptor into the local catalog, and best-effort records the key in scheduler.
 
-Unpublish removes the key from the local catalog, deletes the deterministic named tag, forgets the key in scheduler, persists the catalog, and returns whether a local publication was removed. Deleting the tag stops future catalog lookup immediately, but it does not synchronously delete the blob bytes. The iroh store reclaims untagged blobs through its GC.
+A publication is attributed to an owner, and the catalog keeps the owner set for each key beside its descriptor. The `overlaybd-layer/v1/sha256:` namespace has two independent publishers — the image cache when a layer lands in the commit store, and snapshot publication for every lower of a committed chain — while retention is a single tag and a single catalog entry per key. Without ownership, whichever removal edge ran first would sweep a blob the other publisher was still advertising. An artifact is withdrawn only when its last owner releases it.
+
+Unpublish releases one owner. When that was the last one it removes the key from the local catalog, deletes the deterministic named tag, forgets the key in scheduler, persists the catalog, and returns whether a local publication was removed. Deleting the tag stops future catalog lookup immediately, but it does not synchronously delete the blob bytes. The iroh store reclaims untagged blobs through its GC.
 
 GC is gated to avoid periodic full-store scans when there is no known deletion work:
 
@@ -150,6 +154,12 @@ OSS snapshot resolution consumes fixed artifacts through P2P first:
 POSIX snapshot resolution does not consume P2P. A POSIX repository is already a directly accessible committed artifact store; if a required file is missing, the resolver returns `ArtifactNotFound` instead of repairing the repository from peers. Overlaybd layer acceleration for runtime block reads remains the responsibility of the overlaybd P2P facade, not the POSIX snapshot resolver.
 
 Snapshot P2P publish is best-effort. A failed P2P publish logs a warning and does not roll back the committed snapshot record. This preserves the repository as the source of truth while making newly published artifacts visible to peers before slower backend downloads or uploads become the bottleneck.
+
+## Network Assumptions
+
+The endpoint is built on `presets::Minimal` with an in-memory address lookup: no relay, no DNS, pkarr or mDNS discovery, and therefore no NAT traversal. The transport assumes a flat L3 network in which every node can dial every other node's advertised address directly. A deployment that does not have that property should leave `[p2p].enabled = false`.
+
+That assumption is also the security boundary for connection targeting. A peer's endpoint address is an opaque blob the scheduler relays and a descriptor can carry, and every node parses one and dials what it says. Artifact content is safe regardless — bytes are named by hash and verified on arrival, and each consumer validates metadata before trusting them — but nothing else constrains where a node can be pointed, so a compromised node can steer its peers' dials. `[p2p].cluster_cidrs` names the networks an endpoint address may claim; addresses outside them are refused before any dial. It ships empty, which accepts any address, because a wrong CIDR silently disables discovery.
 
 ## Integrity And Ownership
 
