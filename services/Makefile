@@ -1,7 +1,10 @@
 PROTOC    ?= protoc
 GO        ?= go
 GOBIN_DIR := $(shell $(GO) env GOPATH)/bin
-PROTO_SRC := api/proto/scheduler.proto
+# scheduler.proto is the node-facing contract and is also compiled into the Rust
+# client by the workspace's build.rs. node_stream.proto is spoken between
+# scheduler replicas only, so it stays out of that client.
+PROTO_SRC := api/proto/scheduler.proto api/proto/node_stream.proto
 
 .PHONY: services proto tidy build test bench bench-services fmt fmt-check vet run-scheduler run-gateway
 

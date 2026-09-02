@@ -7,7 +7,7 @@ use tokio::task;
 
 use super::super::shared_runtime_cache_root;
 use super::artifacts::{CollectedBuiltArtifacts, PosixFsArtifactStore};
-use super::catalog::PosixFsCatalogStore;
+use super::catalog::{PosixFsCatalogStore, PosixFsLockStrategy};
 use super::runtime::PosixFsRuntimeResolver;
 use crate::image::cache::{local_image_services_from_global_config, OverlaybdLayerStore};
 use crate::sandbox::FirecrackerSnapshotManifest;
@@ -30,6 +30,8 @@ pub struct PosixFsBackendConfig {
     ///
     /// When `None`, defaults to `<cache_root>/runtime`.
     pub runtime_cache_root: Option<std::path::PathBuf>,
+    /// How the catalog takes its alias and record locks.
+    pub lock_strategy: PosixFsLockStrategy,
 }
 
 pub struct PosixFsBackend {
@@ -67,10 +69,14 @@ impl PosixFsBackend {
             root,
             cache_root,
             runtime_cache_root,
+            lock_strategy,
         } = config;
         let cache_root = cache_root.unwrap_or_else(shared_runtime_cache_root);
         let runtime_cache_root = runtime_cache_root.unwrap_or_else(|| cache_root.join("runtime"));
-        let catalog_store = Arc::new(PosixFsCatalogStore::new(root.clone()));
+        let catalog_store = Arc::new(PosixFsCatalogStore::with_lock_strategy(
+            root.clone(),
+            lock_strategy,
+        ));
         let artifact_store = Arc::new(PosixFsArtifactStore::new(root.clone()));
         let repository: Arc<dyn SnapshotRepository> = Arc::new(PosixFsSnapshotRepository::new(
             catalog_store,
@@ -321,6 +327,8 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    use super::PosixFsLockStrategy;
+
     use overlaybd::config::ImageConfig as OverlaybdImageConfig;
     use tempfile::TempDir;
 
@@ -390,6 +398,7 @@ mod tests {
             root: root.to_path_buf(),
             cache_root: Some(root.join("runtime-cache")),
             runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
+            lock_strategy: PosixFsLockStrategy::default(),
         };
         let cache = LocalArtifactCache::new(root.join("runtime-cache"), None)
             .expect("local artifact cache");

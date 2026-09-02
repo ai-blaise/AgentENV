@@ -41,6 +41,11 @@ const FIRECRACKER_DIRTY_PAGE_SIZE: u64 = 4096;
 const OVERLAYBD_ALIGNMENT: u64 = 512;
 const DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY: usize = 32;
 
+/// Bytes actually written for one memory capture. This is what every
+/// dirty-set reduction has to show up in: the layer on disk, the bytes shipped
+/// over P2P, and the work `compact_to` does inside the pause.
+const MEMORY_SNAPSHOT_LAYER_BYTES_METRIC: &str = "agentenv_memory_snapshot_layer_bytes";
+
 enum LiveOverlaybdSnapshotState {
     ReadOnly,
     Restacked(PathBuf),
@@ -657,6 +662,11 @@ async fn publish_memory_overlaybd_layer(
         compact_to(src_layers, mappings, virtual_size, commit_args)
             .await
             .context("compact memory layer")?;
+        // Take the size before the rename, while the path is still uniquely
+        // ours. `virtual_size` is the addressable image size and is constant by
+        // construction, so it answers nothing about how much a capture cost;
+        // only the produced file does.
+        let layer_bytes = tokio::fs::metadata(&lower_tmp).await.map(|meta| meta.len());
         tokio::fs::rename(&lower_tmp, output_path)
             .await
             .with_context(|| {
@@ -665,6 +675,14 @@ async fn publish_memory_overlaybd_layer(
                     output_path.display()
                 )
             })?;
+        match layer_bytes {
+            Ok(bytes) => {
+                metrics::histogram!(MEMORY_SNAPSHOT_LAYER_BYTES_METRIC).record(bytes as f64)
+            }
+            Err(err) => {
+                warn!(error = %err, "could not measure the sealed memory layer");
+            }
+        }
         Ok(())
     }
     .await;

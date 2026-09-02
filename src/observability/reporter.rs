@@ -20,6 +20,110 @@ use crate::proto::scheduler::{self, scheduler_client::SchedulerClient};
 const MAX_REPORT_BACKOFF: Duration = Duration::from_secs(60);
 const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How many heartbeats a node keeps offering its CPU config while no cluster
+/// intersection has come back.
+///
+/// The config has to survive more than one heartbeat: the scheduler holds the
+/// intersection in process memory, so a scheduler that restarts has no way to
+/// obtain one again except from the nodes, and a node that sent its config once
+/// and forgot it leaves the cluster permanently without an intersection. Every
+/// sandbox then boots with node-local CPU features, which is the exact failure
+/// the intersection exists to prevent.
+///
+/// It cannot be unbounded either. The scheduler only computes the intersection
+/// once every observed node has supplied a config, so one node without
+/// `cpu-template-helper` keeps it unready for good — and each of the others
+/// would then re-upload a full CPU-template JSON on every heartbeat, forever.
+/// Twenty covers a scheduler restart and a rolling deploy at any sane interval.
+const CPU_CONFIG_RESEND_BUDGET: u32 = 20;
+
+/// Holds the CPU-config carry decision behind a privacy boundary.
+///
+/// The fields are private to this module rather than to the file so that
+/// nothing on the heartbeat path can reach them. The defect this type exists
+/// to prevent is precisely the reporter forgetting the node's own copy after
+/// one send, and a reporter that cannot name the field cannot re-introduce it
+/// there: the only way out is [`CpuConfigReporting::payload`], which
+/// `ObservabilityReporter::prepare_heartbeat` calls on every heartbeat.
+mod cpu_config {
+    use super::CPU_CONFIG_RESEND_BUDGET;
+
+    /// Decides whether this node's CPU config rides on the next heartbeat.
+    ///
+    /// The node computes its config once at startup. Before this existed the
+    /// reporter moved it out of the service, sent it once and cleared the local
+    /// copy unconditionally, whether or not the scheduler had retained anything.
+    #[derive(Debug)]
+    pub(super) struct CpuConfigReporting {
+        config: Option<String>,
+        /// Heartbeats still allowed to carry the config.
+        remaining_sends: u32,
+        /// Set once the scheduler has answered with an intersection.
+        cluster_config_seen: bool,
+        /// The `request_cpu_config` flag on the previous accepted response.
+        ///
+        /// The re-arm fires on the rising edge and not on the level, so a
+        /// scheduler wedged at `true` costs one budget rather than one upload
+        /// per heartbeat for the life of the node.
+        previously_requested: bool,
+    }
+
+    impl CpuConfigReporting {
+        pub(super) fn new(config: Option<String>) -> Self {
+            Self {
+                config,
+                remaining_sends: CPU_CONFIG_RESEND_BUDGET,
+                cluster_config_seen: false,
+                previously_requested: false,
+            }
+        }
+
+        /// The config to put on this heartbeat, if any.
+        pub(super) fn payload(&self) -> Option<String> {
+            if self.cluster_config_seen || self.remaining_sends == 0 {
+                return None;
+            }
+            self.config.clone()
+        }
+
+        /// Folds one accepted heartbeat's response back in.
+        ///
+        /// Returns the cluster intersection when this is the first one to
+        /// arrive, so the caller stores and announces it once rather than on
+        /// every heartbeat that repeats it.
+        pub(super) fn record_heartbeat(
+            &mut self,
+            carried: bool,
+            cluster_config: String,
+            requested: bool,
+        ) -> Option<String> {
+            if carried {
+                self.remaining_sends = self.remaining_sends.saturating_sub(1);
+            }
+            let newly_requested = requested && !self.previously_requested;
+            self.previously_requested = requested;
+            if newly_requested {
+                // A scheduler that holds no config for this node is a scheduler
+                // that restarted. The latch below is what a node sets after its
+                // first successful upload, so without this the node would sit
+                // silent and the new scheduler would never rebuild the
+                // intersection that lets a snapshot resume on another node.
+                self.cluster_config_seen = false;
+                self.remaining_sends = CPU_CONFIG_RESEND_BUDGET;
+                return None;
+            }
+            if cluster_config.is_empty() {
+                return None;
+            }
+            let first = !self.cluster_config_seen;
+            self.cluster_config_seen = true;
+            first.then_some(cluster_config)
+        }
+    }
+}
+
+use cpu_config::CpuConfigReporting;
+
 /// The scheduler's wire text for a heartbeat naming a node it does not know.
 ///
 /// Mirrors `NodeNotInRegistryMessage` in
@@ -113,7 +217,7 @@ impl ObservabilityReporter {
         let heartbeat_join = tokio::spawn(async move {
             let mut backoff = config.interval;
             let mut wait = Duration::from_millis(100);
-            let mut pending_cpu_config_json = service.take_cpu_config_json();
+            let mut cpu_config = CpuConfigReporting::new(service.cpu_config_json());
             let mut rosters = RosterDigestState::default();
 
             loop {
@@ -133,7 +237,7 @@ impl ObservabilityReporter {
                     &config,
                     &service,
                     &scheduler_channel,
-                    &mut pending_cpu_config_json,
+                    &mut cpu_config,
                     p2p_endpoint.as_ref(),
                     &mut rosters,
                     heartbeat_emitted.load(Ordering::Relaxed),
@@ -277,26 +381,25 @@ impl ObservabilityReporter {
         config: &ReporterConfig,
         service: &ObservabilityService,
         scheduler_channel: &Channel,
-        cpu_config_json: &mut Option<String>,
+        cpu_config: &mut CpuConfigReporting,
         p2p_endpoint: Option<&P2pEndpoint>,
         rosters: &mut RosterDigestState,
         emitted_events: u64,
     ) -> Result<()> {
-        let mut snapshot = service
+        let snapshot = service
             .node_snapshot()
             .await
             .context("failed to collect heartbeat snapshot")?;
-        snapshot.machine_info.cpu_config_json = cpu_config_json.clone();
         let node_id = snapshot.node_id.clone();
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let roster = rosters.report(&snapshot.sandbox_ids, snapshot.roster_complete);
-        let req = Self::build_heartbeat_request(
+        let (req, carried_cpu_config) = Self::prepare_heartbeat(
+            config,
             snapshot,
-            now_ms,
+            cpu_config,
             p2p_endpoint,
-            config.interval,
-            roster,
+            rosters,
             emitted_events,
+            now_ms,
         );
 
         let mut request = Request::new(req);
@@ -307,14 +410,10 @@ impl ObservabilityReporter {
             .map_err(Self::classify_heartbeat_status)?
             .into_inner();
 
-        *cpu_config_json = None;
-        rosters.observe_response(
-            response.roster_digest_accepted,
-            response.request_full_roster,
-        );
-
-        if !response.cpu_config_json.is_empty() {
-            service.store_cluster_cpu_config(response.cpu_config_json);
+        if let Some(cluster_config) =
+            Self::fold_heartbeat_response(cpu_config, carried_cpu_config, rosters, response)
+        {
+            service.store_cluster_cpu_config(cluster_config);
             info!("received cluster cpu config intersection from scheduler");
         }
 
@@ -325,6 +424,64 @@ impl ObservabilityReporter {
         );
 
         Ok(())
+    }
+
+    /// Builds one heartbeat: everything `send_heartbeat` does before the RPC.
+    ///
+    /// Split out because this is where the CPU-config carry rule is applied to
+    /// an outgoing message, and a test that drives [`CpuConfigReporting`] on
+    /// its own cannot see a heartbeat path that has stopped consulting it —
+    /// which is exactly how the config came to be sent once and never again.
+    /// Nothing here touches the channel, so consecutive heartbeats are
+    /// drivable without a scheduler.
+    ///
+    /// Returns the request and whether it carried this node's CPU config,
+    /// which [`Self::fold_heartbeat_response`] needs to charge the resend
+    /// budget only for heartbeats that actually spent one. Building a
+    /// heartbeat spends nothing, hence the shared borrow: budget moves only
+    /// when a response comes back.
+    fn prepare_heartbeat(
+        config: &ReporterConfig,
+        mut snapshot: super::NodeSnapshot,
+        cpu_config: &CpuConfigReporting,
+        p2p_endpoint: Option<&P2pEndpoint>,
+        rosters: &mut RosterDigestState,
+        emitted_events: u64,
+        now_ms: i64,
+    ) -> (scheduler::HeartbeatRequest, bool) {
+        let carried_cpu_config = cpu_config.payload();
+        snapshot.machine_info.cpu_config_json = carried_cpu_config.clone();
+        let roster = rosters.report(&snapshot.sandbox_ids, snapshot.roster_complete);
+        let req = Self::build_heartbeat_request(
+            snapshot,
+            now_ms,
+            p2p_endpoint,
+            config.interval,
+            roster,
+            emitted_events,
+        );
+        (req, carried_cpu_config.is_some())
+    }
+
+    /// Folds one accepted heartbeat's response back into the reporter's state.
+    ///
+    /// Returns the cluster CPU config intersection when this response is the
+    /// first to carry one, so the caller stores and announces it once.
+    fn fold_heartbeat_response(
+        cpu_config: &mut CpuConfigReporting,
+        carried_cpu_config: bool,
+        rosters: &mut RosterDigestState,
+        response: scheduler::HeartbeatResponse,
+    ) -> Option<String> {
+        rosters.observe_response(
+            response.roster_digest_accepted,
+            response.request_full_roster,
+        );
+        cpu_config.record_heartbeat(
+            carried_cpu_config,
+            response.cpu_config_json,
+            response.request_cpu_config,
+        )
     }
 
     /// Turns a rejected heartbeat into the error the failure log reads.
@@ -628,6 +785,320 @@ mod tests {
         DiskMetric, MachineInfo, NodeMetricsSnapshot, NodeSnapshot, RosterReport,
     };
     use crate::types::{SandboxId, SandboxResources};
+
+    /// The node must keep offering its CPU config until the scheduler has one.
+    ///
+    /// Sending it once and forgetting it is what made the cluster intersection
+    /// unrecoverable: the scheduler holds it only in memory, so after a
+    /// restart it needs a config from every node again, and nothing on the node
+    /// would ever send one. Every sandbox then boots with node-local CPU
+    /// features, and a snapshot taken on one node can fail to restore on
+    /// another — the failure the intersection exists to prevent.
+    #[test]
+    fn the_cpu_config_rides_every_heartbeat_until_the_scheduler_answers() {
+        let mut reporting = CpuConfigReporting::new(Some("{\"cpuid\":1}".to_string()));
+
+        for heartbeat in 1..=5 {
+            let payload = reporting.payload();
+            assert_eq!(
+                payload.as_deref(),
+                Some("{\"cpuid\":1}"),
+                "heartbeat {heartbeat} carried no cpu config"
+            );
+            assert!(
+                reporting
+                    .record_heartbeat(payload.is_some(), String::new(), false)
+                    .is_none(),
+                "an empty response is not a cluster intersection"
+            );
+        }
+    }
+
+    /// Once the scheduler has answered, the node stops re-uploading.
+    #[test]
+    fn an_answered_intersection_stops_the_resend_and_is_announced_once() {
+        let mut reporting = CpuConfigReporting::new(Some("{\"cpuid\":1}".to_string()));
+
+        let payload = reporting.payload();
+        assert!(payload.is_some());
+        assert_eq!(
+            reporting.record_heartbeat(
+                payload.is_some(),
+                "{\"intersection\":1}".to_string(),
+                false
+            ),
+            Some("{\"intersection\":1}".to_string()),
+            "the first intersection must be handed back to be stored"
+        );
+
+        assert_eq!(
+            reporting.payload(),
+            None,
+            "a node whose cluster config has arrived must stop sending its own"
+        );
+        assert_eq!(
+            reporting.record_heartbeat(false, "{\"intersection\":1}".to_string(), false),
+            None,
+            "a repeated intersection must not be announced again"
+        );
+    }
+
+    /// The resend is bounded, so one node that can never supply a config does
+    /// not make every other node upload theirs forever.
+    #[test]
+    fn the_resend_budget_runs_out() {
+        let mut reporting = CpuConfigReporting::new(Some("{\"cpuid\":1}".to_string()));
+
+        for _ in 0..CPU_CONFIG_RESEND_BUDGET {
+            let payload = reporting.payload();
+            assert!(payload.is_some());
+            reporting.record_heartbeat(payload.is_some(), String::new(), false);
+        }
+
+        assert_eq!(
+            reporting.payload(),
+            None,
+            "the config kept riding heartbeats past its budget"
+        );
+    }
+
+    /// A node with no config to offer stays quiet, and a heartbeat that
+    /// carried nothing does not spend budget.
+    ///
+    /// Asserted through `payload` rather than through the counter: the budget
+    /// is a private field, and what matters about it is what the next
+    /// heartbeat carries.
+    #[test]
+    fn a_node_without_a_cpu_config_sends_nothing_and_spends_nothing() {
+        assert_eq!(CpuConfigReporting::new(None).payload(), None);
+
+        let mut reporting = CpuConfigReporting::new(Some("{\"cpuid\":1}".to_string()));
+        for _ in 0..CPU_CONFIG_RESEND_BUDGET * 2 {
+            reporting.record_heartbeat(false, String::new(), false);
+        }
+        assert_eq!(
+            reporting.payload().as_deref(),
+            Some("{\"cpuid\":1}"),
+            "heartbeats that carried nothing spent the resend budget"
+        );
+    }
+
+    /// The snapshot the heartbeat path is handed, as production produces it.
+    ///
+    /// `detect_machine_info` leaves `cpu_config_json` `None`
+    /// (`src/observability/machine.rs`); the reporter is the only thing that
+    /// ever fills it in. A test that started from a snapshot already carrying
+    /// one could not tell a heartbeat that consulted `CpuConfigReporting` from
+    /// one that just passed the field through.
+    fn heartbeat_snapshot() -> NodeSnapshot {
+        let mut snapshot = make_snapshot(false);
+        snapshot.machine_info.cpu_config_json = None;
+        snapshot
+    }
+
+    fn reporter_config() -> ReporterConfig {
+        ReporterConfig {
+            scheduler_endpoint: "http://127.0.0.1:1".to_string(),
+            interval: Duration::from_millis(4500),
+        }
+    }
+
+    fn scheduler_answer(cluster_config: &str) -> scheduler::HeartbeatResponse {
+        scheduler::HeartbeatResponse {
+            cpu_config_json: cluster_config.to_string(),
+            request_full_roster: false,
+            roster_digest_accepted: true,
+            request_cpu_config: false,
+        }
+    }
+
+    /// A scheduler that lost its intersection asks, and the node answers.
+    ///
+    /// The scheduler holds the CPU-config intersection in memory only, so a
+    /// restarted one has nothing, and a node that already uploaded once has
+    /// latched itself quiet. `request_cpu_config` is the only thing that can
+    /// un-latch it. Driven through `prepare_heartbeat`/`fold_heartbeat_response`
+    /// because a node that answers the request on the state machine but never
+    /// puts the config back on the wire has not answered it at all.
+    #[test]
+    fn a_scheduler_that_asks_again_gets_the_cpu_config_again() {
+        let config = reporter_config();
+        let mut cpu_config = CpuConfigReporting::new(Some("{\"cpuid\":1}".to_string()));
+        let mut rosters = RosterDigestState::default();
+
+        let beat = |cpu_config: &mut CpuConfigReporting,
+                    rosters: &mut RosterDigestState,
+                    response: scheduler::HeartbeatResponse| {
+            let (req, carried) = ObservabilityReporter::prepare_heartbeat(
+                &config,
+                heartbeat_snapshot(),
+                cpu_config,
+                None,
+                rosters,
+                0,
+                1_700_000_000_123,
+            );
+            ObservabilityReporter::fold_heartbeat_response(cpu_config, carried, rosters, response);
+            req.machine_info.expect("machine info").cpu_config_json
+        };
+
+        let sent = beat(&mut cpu_config, &mut rosters, scheduler_answer("{\"i\":1}"));
+        assert_eq!(
+            sent, "{\"cpuid\":1}",
+            "the first heartbeat must carry the config"
+        );
+
+        let quiet = beat(&mut cpu_config, &mut rosters, scheduler_answer(""));
+        assert!(
+            quiet.is_empty(),
+            "the node must stay quiet once the scheduler has answered, sent {quiet:?}"
+        );
+
+        let mut asking = scheduler_answer("");
+        asking.request_cpu_config = true;
+        let answered = beat(&mut cpu_config, &mut rosters, asking);
+        assert!(
+            answered.is_empty(),
+            "the request rides the response, so the heartbeat that carries it \
+             was already built and cannot have answered it"
+        );
+
+        let resent = beat(&mut cpu_config, &mut rosters, scheduler_answer(""));
+        assert_eq!(
+            resent, "{\"cpuid\":1}",
+            "the heartbeat after the request must carry the config again"
+        );
+    }
+
+    /// A scheduler wedged at `request_cpu_config` costs one budget, not one
+    /// upload per heartbeat forever.
+    ///
+    /// The re-arm is what makes an unbounded upload possible again, so the edge
+    /// it fires on is load-bearing: on the level it would refill the budget on
+    /// every response and the cap this type exists to hold would be gone.
+    #[test]
+    fn a_scheduler_stuck_asking_does_not_refill_the_budget_forever() {
+        let config = reporter_config();
+        let mut cpu_config = CpuConfigReporting::new(Some("{\"cpuid\":1}".to_string()));
+        let mut rosters = RosterDigestState::default();
+        let mut asking = scheduler_answer("");
+        asking.request_cpu_config = true;
+
+        let mut carried_count = 0;
+        for _ in 0..(CPU_CONFIG_RESEND_BUDGET as usize * 3) {
+            let (_, carried) = ObservabilityReporter::prepare_heartbeat(
+                &config,
+                heartbeat_snapshot(),
+                &cpu_config,
+                None,
+                &mut rosters,
+                0,
+                1_700_000_000_123,
+            );
+            if carried {
+                carried_count += 1;
+            }
+            ObservabilityReporter::fold_heartbeat_response(
+                &mut cpu_config,
+                carried,
+                &mut rosters,
+                asking.clone(),
+            );
+        }
+        // One heartbeat was already built and on the wire when the first
+        // request came back, so the bound is the budget the re-arm grants plus
+        // that one. What matters is that it is a bound at all: on the level
+        // rather than the edge this loop would carry all sixty.
+        let bound = CPU_CONFIG_RESEND_BUDGET as usize + 1;
+        assert!(
+            carried_count <= bound,
+            "a scheduler stuck asking drew {carried_count} uploads, over the \
+             {bound} one re-arm allows"
+        );
+    }
+
+    /// The heartbeat path itself has to keep offering the config, and has to
+    /// stop once the scheduler answers.
+    ///
+    /// This is the seam D6 lived at, and it is not the state machine: the
+    /// reporter took the config out of the service, put it on the first
+    /// heartbeat and dropped its copy, so every later heartbeat carried an
+    /// empty string and a scheduler that restarted never got an intersection
+    /// again. `CpuConfigReporting` driven on its own cannot see that — only
+    /// building consecutive requests the way `send_heartbeat` builds them can,
+    /// which is why `prepare_heartbeat` and `fold_heartbeat_response` are the
+    /// whole of what `send_heartbeat` does around the RPC.
+    #[test]
+    fn consecutive_heartbeats_carry_the_cpu_config_until_the_scheduler_answers() {
+        let config = reporter_config();
+        let mut cpu_config = CpuConfigReporting::new(Some("{\"cpuid\":1}".to_string()));
+        let mut rosters = RosterDigestState::default();
+
+        for heartbeat in 1..=3 {
+            let (req, carried) = ObservabilityReporter::prepare_heartbeat(
+                &config,
+                heartbeat_snapshot(),
+                &cpu_config,
+                None,
+                &mut rosters,
+                0,
+                1_700_000_000_123,
+            );
+            assert_eq!(
+                req.machine_info.expect("machine info").cpu_config_json,
+                "{\"cpuid\":1}",
+                "heartbeat {heartbeat} carried no cpu config"
+            );
+            assert!(carried, "heartbeat {heartbeat} did not report a carry");
+            assert_eq!(
+                ObservabilityReporter::fold_heartbeat_response(
+                    &mut cpu_config,
+                    carried,
+                    &mut rosters,
+                    scheduler_answer(""),
+                ),
+                None,
+                "a scheduler with no intersection yet announced one"
+            );
+        }
+
+        let (_, carried) = ObservabilityReporter::prepare_heartbeat(
+            &config,
+            heartbeat_snapshot(),
+            &cpu_config,
+            None,
+            &mut rosters,
+            0,
+            1_700_000_000_123,
+        );
+        assert_eq!(
+            ObservabilityReporter::fold_heartbeat_response(
+                &mut cpu_config,
+                carried,
+                &mut rosters,
+                scheduler_answer("{\"intersection\":1}"),
+            )
+            .as_deref(),
+            Some("{\"intersection\":1}"),
+            "the first intersection must come back to be stored and announced"
+        );
+
+        let (req, carried) = ObservabilityReporter::prepare_heartbeat(
+            &config,
+            heartbeat_snapshot(),
+            &cpu_config,
+            None,
+            &mut rosters,
+            0,
+            1_700_000_000_123,
+        );
+        assert_eq!(
+            req.machine_info.expect("machine info").cpu_config_json,
+            "",
+            "a node whose cluster config has arrived kept re-uploading its own"
+        );
+        assert!(!carried);
+    }
 
     /// A snapshot whose every field is distinct, so a builder that drops or
     /// swaps one is visible rather than absorbed by a shared default.

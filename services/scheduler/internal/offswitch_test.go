@@ -219,3 +219,33 @@ func TestBookkeepingForDepartedNodesIsReclaimed(t *testing.T) {
 		t.Fatal("a node that is still discovered must keep its cached roster")
 	}
 }
+
+// Replicated node state is the one gate here whose "on" is not the shipped
+// default, because it only means anything to a scheduler that has peers. Off,
+// two schedulers must behave exactly as two schedulers did before the bus
+// existed: each knows only the nodes that heartbeat to it.
+func TestOffSwitchNodeStream(t *testing.T) {
+	nodes := []Node{{ID: "node-a", Endpoint: "http://node-a"}, {ID: "node-b", Endpoint: "http://node-b"}}
+	now := time.Now().Add(-time.Second)
+
+	t.Run("on converges the fleet onto every replica", func(t *testing.T) {
+		_, replicas := newStreamReplicas(t, nodes, 30*time.Second, "replica-1", "replica-2")
+		if _, _, err := replicas[0].Heartbeat(readyHeartbeat("node-a"), now); err != nil {
+			t.Fatalf("heartbeat: %v", err)
+		}
+		if _, health := replicas[1].PeekObservedHealth("node-a"); !health.Seen {
+			t.Fatal("the replica that took no heartbeat never learned of the node")
+		}
+	})
+
+	t.Run("off leaves each replica with only its own nodes", func(t *testing.T) {
+		first := NewAtomicNodeRegistry(nodes, 30*time.Second)
+		second := NewAtomicNodeRegistry(nodes, 30*time.Second)
+		if _, _, err := first.Heartbeat(readyHeartbeat("node-a"), now); err != nil {
+			t.Fatalf("heartbeat: %v", err)
+		}
+		if _, health := second.PeekObservedHealth("node-a"); health.Seen {
+			t.Fatal("a node reached a second registry with the stream disabled")
+		}
+	})
+}

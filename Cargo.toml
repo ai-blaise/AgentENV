@@ -13,6 +13,7 @@ members = [
     "crates/benchmarks",
     "crates/e2e-tests",
     "crates/linux-cap",
+    "crates/loadgen",
     "crates/observability",
     "crates/object-store-operator",
     "crates/test-support",
@@ -40,6 +41,9 @@ vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
 [dev-dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# `start_paused` runtimes, so a test can prove a bound on a call that would
+# otherwise hang for minutes without spending those minutes.
+tokio = { version = "1", features = ["test-util"] }
 
 [dependencies]
 firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client" }

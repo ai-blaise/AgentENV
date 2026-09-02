@@ -13,6 +13,27 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 
+/// Label value for a pool that did not name itself.
+const UNNAMED_POOL: &str = "unnamed";
+
+/// Idle resources tolerated above `high_watermark` before draining.
+///
+/// Without it a pool sitting at its high watermark destroys a resource every
+/// time a release pushes it one over and builds one again the moment an
+/// acquisition takes it one under — steady-state churn of exactly the
+/// expensive thing the pool exists to keep. Sized off the watermark so a deep
+/// pool tolerates proportionally more slack, with a floor of one so small
+/// pools get hysteresis at all.
+///
+/// A `high_watermark` of zero is not a small pool, it is no pool: releases must
+/// go straight back to cleanup, so that case keeps no slack at all.
+fn drain_deadband(high_watermark: usize) -> usize {
+    if high_watermark == 0 {
+        return 0;
+    }
+    (high_watermark / 8).max(1)
+}
+
 /// Action computed by watermark logic for the maintenance worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PoolMaintenanceAction {
@@ -91,6 +112,13 @@ pub struct WarmPool<T: Send> {
     pool: Mutex<VecDeque<T>>,
     /// Watermark config.
     config: PoolConfig,
+    /// Metric label identifying this pool. Bounded by construction: one value
+    /// per pool in the process.
+    pool_name: &'static str,
+    /// Whether an acquisition drained the pool since the last maintenance
+    /// cycle. Read by the fill-target decay, which must not shrink the target
+    /// of a pool that is still under load.
+    pressure_since_last_cycle: AtomicBool,
     /// Current refill target. Starts at the low watermark and grows toward the
     /// high watermark under acquisition pressure. This intentionally ratchets
     /// upward for the process lifetime: after a node observes bursty demand, it
@@ -112,11 +140,26 @@ pub struct WarmPool<T: Send> {
 impl<T: Send> WarmPool<T> {
     /// Create a new warm pool with the given config.
     pub fn new(config: PoolConfig) -> Self {
+        Self::named(config, UNNAMED_POOL)
+    }
+
+    /// Create a new warm pool that labels its metrics with `pool_name`.
+    ///
+    /// The name is `&'static str` rather than a `String` so the metric label
+    /// cannot become unbounded: there is one value per pool in the process.
+    pub fn named(config: PoolConfig, pool_name: &'static str) -> Self {
         let config = config.validate();
         let fill_target = config.low_watermark.min(config.high_watermark);
+        metrics::gauge!("agentenv_pool_low_watermark", "pool" => pool_name)
+            .set(config.low_watermark as f64);
+        metrics::gauge!("agentenv_pool_high_watermark", "pool" => pool_name)
+            .set(config.high_watermark as f64);
+        metrics::gauge!("agentenv_pool_fill_target", "pool" => pool_name).set(fill_target as f64);
         Self {
             pool: Mutex::new(VecDeque::new()),
             fill_target: Mutex::new(fill_target),
+            pool_name,
+            pressure_since_last_cycle: AtomicBool::new(false),
             config,
             maintenance_signal: Mutex::new(PoolMaintenanceSignal::default()),
             maintenance_cv: Condvar::new(),
@@ -155,7 +198,7 @@ impl<T: Send> WarmPool<T> {
                 return PoolMaintenanceAction::Fill(to_fill);
             }
         }
-        if pool_len > self.config.high_watermark {
+        if pool_len > self.config.high_watermark + drain_deadband(self.config.high_watermark) {
             // Drain the full excess in one maintenance cycle. Resource-specific
             // cleanup happens outside the pool lock, and shutdown paths already
             // have to tolerate draining the whole pool.
@@ -184,9 +227,34 @@ impl<T: Send> WarmPool<T> {
             .saturating_mul(2)
             .min(self.config.high_watermark);
         *target = next;
+        metrics::gauge!("agentenv_pool_fill_target", "pool" => self.pool_name).set(next as f64);
+    }
+
+    /// Lowers the refill target after a cycle that saw no acquisition pressure.
+    ///
+    /// The target only ever grew, for the life of the process. Paired with a
+    /// drain from above, that turns one burst into permanent churn: the target
+    /// keeps demanding resources the drain keeps destroying. Halving per quiet
+    /// cycle gives back the burst capacity slowly enough that a bursty node
+    /// keeps it and an idle one does not.
+    pub fn decay_fill_target_when_quiet(&self, pool_len: usize) {
+        if self.pressure_since_last_cycle.swap(false, Ordering::AcqRel) {
+            return;
+        }
+
+        let low = self.config.low_watermark.min(self.config.high_watermark);
+        let mut target = self.fill_target.lock().unwrap();
+        if pool_len < *target || *target <= low {
+            return;
+        }
+        let next = (*target / 2).max(low);
+        *target = next;
+        metrics::gauge!("agentenv_pool_fill_target", "pool" => self.pool_name).set(next as f64);
     }
 
     fn record_acquisition_pressure(&self, pool_len: usize) {
+        self.pressure_since_last_cycle
+            .store(true, Ordering::Release);
         self.grow_fill_target_after_pressure(pool_len);
         if matches!(
             self.compute_maintenance_action(pool_len),
@@ -224,7 +292,7 @@ impl<T: Send> WarmPool<T> {
         let resource = pool.pop_front();
         let next_pool_len = pool.len();
         drop(pool);
-        self.record_acquisition_pressure(next_pool_len);
+        self.record_acquire(resource.is_some(), next_pool_len);
         resource
     }
 
@@ -242,8 +310,19 @@ impl<T: Send> WarmPool<T> {
             .and_then(|idx| pool.remove(idx));
         let next_pool_len = pool.len();
         drop(pool);
-        self.record_acquisition_pressure(next_pool_len);
+        self.record_acquire(resource.is_some(), next_pool_len);
         resource
+    }
+
+    fn record_acquire(&self, hit: bool, pool_len: usize) {
+        metrics::counter!(
+            "agentenv_pool_acquire_total",
+            "pool" => self.pool_name,
+            "result" => if hit { "hit" } else { "miss" },
+        )
+        .increment(1);
+        metrics::gauge!("agentenv_pool_size", "pool" => self.pool_name).set(pool_len as f64);
+        self.record_acquisition_pressure(pool_len);
     }
 
     /// Try to enqueue an idle resource only if the pool is below the high watermark.
@@ -283,6 +362,14 @@ impl<T: Send> WarmPool<T> {
                 let next_pool_len = pool.len() + 1;
                 pool.push_back(resource);
                 drop(pool);
+                metrics::counter!(
+                    "agentenv_pool_release_total",
+                    "pool" => self.pool_name,
+                    "result" => "pooled",
+                )
+                .increment(1);
+                metrics::gauge!("agentenv_pool_size", "pool" => self.pool_name)
+                    .set(next_pool_len as f64);
                 if next_pool_len < self.config.low_watermark
                     || next_pool_len > self.config.high_watermark
                 {
@@ -291,7 +378,14 @@ impl<T: Send> WarmPool<T> {
                 return Ok(());
             }
         }
-        // Pool is full or shutting down: return the resource to the caller.
+        // Pool is full or shutting down: return the resource to the caller,
+        // which destroys it rather than pooling it.
+        metrics::counter!(
+            "agentenv_pool_release_total",
+            "pool" => self.pool_name,
+            "result" => "rejected",
+        )
+        .increment(1);
         Err(resource)
     }
 
@@ -382,6 +476,7 @@ impl<T: Send> WarmPool<T> {
 
             has_immediate_work = {
                 let pool_len = self.pool.lock().unwrap().len();
+                self.decay_fill_target_when_quiet(pool_len);
                 !matches!(
                     self.compute_maintenance_action(pool_len),
                     PoolMaintenanceAction::Idle
@@ -624,6 +719,120 @@ mod tests {
         pool.drain_all();
         assert_eq!(pool.release(42), Err(42));
     }
+
+    /// A pool sitting at its high watermark used to destroy a resource the
+    /// moment a release pushed it one over, and build one again the moment an
+    /// acquisition took it one under. The deadband is what stops a deep pool
+    /// from turning one burst into permanent create/destroy churn.
+    #[test]
+    fn draining_waits_for_a_deadband_above_the_high_watermark() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 64,
+            high_watermark: 64,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+        });
+
+        assert_eq!(
+            pool.compute_maintenance_action(65),
+            PoolMaintenanceAction::Idle,
+            "one resource over the watermark is not worth destroying"
+        );
+        assert_eq!(
+            pool.compute_maintenance_action(72),
+            PoolMaintenanceAction::Idle
+        );
+        assert_eq!(
+            pool.compute_maintenance_action(73),
+            PoolMaintenanceAction::Drain(9),
+            "past the deadband the whole excess goes"
+        );
+    }
+
+    /// A zero high watermark means the pool is off: a released resource has to
+    /// be destroyed, not held as slack. The throughput harness isolates the
+    /// cold path this way.
+    #[test]
+    fn a_disabled_pool_keeps_no_slack() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 0,
+            high_watermark: 0,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+        });
+        assert_eq!(
+            pool.compute_maintenance_action(1),
+            PoolMaintenanceAction::Drain(1)
+        );
+    }
+
+    /// The refill target used to ratchet up for the process lifetime, so a
+    /// single burst left the pool permanently demanding resources that the
+    /// drain above the high watermark keeps destroying.
+    #[test]
+    fn a_quiet_cycle_lowers_the_refill_target_toward_the_low_watermark() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 16,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+        });
+
+        // Three misses in a row: the burst the target is meant to absorb.
+        for _ in 0..3 {
+            assert_eq!(pool.try_acquire(), None);
+        }
+        assert_eq!(pool.current_fill_target(), 16);
+
+        // The cycle that observed the pressure must not decay.
+        pool.decay_fill_target_when_quiet(16);
+        assert_eq!(pool.current_fill_target(), 16);
+
+        pool.decay_fill_target_when_quiet(16);
+        assert_eq!(pool.current_fill_target(), 8);
+        pool.decay_fill_target_when_quiet(16);
+        assert_eq!(pool.current_fill_target(), 4);
+        pool.decay_fill_target_when_quiet(16);
+        assert_eq!(pool.current_fill_target(), 2);
+        pool.decay_fill_target_when_quiet(16);
+        assert_eq!(
+            pool.current_fill_target(),
+            2,
+            "the target must not decay below the low watermark"
+        );
+    }
+
+    /// Decay must not shrink the target of a pool that is still being drained
+    /// by acquisitions, and must not act while the pool is still filling.
+    #[test]
+    fn decay_leaves_a_pool_under_pressure_alone() {
+        let pool = WarmPool::<u32>::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 16,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+        });
+        for _ in 0..3 {
+            assert_eq!(pool.try_acquire(), None);
+        }
+        assert_eq!(pool.current_fill_target(), 16);
+
+        pool.decay_fill_target_when_quiet(16);
+        assert_eq!(pool.try_acquire(), None);
+        pool.decay_fill_target_when_quiet(16);
+        assert_eq!(
+            pool.current_fill_target(),
+            16,
+            "a cycle that saw an acquisition must not decay the target"
+        );
+
+        pool.decay_fill_target_when_quiet(1);
+        assert_eq!(
+            pool.current_fill_target(),
+            16,
+            "a pool still below its target is not idle capacity"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -698,6 +907,46 @@ mod maintenance_worker_tests {
         );
     }
 
+    /// The decay reaches a real pool only through the worker loop, which
+    /// recomputes the target between cycles. A loop that skips it leaves a node
+    /// that saw one burst demanding that capacity for the rest of its life,
+    /// while the drain above the high watermark keeps destroying what the
+    /// target keeps demanding.
+    #[test]
+    fn the_worker_loop_decays_the_refill_target_between_cycles() {
+        let pool: &'static WarmPool<u32> = Box::leak(Box::new(WarmPool::new(PoolConfig {
+            low_watermark: 2,
+            high_watermark: 16,
+            maintenance_enabled: true,
+            startup_prewarm: false,
+        })));
+
+        // Three misses in a row: the burst that ratchets the target up to the
+        // high watermark.
+        for _ in 0..3 {
+            assert_eq!(pool.try_acquire(), None);
+        }
+        assert_eq!(pool.current_fill_target(), 16);
+        // Held at the target, so each cycle sees idle capacity rather than a
+        // pool that is still filling.
+        for _ in 0..16 {
+            pool.release(0).expect("the pool should accept a release");
+        }
+
+        pool.start_maintenance_worker(|| {});
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.current_fill_target() == 16 && Instant::now() < deadline {
+            pool.request_maintenance();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        pool.stop_maintenance_worker();
+
+        assert!(
+            pool.current_fill_target() < 16,
+            "the worker loop never decayed the ratcheted refill target"
+        );
+    }
+
     /// A cycle that never satisfies the watermark — a fill that keeps failing,
     /// a resource the host cannot currently build — leaves work outstanding
     /// every time round. The worker must still stop: otherwise the join blocks
@@ -718,6 +967,163 @@ mod maintenance_worker_tests {
             started.elapsed() < Duration::from_secs(5),
             "stopping took {:?}; the worker never observed the stop flag",
             started.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// Captures counter increments and gauge sets so a test can read back what
+    /// the pool actually emitted. Installed per-thread, so it does not disturb
+    /// a process-wide recorder.
+    #[derive(Default, Clone)]
+    struct MetricSpy {
+        values: Arc<Mutex<HashMap<String, f64>>>,
+    }
+
+    struct SpyMetric {
+        key: String,
+        values: Arc<Mutex<HashMap<String, f64>>>,
+    }
+
+    fn key_with_labels(key: &metrics::Key) -> String {
+        let mut labels: Vec<String> = key
+            .labels()
+            .map(|label| format!("{}={}", label.key(), label.value()))
+            .collect();
+        labels.sort();
+        format!("{}{{{}}}", key.name(), labels.join(","))
+    }
+
+    impl metrics::CounterFn for SpyMetric {
+        fn increment(&self, value: u64) {
+            *self
+                .values
+                .lock()
+                .unwrap()
+                .entry(self.key.clone())
+                .or_insert(0.0) += value as f64;
+        }
+        fn absolute(&self, value: u64) {
+            self.values
+                .lock()
+                .unwrap()
+                .insert(self.key.clone(), value as f64);
+        }
+    }
+
+    impl metrics::GaugeFn for SpyMetric {
+        fn increment(&self, _value: f64) {}
+        fn decrement(&self, _value: f64) {}
+        fn set(&self, value: f64) {
+            self.values.lock().unwrap().insert(self.key.clone(), value);
+        }
+    }
+
+    impl metrics::Recorder for MetricSpy {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+        fn register_counter(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::from_arc(Arc::new(SpyMetric {
+                key: key_with_labels(key),
+                values: Arc::clone(&self.values),
+            }))
+        }
+        fn register_gauge(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            metrics::Gauge::from_arc(Arc::new(SpyMetric {
+                key: key_with_labels(key),
+                values: Arc::clone(&self.values),
+            }))
+        }
+        fn register_histogram(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
+    /// The pool had no metrics at all: starvation was visible only as latency
+    /// in whatever the pool fed. Emitting from the crate rather than from one
+    /// consumer is what gives all three pools the same numbers.
+    #[test]
+    fn the_pool_publishes_its_watermarks_and_its_acquisitions() {
+        let spy = MetricSpy::default();
+        let values = Arc::clone(&spy.values);
+        metrics::with_local_recorder(&spy, || {
+            let pool = WarmPool::<u32>::named(
+                PoolConfig {
+                    low_watermark: 2,
+                    high_watermark: 16,
+                    maintenance_enabled: false,
+                    startup_prewarm: false,
+                },
+                "network",
+            );
+
+            assert_eq!(pool.try_acquire(), None);
+            pool.release(7).unwrap();
+            assert_eq!(pool.try_acquire(), Some(7));
+        });
+
+        let values = values.lock().unwrap();
+        assert_eq!(
+            values.get("agentenv_pool_low_watermark{pool=network}"),
+            Some(&2.0)
+        );
+        assert_eq!(
+            values.get("agentenv_pool_high_watermark{pool=network}"),
+            Some(&16.0)
+        );
+        assert_eq!(
+            values.get("agentenv_pool_fill_target{pool=network}"),
+            Some(&8.0),
+            "both acquisitions left the pool below the low watermark, so both \
+             grew the refill target, and each growth should be published"
+        );
+        assert_eq!(
+            values.get("agentenv_pool_acquire_total{pool=network,result=miss}"),
+            Some(&1.0)
+        );
+        assert_eq!(
+            values.get("agentenv_pool_acquire_total{pool=network,result=hit}"),
+            Some(&1.0)
+        );
+        assert_eq!(
+            values.get("agentenv_pool_release_total{pool=network,result=pooled}"),
+            Some(&1.0)
         );
     }
 }

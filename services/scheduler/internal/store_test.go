@@ -610,7 +610,7 @@ func TestAShortBindingTTLBootsWithoutAnExplicitGrace(t *testing.T) {
 	if err := os.WriteFile(path, []byte(`{"scheduler":{"binding_ttl":"10s"}}`), 0o644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
-	cfg, err := config.LoadScheduler(path, false)
+	cfg, err := config.LoadScheduler(path, config.SchedulerModePrimary)
 	if err != nil {
 		t.Fatalf("a 10s binding ttl failed to load: %v", err)
 	}

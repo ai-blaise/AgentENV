@@ -47,6 +47,15 @@ pub struct ApiImpl {
     /// response the node itself produced can pin it.
     #[cfg(test)]
     forced_admission_refusal: Option<(AdmissionRejectReason, std::time::Duration)>,
+    /// Drain knobs to run a pass under in place of the node's own.
+    ///
+    /// `[orchestrator.drain]` is read from the same process-wide `OnceLock`
+    /// config as everything else, and the shipped values are the ones the
+    /// handler's own literals would be. Without a way to put the handler under
+    /// different ones, no test can tell a live `config.deadline_ms` from a
+    /// hardcoded `30_000`.
+    #[cfg(test)]
+    drain_config: Option<crate::cfg::DrainConfig>,
 }
 
 impl ApiImpl {
@@ -72,7 +81,28 @@ impl ApiImpl {
             proxy_timeouts,
             #[cfg(test)]
             forced_admission_refusal: None,
+            #[cfg(test)]
+            drain_config: None,
         }
+    }
+
+    /// Runs drains under `drain_config` instead of the node's configuration.
+    #[cfg(test)]
+    pub(crate) fn with_drain_config(mut self, drain_config: crate::cfg::DrainConfig) -> Self {
+        self.drain_config = Some(drain_config);
+        self
+    }
+
+    /// How hard a drain pass pushes, and how long it is given.
+    pub(crate) fn drain_config(&self) -> crate::cfg::DrainConfig {
+        #[cfg(test)]
+        if let Some(drain_config) = &self.drain_config {
+            return drain_config.clone();
+        }
+        crate::cfg::ConfigManager::global_config()
+            .orchestrator
+            .drain
+            .clone()
     }
 
     /// Makes creates answer with the capacity refusal `reason` describes.

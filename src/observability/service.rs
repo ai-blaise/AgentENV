@@ -55,8 +55,14 @@ impl ObservabilityService {
         }
     }
 
-    pub fn take_cpu_config_json(&self) -> Option<String> {
-        self.pending_cpu_config.lock().unwrap().take()
+    /// This node's own CPU config, as detected once at startup.
+    ///
+    /// Cloned rather than taken. The reporter has to be able to send it on more
+    /// than one heartbeat — a scheduler that restarts holds its intersection
+    /// only in memory and can get one back no other way — and a value moved
+    /// out of here on the first send is a value the node can never offer again.
+    pub fn cpu_config_json(&self) -> Option<String> {
+        self.pending_cpu_config.lock().unwrap().clone()
     }
 
     pub fn store_cluster_cpu_config(&self, config: String) {

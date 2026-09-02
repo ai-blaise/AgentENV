@@ -721,3 +721,67 @@ func TestHeartbeatRejectsEmptyServiceInstanceID(t *testing.T) {
 		t.Fatalf("expected invalid argument, got %v", err)
 	}
 }
+
+// A binding written after a node collected its roster must survive that
+// roster's arrival.
+//
+// The heartbeat carries what the node owned when it sampled; a sandbox placed
+// between the sample and the RPC landing is bound and in no roster. Reconciling
+// it away silently unbinds a live sandbox the client is already holding an id
+// for — the client's very next request 404s, and nothing on either side logs a
+// reason. The grace period is the window in which reconcile must assume the
+// node simply had not seen it yet.
+func TestHeartbeatWithStaleRosterKeepsFreshAssignment(t *testing.T) {
+	const grace = 300 * time.Millisecond
+	service := NewService(
+		zap.NewNop(),
+		NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL),
+		NewStrategy("round_robin"),
+		NewInMemoryBindingStoreWithGrace(defaultObservedReportTTL, grace),
+	)
+	node := (&Node{ID: "node-a", Endpoint: "http://node-a"}).ToProto()
+
+	// The node's roster was collected before either of these was placed.
+	for _, sandboxID := range []string{"sbx-fresh", "sbx-also-fresh"} {
+		if _, err := service.RecordAssignment(context.Background(), &schedulerv1.RecordAssignmentRequest{
+			SandboxId: sandboxID,
+			Node:      node,
+		}); err != nil {
+			t.Fatalf("record assignment %s failed: %v", sandboxID, err)
+		}
+	}
+
+	staleRoster := &schedulerv1.HeartbeatRequest{
+		NodeId:            "node-a",
+		ClusterId:         "cluster-1",
+		ServiceInstanceId: "svc-a",
+		SandboxIds:        []string{"sbx-older"},
+		RosterComplete:    true,
+		Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+	}
+	if _, err := service.Heartbeat(context.Background(), staleRoster); err != nil {
+		t.Fatalf("heartbeat failed: %v", err)
+	}
+
+	for _, sandboxID := range []string{"sbx-fresh", "sbx-also-fresh"} {
+		resp, err := service.LookupNode(context.Background(), &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
+		if err != nil {
+			t.Fatalf("a binding written inside the grace was reconciled away: %s: %v", sandboxID, err)
+		}
+		if got := resp.GetNode().GetNodeId(); got != "node-a" {
+			t.Fatalf("lookup %s returned node %q, want %q", sandboxID, got, "node-a")
+		}
+	}
+
+	// The grace is a window, not a blanket: once a node has had time to see a
+	// binding and still omits it, the binding is gone and reconcile must say so.
+	time.Sleep(2 * grace)
+	if _, err := service.Heartbeat(context.Background(), staleRoster); err != nil {
+		t.Fatalf("second heartbeat failed: %v", err)
+	}
+	for _, sandboxID := range []string{"sbx-fresh", "sbx-also-fresh"} {
+		if _, err := service.LookupNode(context.Background(), &schedulerv1.LookupNodeRequest{SandboxId: sandboxID}); status.Code(err) != codes.NotFound {
+			t.Fatalf("a binding older than the grace and absent from the roster should be removed: %s: %v", sandboxID, err)
+		}
+	}
+}

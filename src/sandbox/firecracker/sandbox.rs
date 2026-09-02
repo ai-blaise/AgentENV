@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
@@ -28,12 +29,13 @@ use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
 
-use crate::cfg::ConfigManager;
+use crate::cfg::{BalloonConfig, ConfigManager};
+use crate::observability::prometheus::MetricGuard;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
-    CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
-    SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec,
-    SandboxRuntimeInfo,
+    CapturedSandboxSnapshot, MemoryControlCapability, PausedSandboxState, RuntimeArtifactSet,
+    SandboxBackend, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor, SandboxForkResult,
+    SandboxForkSpec, SandboxMemoryTelemetry, SandboxRuntimeInfo,
 };
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{
@@ -60,6 +62,13 @@ const USER_ROOTFS_DRIVE_PATH: &str = "user-rootfs";
 /// `refill_time`, not a per-second rate. Pinning the refill period to 1000 ms
 /// makes the configured `*_per_sec` values equal the sustained per-second rate.
 const RATE_LIMIT_REFILL_TIME_MS: i64 = 1000;
+
+const MEMORY_HINTING_DURATION_METRIC: &str = "agentenv_memory_snapshot_hinting_duration_seconds";
+
+/// How often the free-page-hinting handshake is re-read. The guest answers on
+/// its own schedule, so this trades a little added pause latency against
+/// hammering the API socket for the whole of a run.
+const FREE_PAGE_HINTING_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 fn bandwidth_bucket(
     cfg: &crate::cfg::DiskRateLimitConfig,
@@ -195,6 +204,10 @@ pub struct FirecrackerSandbox {
     /// deliberately is not `mem_snapshot_image_config_path`, which is the ublk
     /// device key and must keep pointing at the image backing the *live* VM.
     mem_snapshot_parent_config_path: Option<PathBuf>,
+    /// Memory-control devices this VM was observed to have, probed once the
+    /// VM is live. All-false until then, and all-false forever for a VM that
+    /// has none — see [`MemoryControlCapability`].
+    mem_control: MemoryControlCapability,
     /// image.json path the rootfs device was opened with. Also released at
     /// envd ready so a rootfs background download (when enabled) never
     /// waits out the fallback with no notification.
@@ -424,6 +437,7 @@ impl SandboxBackend for FirecrackerSandbox {
             runtime_artifacts: RuntimeArtifactSet::from_overlaybd_image_configs(
                 self.runtime_image_config_paths(),
             ),
+            mem_control: self.mem_control,
         }
     }
 
@@ -449,6 +463,14 @@ impl SandboxBackend for FirecrackerSandbox {
         } else {
             bail!("sandbox has no active network slot")
         }
+    }
+
+    async fn memory_telemetry(&self) -> Result<Option<SandboxMemoryTelemetry>> {
+        FirecrackerSandbox::memory_telemetry(self).await
+    }
+
+    async fn set_memory_plug_target(&mut self, mib: u32) -> Result<()> {
+        FirecrackerSandbox::set_memory_plug_target(self, mib).await
     }
 
     fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>) {
@@ -676,6 +698,10 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
     ) -> Result<(FirecrackerSnapshotConfig, FirecrackerSnapshotManifest)> {
         debug!(snapshot_dir = %snapshot_dir.display(), "pausing sandbox");
+        // Before the pause, not after: this is the only `fc_instance.pause()`
+        // in the file, so one call here covers pause, snapshot, fork and
+        // template build, and the guest is still running to answer.
+        self.run_free_page_hinting().await;
         self.fc_instance.pause().await?;
 
         tokio::fs::create_dir_all(snapshot_dir)
@@ -685,11 +711,7 @@ impl FirecrackerSandbox {
         let snapshot_result = self.snapshot_to_dir(snapshot_dir).await;
         match snapshot_result {
             Ok(snapshot) => {
-                // Advance the chain only once the capture has succeeded. A
-                // failed capture that resumes in place must leave the sandbox
-                // stacking onto the same parent it had before.
-                self.mem_snapshot_parent_config_path =
-                    Some(snapshot.0.mem_overlaybd_config.image_config_path.clone());
+                self.record_capture_as_chain_parent(&snapshot.0);
                 Ok(snapshot)
             }
             Err(err) => {
@@ -697,6 +719,21 @@ impl FirecrackerSandbox {
                 Err(err)
             }
         }
+    }
+
+    /// Makes `captured` the parent the next capture stacks onto.
+    ///
+    /// Called only from the success arm above. A failed capture resumes the VM
+    /// in place, so the chain it stacks onto has not moved, and advancing the
+    /// parent there would leave the next capture diffing against a layer that
+    /// was never written.
+    ///
+    /// Split out of `pause_to_dir` because the rest of that function needs a
+    /// live VM and this rule does not; it is the half that can be pinned by a
+    /// unit test.
+    fn record_capture_as_chain_parent(&mut self, captured: &FirecrackerSnapshotConfig) {
+        self.mem_snapshot_parent_config_path =
+            Some(captured.mem_overlaybd_config.image_config_path.clone());
     }
 
     async fn snapshot_to_dir(
@@ -930,11 +967,14 @@ impl FirecrackerSandbox {
             guard.stop().await;
         }
 
-        // Cleanup network resources
+        // Cleanup network resources. Release tears down the veth and unmounts
+        // the namespace, so it goes to the blocking pool rather than parking
+        // the worker running this stop.
         if let Some(slot) = self.network_slot.take() {
             let idx = slot.idx;
-            NetworkManager::global()
-                .release(slot)
+            tokio::task::spawn_blocking(move || NetworkManager::global().release(slot))
+                .await
+                .context("network slot release task")?
                 .context("Failed to release network slot")?;
             debug!(slot = idx, "network slot released");
         }
@@ -1164,10 +1204,193 @@ impl Drop for FirecrackerSandbox {
         // the daemon shuts down.
         self.extra_drive_runtimes.clear();
         if let Some(slot) = self.network_slot.take() {
-            if let Err(e) = NetworkManager::global().release(slot) {
-                warn!(error = %e, "failed to release network slot on drop");
-            }
+            // Drop cannot await, and this drop often runs on a Tokio worker.
+            NetworkManager::global().release_detached(slot);
         }
+    }
+}
+
+// ── Memory control ───────────────────────────────────────────────────────────
+
+impl FirecrackerSandbox {
+    /// Record which memory-control devices this VM actually has.
+    ///
+    /// Called once per start, on both the fresh and the resume path. The
+    /// resume path is not optional: a snapshot captured before a device existed
+    /// comes back without it no matter how this node is configured, and a
+    /// snapshot captured with one comes back with it even on a node that has
+    /// since turned the feature off. Only the live VM knows.
+    ///
+    /// Never fails a start. A node whose Firecracker build does not serve
+    /// `GET /vm/config` keeps every capability bit false and loses the elastic
+    /// features, which is the same position it was in before they existed.
+    async fn probe_memory_control(&mut self) {
+        let vm_config = match self.fc_instance.vm_config().await {
+            Ok(vm_config) => vm_config,
+            Err(err) => {
+                warn!(
+                    sandbox_id = %self.id,
+                    error = %err,
+                    "memory control capability probe failed; treating the sandbox as having no \
+                     balloon or hot-plug device"
+                );
+                self.mem_control = MemoryControlCapability::default();
+                Self::record_memory_capability_metrics(self.mem_control);
+                return;
+            }
+        };
+
+        let balloon = vm_config.balloon.as_deref();
+        self.mem_control = MemoryControlCapability {
+            balloon: balloon.is_some(),
+            balloon_stats: balloon
+                .and_then(|balloon| balloon.stats_polling_interval_s)
+                .is_some_and(|interval| interval > 0),
+            free_page_hinting: balloon
+                .and_then(|balloon| balloon.free_page_hinting)
+                .unwrap_or(false),
+            hotplug: vm_config.memory_hotplug.is_some(),
+        };
+        Self::record_memory_capability_metrics(self.mem_control);
+
+        if self.mem_control.is_inert() {
+            debug!(
+                sandbox_id = %self.id,
+                "sandbox has no memory control devices; elastic memory is inactive for it"
+            );
+        }
+    }
+
+    fn record_memory_capability_metrics(capability: MemoryControlCapability) {
+        for (name, supported) in [
+            ("balloon", capability.balloon),
+            ("balloon_stats", capability.balloon_stats),
+            ("free_page_hinting", capability.free_page_hinting),
+            ("hotplug", capability.hotplug),
+        ] {
+            metrics::counter!(
+                "agentenv_sandbox_memory_capability_total",
+                "capability" => name,
+                "supported" => if supported { "true" } else { "false" },
+            )
+            .increment(1);
+        }
+    }
+
+    async fn memory_telemetry(&self) -> Result<Option<SandboxMemoryTelemetry>> {
+        if !self.mem_control.balloon_stats {
+            return Ok(None);
+        }
+        let stats = self
+            .fc_instance
+            .balloon_statistics()
+            .await
+            .context("sample balloon statistics")?;
+
+        // A field the guest never sent stays absent: the balloon statistics are
+        // gated on the guest kernel, and collapsing a missing counter to zero
+        // would make a guest that cannot report allocation stalls
+        // indistinguishable from one that has had none. A negative value is
+        // not meaningful for any of them, so clamp that rather than fail a
+        // whole control pass over one odd sample.
+        fn non_negative(value: Option<i64>) -> Option<u64> {
+            value.map(|value| u64::try_from(value).unwrap_or(0))
+        }
+
+        let mut telemetry = SandboxMemoryTelemetry {
+            available_bytes: non_negative(stats.available_memory),
+            total_bytes: non_negative(stats.total_memory),
+            disk_caches_bytes: non_negative(stats.disk_caches),
+            oom_kills: non_negative(stats.oom_kill),
+            alloc_stalls: non_negative(stats.alloc_stall),
+            plugged_mib: None,
+            requested_mib: None,
+        };
+
+        if self.mem_control.hotplug {
+            let status = self
+                .fc_instance
+                .memory_hotplug_status()
+                .await
+                .context("read hot-plug memory status")?;
+            telemetry.plugged_mib = status
+                .plugged_size_mib
+                .and_then(|mib| u32::try_from(mib).ok());
+            telemetry.requested_mib = status
+                .requested_size_mib
+                .and_then(|mib| u32::try_from(mib).ok());
+        }
+
+        Ok(Some(telemetry))
+    }
+
+    async fn set_memory_plug_target(&mut self, mib: u32) -> Result<()> {
+        anyhow::ensure!(
+            self.mem_control.hotplug,
+            "sandbox {} has no virtio-mem device, so its memory ceiling cannot be moved",
+            self.id
+        );
+        self.fc_instance
+            .patch_memory_hotplug(mib)
+            .await
+            .context("set hot-plug memory target")
+    }
+
+    /// Ask the guest to declare its free pages so the imminent capture can skip
+    /// them.
+    ///
+    /// Issued while the guest is still executing, and deliberately so. Hinting
+    /// is a handshake — the host raises `host_cmd` and waits for the balloon
+    /// driver to raise `guest_cmd` to match — and a paused vCPU cannot drain
+    /// the balloon queue, so running this after the pause would burn the whole
+    /// timeout on every capture and never complete once.
+    ///
+    /// Best-effort throughout: any failure, and expiry of the timeout, fall
+    /// through to a capture that behaves exactly as it would with hinting off.
+    async fn run_free_page_hinting(&self) {
+        // Read from the launch config rather than the process-global one: it
+        // is the same balloon block, resolved for this sandbox, and it is what
+        // the resume path already reconciles against the node.
+        let config = &self.launch.common().balloon;
+        if !config.free_page_hinting_on_capture || !self.mem_control.free_page_hinting {
+            return;
+        }
+
+        let mut guard = MetricGuard::stage(MEMORY_HINTING_DURATION_METRIC, "hinting");
+        let outcome = self.free_page_hinting_round_trip(config).await;
+        guard.finish(&outcome);
+        if let Err(err) = outcome {
+            warn!(
+                sandbox_id = %self.id,
+                error = %err,
+                "free page hinting did not complete; capturing the full dirty set"
+            );
+        }
+
+        // Stop unconditionally: an abandoned run left armed would leak into the
+        // next capture's status poll, which would then read a stale completed
+        // handshake and skip its own wait.
+        if let Err(err) = self.fc_instance.stop_free_page_hinting().await {
+            warn!(sandbox_id = %self.id, error = %err, "failed to stop free page hinting");
+        }
+    }
+
+    async fn free_page_hinting_round_trip(&self, config: &BalloonConfig) -> Result<()> {
+        self.fc_instance.start_free_page_hinting(true).await?;
+        let deadline = Duration::from_millis(config.free_page_hinting_timeout_ms);
+        tokio::time::timeout(deadline, async {
+            loop {
+                let status = self.fc_instance.free_page_hinting_status().await?;
+                if status.guest_cmd == Some(status.host_cmd) {
+                    return Ok(());
+                }
+                tokio::time::sleep(FREE_PAGE_HINTING_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("guest did not acknowledge free page hinting within {deadline:?}")
+        })?
     }
 }
 
@@ -1209,6 +1432,7 @@ impl FirecrackerSandbox {
             mem_ublk_device: None,
             mem_snapshot_image_config_path: None,
             mem_snapshot_parent_config_path,
+            mem_control: MemoryControlCapability::default(),
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),
             live_snapshot_root: None,
@@ -1398,6 +1622,7 @@ impl FirecrackerSandbox {
         self.configure_microvm(&config, boot_args.as_deref(), &extra_drive_attachments)
             .await?;
         self.fc_instance.start().await?;
+        self.probe_memory_control().await;
         debug!("fresh sandbox started");
         Ok(())
     }
@@ -1630,6 +1855,11 @@ impl FirecrackerSandbox {
             .await
             .context("reconcile disk rate limiter on snapshot resume")?;
 
+        // Same window, same reason: the restored VM's memory devices come from
+        // vm_state.bin, so this is the first moment they can be observed and
+        // the last moment before the guest starts running against them.
+        self.probe_memory_control().await;
+
         self.fc_instance.resume().await?;
 
         debug!("sandbox restored from snapshot config");
@@ -1787,7 +2017,7 @@ impl FirecrackerSandbox {
         // Paired with DAMON reclaim (kernel boot args): DAMON reclaims cold
         // pagecache pages inside the guest, and the balloon device reports the
         // resulting free pages to the host VMM so it can release physical memory.
-        self.fc_instance.set_balloon().await?;
+        self.fc_instance.set_balloon(&config.common.balloon).await?;
 
         Ok(())
     }
@@ -1976,6 +2206,364 @@ mod tests {
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
         }
+    }
+
+    use super::super::socket::fake::{FakeFirecracker, FakeReply};
+
+    /// A sandbox whose Firecracker API socket is served by `fake`, with the
+    /// balloon features `balloon` asks for and the matching probed capability.
+    ///
+    /// The socket path is derived the same way the real one is, so nothing here
+    /// reaches around the code under test.
+    fn hinting_sandbox(
+        balloon: crate::cfg::BalloonConfig,
+        capability: MemoryControlCapability,
+    ) -> Result<(FirecrackerSandbox, FakeFirecracker)> {
+        let mut config = overlaybd_config();
+        config.common.balloon = balloon;
+        let mut sandbox = FirecrackerSandbox::new(config)?;
+        sandbox.mem_control = capability;
+        let fake = FakeFirecracker::spawn(
+            &sandbox.work_dir.path().join("firecracker.socket"),
+            |_method, path| match path {
+                "/balloon/hinting/status" => {
+                    FakeReply::json(serde_json::json!({"host_cmd": 1, "guest_cmd": 1}))
+                }
+                _ => FakeReply::no_content(),
+            },
+        )?;
+        Ok((sandbox, fake))
+    }
+
+    fn hinting_on() -> crate::cfg::BalloonConfig {
+        crate::cfg::BalloonConfig {
+            stats_polling_interval_s: 1,
+            free_page_hinting: true,
+            free_page_hinting_on_capture: true,
+            free_page_hinting_timeout_ms: 500,
+        }
+    }
+
+    fn hinting_capability() -> MemoryControlCapability {
+        MemoryControlCapability {
+            balloon: true,
+            balloon_stats: true,
+            free_page_hinting: true,
+            hotplug: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn hinting_runs_before_the_vm_is_paused() -> Result<()> {
+        // Hinting is a handshake with the guest balloon driver. A paused vCPU
+        // cannot drain the balloon queue, so a run issued after PATCH /vm
+        // would never complete and every capture would burn the full timeout.
+        let (mut sandbox, fake) = hinting_sandbox(hinting_on(), hinting_capability())?;
+        let snapshot_dir = sandbox.work_dir.path().join("snapshot");
+
+        // The capture itself cannot succeed without a live Firecracker
+        // process to read memory out of; the ordering before that point is
+        // what this pins.
+        let _ = sandbox.pause_to_dir(&snapshot_dir).await;
+
+        let sequence = fake.path_sequence();
+        let pause_at = sequence
+            .iter()
+            .position(|path| path == "/vm")
+            .expect("the VM was never paused");
+        let start_at = sequence
+            .iter()
+            .position(|path| path == "/balloon/hinting/start")
+            .expect("hinting never started");
+        let stop_at = sequence
+            .iter()
+            .position(|path| path == "/balloon/hinting/stop")
+            .expect("hinting never stopped");
+
+        assert!(
+            start_at < pause_at && stop_at < pause_at,
+            "the whole hinting run must precede the pause, got {sequence:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hinting_is_skipped_when_the_run_switch_is_off() -> Result<()> {
+        let mut balloon = hinting_on();
+        balloon.free_page_hinting_on_capture = false;
+        let (mut sandbox, fake) = hinting_sandbox(balloon, hinting_capability())?;
+        let snapshot_dir = sandbox.work_dir.path().join("snapshot");
+
+        let _ = sandbox.pause_to_dir(&snapshot_dir).await;
+
+        assert!(
+            !fake
+                .path_sequence()
+                .iter()
+                .any(|path| path.starts_with("/balloon/hinting")),
+            "the shipped default must not touch the hinting endpoints"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn hinting_is_skipped_when_the_vm_has_no_hinting_capable_balloon() -> Result<()> {
+        // A snapshot captured before the feature existed comes back without
+        // it however this node is configured, so the probed capability — not
+        // the config — decides.
+        let (mut sandbox, fake) =
+            hinting_sandbox(hinting_on(), MemoryControlCapability::default())?;
+        let snapshot_dir = sandbox.work_dir.path().join("snapshot");
+
+        let _ = sandbox.pause_to_dir(&snapshot_dir).await;
+
+        assert!(!fake
+            .path_sequence()
+            .iter()
+            .any(|path| path.starts_with("/balloon/hinting")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_guest_that_never_answers_does_not_hold_up_the_capture() -> Result<()> {
+        let mut config = overlaybd_config();
+        config.common.balloon = hinting_on();
+        config.common.balloon.free_page_hinting_timeout_ms = 150;
+        let mut sandbox = FirecrackerSandbox::new(config)?;
+        sandbox.mem_control = hinting_capability();
+        let fake = FakeFirecracker::spawn(
+            &sandbox.work_dir.path().join("firecracker.socket"),
+            |_method, path| match path {
+                // The guest never acknowledges: guest_cmd stays behind.
+                "/balloon/hinting/status" => {
+                    FakeReply::json(serde_json::json!({"host_cmd": 1, "guest_cmd": 0}))
+                }
+                _ => FakeReply::no_content(),
+            },
+        )?;
+        let snapshot_dir = sandbox.work_dir.path().join("snapshot");
+
+        let started = std::time::Instant::now();
+        let _ = sandbox.pause_to_dir(&snapshot_dir).await;
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "an unanswered hinting run must fall through on its timeout, took {elapsed:?}"
+        );
+        let sequence = fake.path_sequence();
+        assert!(
+            sequence.iter().any(|path| path == "/balloon/hinting/stop"),
+            "an abandoned run must still be stopped, got {sequence:?}"
+        );
+        assert!(
+            sequence.iter().any(|path| path == "/vm"),
+            "a hinting timeout must not fail the pause, got {sequence:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_capability_probe_reads_the_live_device_set() -> Result<()> {
+        let mut sandbox = FirecrackerSandbox::new(overlaybd_config())?;
+        let _fake = FakeFirecracker::spawn(
+            &sandbox.work_dir.path().join("firecracker.socket"),
+            |_method, path| {
+                assert_eq!(path, "/vm/config");
+                FakeReply::json(serde_json::json!({
+                    "balloon": {
+                        "amount_mib": 0,
+                        "deflate_on_oom": true,
+                        "stats_polling_interval_s": 1,
+                        "free_page_hinting": true,
+                    },
+                    "memory-hotplug": {"total_size_mib": 1024},
+                }))
+            },
+        )?;
+
+        sandbox.probe_memory_control().await;
+
+        assert_eq!(
+            sandbox.runtime_info().mem_control,
+            MemoryControlCapability {
+                balloon: true,
+                balloon_stats: true,
+                free_page_hinting: true,
+                hotplug: true,
+            }
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_balloon_without_statistics_is_not_reported_as_stats_capable() -> Result<()> {
+        // Statistics cannot be armed after boot, so a device that came back
+        // without them is a permanent opt-out for the control loop, not a
+        // retryable condition.
+        let mut sandbox = FirecrackerSandbox::new(overlaybd_config())?;
+        let _fake = FakeFirecracker::spawn(
+            &sandbox.work_dir.path().join("firecracker.socket"),
+            |_method, _path| {
+                FakeReply::json(serde_json::json!({
+                    "balloon": {"amount_mib": 0, "deflate_on_oom": true},
+                }))
+            },
+        )?;
+
+        sandbox.probe_memory_control().await;
+
+        let capability = sandbox.runtime_info().mem_control;
+        assert!(capability.balloon);
+        assert!(!capability.balloon_stats);
+        assert!(!capability.free_page_hinting);
+        assert!(sandbox.memory_telemetry().await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_probe_leaves_every_capability_off() -> Result<()> {
+        let mut sandbox = FirecrackerSandbox::new(overlaybd_config())?;
+        let _fake = FakeFirecracker::spawn(
+            &sandbox.work_dir.path().join("firecracker.socket"),
+            |_method, _path| FakeReply::bad_request("no such resource"),
+        )?;
+
+        sandbox.probe_memory_control().await;
+
+        assert!(sandbox.runtime_info().mem_control.is_inert());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_telemetry_reports_the_guest_numbers_and_the_plugged_size() -> Result<()> {
+        let mut sandbox = FirecrackerSandbox::new(overlaybd_config())?;
+        sandbox.mem_control = MemoryControlCapability {
+            balloon: true,
+            balloon_stats: true,
+            free_page_hinting: false,
+            hotplug: true,
+        };
+        let _fake = FakeFirecracker::spawn(
+            &sandbox.work_dir.path().join("firecracker.socket"),
+            |_method, path| match path {
+                "/balloon/statistics" => FakeReply::json(serde_json::json!({
+                    "target_pages": 0,
+                    "actual_pages": 0,
+                    "target_mib": 0,
+                    "actual_mib": 0,
+                    "available_memory": 256_000_000,
+                    "total_memory": 1_024_000_000,
+                    "disk_caches": 64_000_000,
+                    "alloc_stall": 4,
+                    "oom_kill": 0,
+                })),
+                "/hotplug/memory" => FakeReply::json(serde_json::json!({
+                    "plugged_size_mib": 256,
+                    "requested_size_mib": 512,
+                })),
+                other => panic!("unexpected path {other}"),
+            },
+        )?;
+
+        let telemetry = sandbox
+            .memory_telemetry()
+            .await?
+            .expect("a stats-capable balloon must produce a sample");
+
+        assert_eq!(telemetry.available_bytes, Some(256_000_000));
+        assert_eq!(telemetry.total_bytes, Some(1_024_000_000));
+        assert_eq!(telemetry.disk_caches_bytes, Some(64_000_000));
+        assert_eq!(telemetry.alloc_stalls, Some(4));
+        assert_eq!(telemetry.oom_kills, Some(0));
+        assert_eq!(telemetry.plugged_mib, Some(256));
+        assert_eq!(telemetry.requested_mib, Some(512));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_counter_the_guest_omits_is_reported_as_absent_not_as_zero() -> Result<()> {
+        // oom_kill and alloc_stall are gated on the guest kernel version, and
+        // total_memory on the driver reporting S_MEMTOT. Collapsing an absent
+        // field to zero makes a guest that cannot report distress look like
+        // one that has had none, and a guest that reports no total look like
+        // one with none at all.
+        let mut sandbox = FirecrackerSandbox::new(overlaybd_config())?;
+        sandbox.mem_control = MemoryControlCapability {
+            balloon: true,
+            balloon_stats: true,
+            free_page_hinting: false,
+            hotplug: false,
+        };
+        let _fake = FakeFirecracker::spawn(
+            &sandbox.work_dir.path().join("firecracker.socket"),
+            |_method, _path| {
+                FakeReply::json(serde_json::json!({
+                    "target_pages": 0,
+                    "actual_pages": 0,
+                    "target_mib": 0,
+                    "actual_mib": 0,
+                    "available_memory": 256_000_000,
+                }))
+            },
+        )?;
+
+        let telemetry = sandbox
+            .memory_telemetry()
+            .await?
+            .expect("a stats-capable balloon must produce a sample");
+
+        assert_eq!(telemetry.oom_kills, None);
+        assert_eq!(telemetry.alloc_stalls, None);
+        assert_eq!(telemetry.total_bytes, None);
+        assert!(telemetry.is_blind_to_distress());
+        assert!(
+            telemetry.guest_position().is_none(),
+            "a sample with no total describes no position"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn configure_microvm_arms_the_balloon_the_operator_asked_for() -> Result<()> {
+        // Every balloon feature is pre-boot, so this single PUT during
+        // configuration is the whole window in which `[machine.balloon]` can
+        // reach a microVM. If the launch config is not what is sent, the
+        // operator's block is inert and no later call can recover it.
+        let mut config = overlaybd_config();
+        config.common.balloon = crate::cfg::BalloonConfig {
+            stats_polling_interval_s: 9,
+            free_page_hinting: true,
+            free_page_hinting_on_capture: false,
+            free_page_hinting_timeout_ms: 3000,
+        };
+        let sandbox = FirecrackerSandbox::new(config.clone())?;
+        let fake = FakeFirecracker::spawn(
+            &sandbox.work_dir.path().join("firecracker.socket"),
+            |_method, _path| FakeReply::no_content(),
+        )?;
+
+        sandbox.configure_microvm(&config, None, &[]).await?;
+
+        let body = fake
+            .body_of("/balloon")
+            .expect("configuring a microVM must PUT the balloon");
+        assert_eq!(body["stats_polling_interval_s"], 9);
+        assert_eq!(body["free_page_hinting"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn moving_the_plug_target_is_refused_without_a_virtio_mem_device() -> Result<()> {
+        let mut sandbox = FirecrackerSandbox::new(overlaybd_config())?;
+        sandbox.mem_control = hinting_capability();
+
+        let err = FirecrackerSandbox::set_memory_plug_target(&mut sandbox, 1024)
+            .await
+            .expect_err("a sandbox with no virtio-mem device cannot move its ceiling");
+
+        assert!(err.to_string().contains("no virtio-mem device"));
+        Ok(())
     }
 
     fn rate_limit_cfg() -> crate::cfg::DiskRateLimitConfig {
@@ -2458,6 +3046,104 @@ mod tests {
             sandbox.mem_snapshot_parent_config_path.as_deref(),
             Some(parent.as_path()),
             "a resumed sandbox must stack its next capture onto the image it resumed from"
+        );
+        Ok(())
+    }
+
+    /// Each capture becomes the parent of the next one.
+    ///
+    /// This is the whole of the memory chain's shape. A second capture whose
+    /// parent is still the launch-time config produces a layer that diffs
+    /// against a state two captures old, and the first capture's delta is in
+    /// no image at all — silent corruption, visible only when the snapshot is
+    /// restored and the guest's memory is missing whatever changed between the
+    /// two captures.
+    #[test]
+    fn each_capture_becomes_the_parent_of_the_next() -> Result<()> {
+        let snapshot = snapshot_config_with_mem_image("/snapshots/launch/mem_image.json");
+        let mut sandbox = FirecrackerSandbox::from_snapshot_config(&snapshot)?;
+
+        let first = snapshot_config_with_mem_image("/snapshots/capture-1/mem_image.json");
+        sandbox.record_capture_as_chain_parent(&first);
+        assert_eq!(
+            sandbox.mem_snapshot_parent_config_path.as_deref(),
+            Some(std::path::Path::new("/snapshots/capture-1/mem_image.json")),
+            "the first capture must replace the launch-time parent"
+        );
+
+        let second = snapshot_config_with_mem_image("/snapshots/capture-2/mem_image.json");
+        sandbox.record_capture_as_chain_parent(&second);
+        assert_eq!(
+            sandbox.mem_snapshot_parent_config_path.as_deref(),
+            Some(std::path::Path::new("/snapshots/capture-2/mem_image.json")),
+            "the second capture must stack onto the first, not back onto the launch config"
+        );
+        Ok(())
+    }
+
+    /// Answers one Firecracker API request with 204 on the socket the sandbox
+    /// will use, so a test can drive `pause_to_dir` past the VM pause without a
+    /// hypervisor.
+    fn fake_firecracker_api(socket_path: std::path::PathBuf) -> tokio::task::JoinHandle<()> {
+        use http_body_util::Full;
+        use hyper::body::Incoming;
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::{Request, Response, StatusCode};
+        use hyper_util::rt::TokioIo;
+
+        let listener =
+            tokio::net::UnixListener::bind(&socket_path).expect("bind the fake firecracker socket");
+        tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(
+                    TokioIo::new(stream),
+                    service_fn(|_: Request<Incoming>| async move {
+                        Ok::<_, std::convert::Infallible>(
+                            Response::builder()
+                                .status(StatusCode::NO_CONTENT)
+                                .body(Full::new(bytes::Bytes::new()))
+                                .expect("build response"),
+                        )
+                    }),
+                )
+                .await;
+        })
+    }
+
+    /// A capture that fails after the VM is paused leaves the chain where it
+    /// was.
+    ///
+    /// This is the arm that matters: the VM has been paused, so the sandbox is
+    /// mutated, and the capture then fails while writing the layer.
+    /// `pause_to_dir` resumes in place, so the next capture still diffs against
+    /// the same parent — advancing it here would point that capture at a
+    /// `mem_image.json` nothing ever wrote, and the layer it produced would be
+    /// a diff against a state that does not exist.
+    #[tokio::test]
+    async fn a_failed_capture_leaves_the_memory_chain_alone() -> Result<()> {
+        let snapshot = snapshot_config_with_mem_image("/snapshots/parent/mem_image.json");
+        let mut sandbox = FirecrackerSandbox::from_snapshot_config(&snapshot)?;
+        let before = sandbox.mem_snapshot_parent_config_path.clone();
+        assert!(before.is_some(), "the fixture must start with a parent");
+
+        let server = fake_firecracker_api(sandbox.work_dir.path().join("firecracker.socket"));
+        let snapshot_dir = sandbox.work_dir.path().join("failed-capture");
+        let result = sandbox.pause_to_dir(&snapshot_dir).await;
+        server.abort();
+
+        let error = result.expect_err("a sandbox with no live VM cannot write a memory layer");
+        assert!(
+            !format!("{error:#}").contains("Failed to pause microVM"),
+            "the capture must have failed after the pause, not at it: {error:#}"
+        );
+        assert_eq!(
+            sandbox.mem_snapshot_parent_config_path, before,
+            "a failed capture advanced the memory chain onto a layer it never wrote"
         );
         Ok(())
     }

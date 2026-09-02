@@ -117,7 +117,7 @@ impl FirecrackerPool {
         let firecracker_work_base_dir = app_config.firecracker.work_dir.clone();
 
         Self {
-            pool: WarmPool::new(pool_config.pool),
+            pool: WarmPool::named(pool_config.pool, "firecracker"),
             binary,
             socket_timeout,
             socket_poll_interval,
@@ -290,8 +290,14 @@ impl FirecrackerPool {
 
     #[tracing::instrument(skip(self))]
     async fn create_warm_async(&self) -> Result<WarmFirecracker> {
-        let slot = NetworkManager::global()
-            .allocate_any()
+        // `allocate_any` is fully synchronous, and this is the first statement
+        // of the future `fill_warm_entries` joins. Polled inline it blocks the
+        // maintenance thread inside `Runtime::block_on`, so future 0 finishes
+        // before future 1 is ever polled and `fill_concurrency` is 1 whatever
+        // it is configured to be.
+        let slot = tokio::task::spawn_blocking(|| NetworkManager::global().allocate_any())
+            .await
+            .context("firecracker pool: network slot task")?
             .context("firecracker pool: allocate network slot")?;
 
         let work_dir = match create_firecracker_work_dir(self.firecracker_work_base_dir.as_deref())

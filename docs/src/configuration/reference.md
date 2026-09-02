@@ -219,6 +219,25 @@ override them.
 |-----|------|---------|-------------|
 | `always_denied_cidrs` | array of IPv4 CIDR strings | `["10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16"]` | Destination CIDRs that are always rejected from sandboxes before user egress policy is evaluated. Deployments can remove selected RFC1918 ranges when sandbox egress to those destinations is required. |
 
+## `[network.iptables]`
+
+How `iptables-restore` is told to wait for the xtables lock. Only the legacy
+backend takes that lock at all; `xtables-nft-restore` accepts both options and
+discards them, because an nft restore is one kernel netlink transaction. Both
+are passed `=`-bound: `-w`'s argument is optional in iptables' own getopt table,
+so a space-separated value is not bound to it.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `wait_secs` | integer | `5` | Seconds `iptables-restore` may block on the xtables lock. `0` passes neither option and leaves the binary's own lock behavior in place. |
+| `wait_interval_usec` | integer | `20000` | Microseconds between lock retries. The binary's own default is one second, far longer than the few milliseconds a slot setup holds the lock. |
+
+## `[network.slot]`
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `create_veth_peer_in_namespace` | boolean | `false` | Create the namespace end of the veth pair directly in the sandbox namespace rather than creating both ends inside it and moving the host end back out. The move is `dev_change_net_namespace()`, the one slot operation documented to hold RTNL across an RCU grace period. Off until the resulting devices have been compared against the moved-end path on the target kernel. |
+
 ## `[network.internal]`
 
 AgentENV-internal sandbox address plan. Change these only when the defaults
@@ -262,6 +281,75 @@ Validation rules, enforced at config load when `enabled` is true:
 - Each burst requires its matching sustained limit to be nonzero; a burst paired
   with a zero sustained limit is silently ignored by the consumer.
 - Every value must fit Firecracker's signed `i64` token-bucket fields.
+
+## `[machine.balloon]`
+
+virtio-balloon device features requested for every microVM this node boots.
+Every key here is pre-boot only: Firecracker rejects a balloon reconfiguration
+after the VM starts, and the statistics sub-feature explicitly cannot be turned
+on or off after boot. A sandbox therefore keeps whatever this block said when it
+first booted, for its whole life and for every snapshot taken from it, so a
+change here reaches new sandboxes only. PVM nodes force every field off, because
+the statistics and hinting endpoints are patches carried by the KVM build.
+
+The balloon stays a reporting device. AgentENV never inflates it: forced
+inflation would fight the in-guest DAMON reclaim watermarks set in
+`[firecracker].boot_args`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `stats_polling_interval_s` | integer | `1` | Seconds between guest statistics refreshes; `0` disables statistics. The only source of guest memory consumption that does not double-count the shared memory device across sandboxes. |
+| `free_page_hinting` | boolean | `false` | Enable the free-page-hinting device feature bit |
+| `free_page_hinting_on_capture` | boolean | `false` | Run free-page hinting before each memory capture, so freed pages stay out of the layer. Requires the feature bit above, and is skipped for a sandbox whose balloon does not report hinting. |
+| `free_page_hinting_timeout_ms` | integer | `3000` | How long a hinting run may hold up a capture. The run happens while the guest still executes, so this is added pause latency, not guest downtime; on expiry the capture proceeds as if hinting were off. |
+
+Validation rule, enforced at config load: `free_page_hinting_on_capture` requires
+`free_page_hinting`. The device feature bit is pre-boot only, so a run requested
+without it is silently skipped for every sandbox rather than staged for later.
+
+## `[machine.memory_control]`
+
+Node memory-pressure control loop. It complements the in-guest DAMON reclaim
+configured in `[firecracker].boot_args` rather than duplicating it: DAMON runs
+with `skip_anon=Y` and so reclaims only cold page cache, while this loop moves
+each guest's RAM ceiling from the host side.
+
+The loop never raises a sandbox above the `memoryMB` it was created with. That
+ceiling governs the guest's *total* memory rather than its hot-plug region, so a
+guest already holding its full `memoryMB` is held whatever its hot-plug region
+reports, and growth has room only for a sandbox that boots below its ceiling.
+The loop skips any sandbox that is not `Running` — a plug or unplug during a
+capture would move pages the dirty-range path cannot describe — and it abandons
+any backend call that does not answer promptly rather than hold the sandbox's
+lock against pause, resume, snapshot, fork and delete. Actuation additionally
+requires a virtio-mem device on the sandbox; without one the loop only samples
+and reports.
+
+A guest that reports no memory totals — a device present with a driver that
+never reports them — is held, never reclaimed from: silence is not slack.
+Likewise, a host over its watermark refuses growth to every guest but reclaims
+only from guests that are actually over-provisioned; taking pages from a guest
+that is already OOM-killing deepens the guest OOM and returns nothing to the
+host.
+
+Validation rules, enforced at config load when `enabled` is true:
+
+- `interval_secs` and `max_step_mib` must be > 0.
+- `node_memory_high_percent` must be between 1 and 100. Zero would put the node
+  permanently over its watermark.
+- `grow_available_percent` must be strictly below `shrink_available_percent`.
+  An inverted or empty band leaves a guest both distressed and over-provisioned,
+  and the distressed arm wins forever.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | boolean | `false` | Run the loop at all |
+| `interval_secs` | integer | `15` | Seconds between passes |
+| `grow_available_percent` | integer | `10` | Grow below this share of guest memory available, or as soon as the guest's allocation-stall counters move |
+| `shrink_available_percent` | integer | `40` | Consider a guest over-provisioned above this share available |
+| `shrink_hysteresis_passes` | integer | `4` | Consecutive over-provisioned passes before anything is taken back |
+| `max_step_mib` | integer | `512` | Largest single move, in MiB |
+| `node_memory_high_percent` | integer | `85` | Host memory utilisation above which the node refuses all growth and reclaims from over-provisioned guests. Read from cgroup-aware host metrics, so under a container limit this is a share of the limit. |
 
 ## `[envd]`
 
@@ -319,6 +407,25 @@ see pre-reservation capacity.
 | `retry_after_secs` | integer | `2` | `Retry-After` seconds returned with a rejection |
 | `snapshot_max_age_ms` | integer | `200` | How long one node-metrics reading may be reused across admission decisions. Collecting metrics walks every sandbox, so re-reading per decision would make the gate the bottleneck under the burst it exists to survive |
 
+## `[orchestrator.drain]`
+
+How `POST /admin/drain` empties this node. The call closes the node to new work
+and then runs one bounded pass over what it is already holding, reporting
+`{remaining, published, failed}`; the caller polls until `remaining` is zero.
+`deploy/k8s/base/agentenv-daemonset.yaml` drives it from the pod's `preStop`
+hook.
+
+A pass publishes paused state to the snapshot repository only when
+`[snapshot.mobility].enabled` is on. Off — the default — it still pauses
+everything, but uploads nothing: a published snapshot is reachable only through
+the mobility record that names it, so without one it is a copy of every byte the
+sandbox owns that nothing will ever read.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `concurrency` | integer | `4` | Sandboxes paused and published at once. Each writes a memory image, so this leans on storage the sandboxes still running here are also using |
+| `deadline_ms` | integer | `30000` | Deadline for one pass when the request omits `deadlineMs` |
+
 ## `[pool]`
 
 Shared process-wide warm-pool defaults used by network slots, block devices, and pre-spawned Firecracker processes. Pools prewarm to the low watermark, then grow the refill target geometrically toward the high watermark when real acquisitions drain the pool.
@@ -336,12 +443,15 @@ Component sections:
 | `[pool.network]` | `maintenance_enabled` | boolean | `true` | Enable the background network-slot maintenance worker |
 | `[pool.network]` | `startup_prewarm` | boolean | `true` | Build slots up to the low watermark during server startup |
 | `[pool.network]` | `fill_concurrency` | integer | `4` | Slots built concurrently per refill batch. Slot creation is dominated by RTNL-serialized netlink work, so this does not scale linearly |
+| `[pool.network]` | `low_watermark` | integer | inherits `[pool]` | Per-pool override of the shared low watermark |
+| `[pool.network]` | `high_watermark` | integer | inherits `[pool]` | Per-pool override of the shared high watermark |
 | `[pool.block]` | `enabled` | boolean | `true` | Enable the ublk overlaybd warm-device pool. Its only switch: `maintenance_enabled` and `fill_concurrency` do not apply, because the daemon refills asynchronously from request paths |
 | `[pool.block]` | `startup_prewarm` | boolean | capability-based | Prewarm block devices after the first reusable image shape is known. When omitted, it is enabled only if the kernel supports `UBLK_F_UPDATE_SIZE`; an explicit value overrides detection |
 | `[pool.firecracker]` | `enabled` | boolean | `true` | Enable pre-spawned Firecracker processes for snapshot resume |
 | `[pool.firecracker]` | `maintenance_enabled` | boolean | `true` | Enable the background Firecracker process maintenance worker |
 | `[pool.firecracker]` | `startup_prewarm` | boolean | `true` | Spawn warm Firecracker entries up to the low watermark during server startup |
 | `[pool.firecracker]` | `fill_concurrency` | integer | `4` | Maximum number of warm Firecracker processes created concurrently by one maintenance refill batch |
+| `[pool.block]`, `[pool.firecracker]` | `low_watermark`, `high_watermark` | integer | inherits `[pool]` | Per-pool overrides of the shared watermarks. The three pools hold very different resources, so one shared depth is a compromise between them rather than a setting for any of them |
 
 Validation rules:
 
@@ -461,10 +571,12 @@ POSIX filesystem-backed snapshot repository configuration. This section is used 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `snapshot_store` | string | `"$AENV_HOME/snapshot-store"` | Root directory for durable committed snapshot repository state. Relative explicit paths are resolved against the config file directory. |
+| `lock_strategy` | string | `"flock"` | How the catalog takes its alias and record locks. `flock` is kernel-enforced and released when the holding process dies. `create_new` uses a lock file carrying an ownership token, for filesystems that do not honour `flock` between every writer sharing one repository; it is strictly weaker, because a holder that dies leaves its lock behind until it ages out. |
 
 Environment variable overrides:
 
 - `AENV_SNAPSHOT_STORE`
+- `AENV_SNAPSHOT_STORE_LOCK_STRATEGY`
 
 ## `[backend.oss]`
 

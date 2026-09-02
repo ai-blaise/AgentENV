@@ -143,3 +143,136 @@ func TestSchedulerArtifactLookupNodeLimitDefaultsToEight(t *testing.T) {
 		t.Fatalf("default artifact_lookup_node_limit = %d, want 8", cfg.Scheduler.ArtifactLookupNodeLimit)
 	}
 }
+
+// The mode decides one thing that cannot be recovered from at runtime: whether
+// this process may run without a shared binding store. Three replicas with
+// three private binding maps answer a routing lookup correctly one time in
+// three, and nothing says so until a client is told a running sandbox does not
+// exist.
+func TestSchedulerReplicaRequiresASharedStore(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		mode      SchedulerMode
+		redisAddr string
+		wantErr   string
+	}{
+		{name: "a replica without redis is refused", mode: SchedulerModeReplica, wantErr: "requires scheduler.redis_addr"},
+		{name: "a replica with redis starts", mode: SchedulerModeReplica, redisAddr: "redis:6379"},
+		{name: "query-only without redis is refused", mode: SchedulerModeQueryOnly, wantErr: "requires scheduler.redis_addr"},
+		{name: "a primary without redis still starts", mode: SchedulerModePrimary},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := `"strategy": "round_robin"`
+			if tc.redisAddr != "" {
+				body += `, "redis_addr": "` + tc.redisAddr + `"`
+			}
+			_, err := LoadScheduler(writeSchedulerConfig(t, body), tc.mode)
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("LoadScheduler(%s) failed: %v", tc.mode, err)
+			case tc.wantErr != "" && err == nil:
+				t.Fatalf("LoadScheduler(%s) accepted a config it should refuse", tc.mode)
+			case tc.wantErr != "" && !strings.Contains(err.Error(), tc.wantErr):
+				t.Fatalf("LoadScheduler(%s) error = %v, want it to name %q", tc.mode, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// --query-only is what every shipped manifest and runbook says today, so it
+// keeps working. The two spellings can disagree, so setting both is refused
+// rather than resolved by precedence.
+func TestResolveSchedulerMode(t *testing.T) {
+	env := func(pairs map[string]string) func(string) (string, bool) {
+		return func(key string) (string, bool) {
+			value, ok := pairs[key]
+			return value, ok
+		}
+	}
+
+	for _, tc := range []struct {
+		name      string
+		modeFlag  string
+		queryOnly bool
+		env       map[string]string
+		want      SchedulerMode
+		wantErr   bool
+	}{
+		{name: "nothing set is a primary", want: SchedulerModePrimary},
+		{name: "the flag wins", modeFlag: "replica", env: map[string]string{"SCHEDULER_MODE": "primary"}, want: SchedulerModeReplica},
+		{name: "the environment is read when the flag is not set", env: map[string]string{"SCHEDULER_MODE": "query-only"}, want: SchedulerModeQueryOnly},
+		{name: "the deprecated alias still selects query-only", queryOnly: true, want: SchedulerModeQueryOnly},
+		{name: "both spellings at once is refused", modeFlag: "replica", queryOnly: true, wantErr: true},
+		{name: "an unknown mode is refused", modeFlag: "leader", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ResolveSchedulerMode(tc.modeFlag, tc.queryOnly, env(tc.env))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("ResolveSchedulerMode() = %q, want an error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ResolveSchedulerMode() error = %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("ResolveSchedulerMode() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// SchedulerConfig.UnmarshalJSON whitelists every field it reads, so a key added
+// to the struct and forgotten there parses into nothing and the operator's
+// value is silently the default.
+func TestSchedulerNodeStreamKeysAreParsed(t *testing.T) {
+	path := writeSchedulerConfig(t, `"redis_addr": "redis:6379",
+		"node_stream_enabled": false,
+		"node_stream_maxlen": 4096,
+		"node_stream_publish_queue": 128,
+		"node_stream_warmup_timeout": "3s",
+		"store_probe_interval": "500ms"`)
+
+	cfg, err := LoadScheduler(path, SchedulerModeReplica)
+	if err != nil {
+		t.Fatalf("LoadScheduler: %v", err)
+	}
+	if cfg.Scheduler.NodeStreamEnabledFor(SchedulerModeReplica) {
+		t.Fatal("node_stream_enabled = false did not disable the stream for a replica")
+	}
+	if cfg.Scheduler.NodeStreamMaxLen != 4096 {
+		t.Fatalf("node_stream_maxlen = %d, want 4096", cfg.Scheduler.NodeStreamMaxLen)
+	}
+	if cfg.Scheduler.NodeStreamPublishQueue != 128 {
+		t.Fatalf("node_stream_publish_queue = %d, want 128", cfg.Scheduler.NodeStreamPublishQueue)
+	}
+	if cfg.Scheduler.NodeStreamWarmupTimeout != 3*time.Second {
+		t.Fatalf("node_stream_warmup_timeout = %s, want 3s", cfg.Scheduler.NodeStreamWarmupTimeout)
+	}
+	if cfg.Scheduler.StoreProbeInterval != 500*time.Millisecond {
+		t.Fatalf("store_probe_interval = %s, want 500ms", cfg.Scheduler.StoreProbeInterval)
+	}
+}
+
+// The default is on for a replica, because a replica that does not replicate is
+// strictly worse than the single scheduler it was scaled out from, and off
+// everywhere else, because nothing else has peers to hear from.
+func TestSchedulerNodeStreamDefaultsByMode(t *testing.T) {
+	cfg, err := LoadScheduler(writeSchedulerConfig(t, `"redis_addr": "redis:6379"`), SchedulerModeReplica)
+	if err != nil {
+		t.Fatalf("LoadScheduler: %v", err)
+	}
+	for _, tc := range []struct {
+		mode SchedulerMode
+		want bool
+	}{
+		{mode: SchedulerModeReplica, want: true},
+		{mode: SchedulerModePrimary, want: false},
+		{mode: SchedulerModeQueryOnly, want: false},
+	} {
+		if got := cfg.Scheduler.NodeStreamEnabledFor(tc.mode); got != tc.want {
+			t.Fatalf("NodeStreamEnabledFor(%s) = %v, want %v", tc.mode, got, tc.want)
+		}
+	}
+}

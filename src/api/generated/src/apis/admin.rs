@@ -11,6 +11,20 @@ use crate::{models, types::*};
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 #[must_use]
 #[allow(clippy::large_enum_variant)]
+pub enum AdminDrainPostResponse {
+    /// The drain pass completed
+    Status200_TheDrainPassCompleted(models::DrainProgress),
+    /// Bad request
+    Status400_BadRequest(models::Error),
+    /// Authentication error
+    Status401_AuthenticationError(models::Error),
+    /// Server error
+    Status500_ServerError(models::Error),
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[must_use]
+#[allow(clippy::large_enum_variant)]
 pub enum NodesGetResponse {
     /// Successfully returned all nodes
     Status200_SuccessfullyReturnedAllNodes(Vec<models::Node>),
@@ -39,6 +53,19 @@ pub enum NodesNodeIdGetResponse {
 #[allow(clippy::ptr_arg)]
 pub trait Admin<E: std::fmt::Debug + Send + Sync + 'static = ()>: super::ErrorHandler<E> {
     type Claims;
+
+    /// Drain the node.
+    ///
+    /// AdminDrainPost - POST /admin/drain
+    async fn admin_drain_post(
+        &self,
+
+        method: &Method,
+        host: &Host,
+        cookies: &CookieJar,
+        claims: &Self::Claims,
+        body: &Option<models::DrainRequest>,
+    ) -> Result<AdminDrainPostResponse, E>;
 
     /// List nodes.
     ///

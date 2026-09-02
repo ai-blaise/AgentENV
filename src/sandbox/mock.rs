@@ -19,7 +19,7 @@ use tokio::time::sleep;
 use super::backend::{
     CapturedSandboxSnapshot, PausedSandboxState, RuntimeArtifactSet, SandboxBackend,
     SandboxBackendFactory, SandboxCaptureResult, SandboxForkResult, SandboxForkSpec,
-    SandboxRuntimeInfo,
+    SandboxMemoryTelemetry, SandboxRuntimeInfo,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
@@ -55,6 +55,8 @@ pub enum MockOperation {
     ForkChild,
     Stop,
     UpdateNetwork,
+    MemoryTelemetry,
+    SetMemoryPlugTarget,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +76,11 @@ pub struct MockBehavior {
     source_config_paths: Mutex<Vec<std::path::PathBuf>>,
     stop_calls: AtomicUsize,
     update_network_calls: AtomicUsize,
+    /// Telemetry samples handed out one per `memory_telemetry` call. The last
+    /// entry is repeated once the queue drains, so a test can script a ramp and
+    /// then let the loop tick freely against its final state.
+    memory_telemetry: Mutex<VecDeque<Option<SandboxMemoryTelemetry>>>,
+    plug_targets: Mutex<Vec<u32>>,
 }
 
 impl MockBehavior {
@@ -123,6 +130,41 @@ impl MockBehavior {
 
     pub fn stop_calls(&self) -> usize {
         self.stop_calls.load(Ordering::Relaxed)
+    }
+
+    /// Queue the telemetry samples `memory_telemetry` will return, in order.
+    pub fn set_memory_telemetry(&self, samples: Vec<Option<SandboxMemoryTelemetry>>) {
+        *self
+            .memory_telemetry
+            .lock()
+            .expect("memory_telemetry mutex poisoned") = samples.into();
+    }
+
+    fn next_memory_telemetry(&self) -> Option<SandboxMemoryTelemetry> {
+        let mut queue = self
+            .memory_telemetry
+            .lock()
+            .expect("memory_telemetry mutex poisoned");
+        if queue.len() > 1 {
+            queue.pop_front().flatten()
+        } else {
+            queue.front().copied().flatten()
+        }
+    }
+
+    /// Every plug target the backend was asked for, in call order.
+    pub fn plug_targets(&self) -> Vec<u32> {
+        self.plug_targets
+            .lock()
+            .expect("plug_targets mutex poisoned")
+            .clone()
+    }
+
+    fn record_plug_target(&self, mib: u32) {
+        self.plug_targets
+            .lock()
+            .expect("plug_targets mutex poisoned")
+            .push(mib);
     }
 
     pub fn update_network_calls(&self) -> usize {
@@ -354,6 +396,21 @@ impl SandboxBackend for MockSandboxBackend {
         self.behavior
             .apply_async(MockOperation::UpdateNetwork)
             .await
+    }
+
+    async fn memory_telemetry(&self) -> Result<Option<SandboxMemoryTelemetry>> {
+        self.behavior
+            .apply_async(MockOperation::MemoryTelemetry)
+            .await?;
+        Ok(self.behavior.next_memory_telemetry())
+    }
+
+    async fn set_memory_plug_target(&mut self, mib: u32) -> Result<()> {
+        self.behavior
+            .apply_async(MockOperation::SetMemoryPlugTarget)
+            .await?;
+        self.behavior.record_plug_target(mib);
+        Ok(())
     }
 
     fn update_custom_extension_params(&mut self, _params: Option<CustomExtensionParams>) {}

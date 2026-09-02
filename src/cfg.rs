@@ -9,7 +9,10 @@ pub use image::{
     ImageCacheConfig, ImageConfig, ImageRemoteBlocksCacheConfig, ImageResolverConfig,
     ResolvedImageCacheConfig, ResolvedImageCacheGcConfig,
 };
-pub use network::{NetworkConfig, NetworkEgressConfig, NetworkInternalConfig};
+pub use network::{
+    NetworkConfig, NetworkEgressConfig, NetworkInternalConfig, NetworkIptablesConfig,
+    NetworkSlotConfig,
+};
 use overlaybd::config::UpperMode;
 use serde::Deserialize;
 
@@ -153,6 +156,15 @@ pub struct PosixFsBackendConfig {
         parse_env = parse_required_path
     )]
     pub snapshot_store: PathBuf,
+    /// How the catalog takes its alias and record locks: `flock` (the default)
+    /// or `create_new`.
+    ///
+    /// `flock` is kernel-enforced and released on process death. `create_new`
+    /// exists for filesystems that do not honour `flock` between the writers
+    /// sharing one repository; it is strictly weaker, because a holder that
+    /// dies leaves its lock behind until it ages out.
+    #[config(default = "flock", env = "AENV_SNAPSHOT_STORE_LOCK_STRATEGY")]
+    pub lock_strategy: crate::snapshot::repository::backends::PosixFsLockStrategy,
 }
 
 #[derive(Debug, Clone, Config)]
@@ -261,6 +273,15 @@ pub struct PoolComponentConfig {
     /// without `--wait`.
     #[config(default = 4usize)]
     pub fill_concurrency: usize,
+    /// Overrides the shared `[pool] low_watermark` for this pool alone.
+    ///
+    /// The three pools hold very different resources — a network slot is a
+    /// dozen netlink operations, a ublk device is an io_uring round trip on a
+    /// shared control ring — so one shared depth is a compromise between them
+    /// rather than a setting for any of them.
+    pub low_watermark: Option<usize>,
+    /// Overrides the shared `[pool] high_watermark` for this pool alone.
+    pub high_watermark: Option<usize>,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -273,6 +294,10 @@ pub struct FirecrackerProcessPoolConfig {
     pub startup_prewarm: bool,
     #[config(default = 4usize)]
     pub fill_concurrency: usize,
+    /// Overrides the shared `[pool] low_watermark` for this pool alone.
+    pub low_watermark: Option<usize>,
+    /// Overrides the shared `[pool] high_watermark` for this pool alone.
+    pub high_watermark: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -361,6 +386,102 @@ pub struct MachineConfig {
     pub mem_size_mib: u32,
     #[config(nested)]
     pub disk_rate_limit: DiskRateLimitConfig,
+    #[config(nested)]
+    pub balloon: BalloonConfig,
+    #[config(nested)]
+    pub memory_control: MemoryControlConfig,
+}
+
+/// The node's memory-pressure control loop.
+///
+/// Complements the in-guest DAMON reclaim configured in the kernel boot args
+/// rather than duplicating it: DAMON runs with `skip_anon=Y`, so it reclaims
+/// cold page cache and never touches the anonymous working set an agent grows.
+/// This loop moves the guest's RAM ceiling instead, and takes its input from
+/// the host side of the boundary.
+#[derive(Debug, Config, Clone, PartialEq, Eq)]
+pub struct MemoryControlConfig {
+    /// Run the loop at all. Off: every sandbox keeps the memory it was
+    /// created with, which is the behaviour of a node without this block.
+    #[config(default = false)]
+    pub enabled: bool,
+    /// Seconds between passes.
+    #[config(default = 15u64)]
+    pub interval_secs: u64,
+    /// Grow when the guest reports less than this share of its memory
+    /// available, or as soon as its allocation-stall counters move.
+    #[config(default = 10u32)]
+    pub grow_available_percent: u32,
+    /// Consider a guest over-provisioned above this share available.
+    #[config(default = 40u32)]
+    pub shrink_available_percent: u32,
+    /// Consecutive over-provisioned passes before anything is taken back. A
+    /// shrink makes the guest re-fault whatever it gives up, so a single idle
+    /// sample must not pay for one.
+    #[config(default = 4u32)]
+    pub shrink_hysteresis_passes: u32,
+    /// Largest single move, in MiB. Bounds both how fast a runaway guest can
+    /// claim the host and how much a mistaken shrink costs.
+    #[config(default = 512u32)]
+    pub max_step_mib: u32,
+    /// Host memory utilisation, as a percentage, above which the node refuses
+    /// all growth and reclaims from over-provisioned guests. Read from
+    /// cgroup-aware host metrics, so under a container limit this is a share
+    /// of the limit rather than of the machine.
+    #[config(default = 85u32)]
+    pub node_memory_high_percent: u32,
+}
+
+/// virtio-balloon device features requested for every microVM this node boots.
+///
+/// Every field here is pre-boot only: Firecracker rejects a `PUT /balloon`
+/// after `InstanceStart`, and the statistics sub-feature explicitly "cannot be
+/// turned on/off after boot". A sandbox therefore carries whatever this block
+/// said at the moment it first booted, for its whole life and for the life of
+/// every snapshot taken from it — flipping a field here does not reach a
+/// microVM that is already running or a snapshot that was already captured.
+///
+/// The balloon stays a *reporting* device. Nothing in this tree issues
+/// `PATCH /balloon` with a non-zero `amount_mib`: forced inflation would fight
+/// the in-guest DAMON reclaim watermarks configured in the kernel boot args,
+/// and two reclaim actuators driven from opposite sides of the guest boundary
+/// thrash rather than converge.
+#[derive(Debug, Config, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BalloonConfig {
+    /// Seconds between guest statistics refreshes. `0` disables statistics,
+    /// which is Firecracker's own default and the behaviour of every sandbox
+    /// booted before this key existed.
+    ///
+    /// Statistics are the only source of guest memory consumption that does
+    /// not double-count: each Firecracker process mmaps the *shared* memory
+    /// ublk device, so host-side per-process RSS counts one page once per
+    /// sandbox that faulted it in.
+    #[config(default = 1u32)]
+    pub stats_polling_interval_s: u32,
+    /// Enable the free-page-hinting device feature.
+    ///
+    /// This is the pre-boot feature bit only; it makes the
+    /// `/balloon/hinting/*` endpoints answer with something other than an
+    /// error. Whether a hinting run is actually issued before a capture is
+    /// [`Self::free_page_hinting_on_capture`], which is a separate switch
+    /// because the device bit cannot be changed later and the run can.
+    #[config(default = false)]
+    pub free_page_hinting: bool,
+    /// Run free-page hinting before each memory capture.
+    ///
+    /// Off until the dirty-set delta has been measured on a KVM host: nothing
+    /// in the Firecracker API contract states that a hinting run removes pages
+    /// from `/vm/dirty-memory-ranges`, so the saving is a property of the
+    /// patched binary rather than a documented guarantee.
+    #[config(default = false)]
+    pub free_page_hinting_on_capture: bool,
+    /// How long a hinting run may hold up a capture before it is abandoned.
+    ///
+    /// The run is issued while the guest is still executing, so this is
+    /// wall-clock latency added to a pause rather than guest downtime; on
+    /// expiry the capture proceeds exactly as it would with hinting off.
+    #[config(default = 3000u64)]
+    pub free_page_hinting_timeout_ms: u64,
 }
 
 #[derive(Debug, Config, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -678,6 +799,27 @@ pub struct OrchestratorConfig {
     pub persisted_sandbox_store_path: PathBuf,
     #[config(nested)]
     pub admission: AdmissionConfig,
+    #[config(nested)]
+    pub drain: DrainConfig,
+}
+
+/// How hard `POST /admin/drain` pushes while emptying the node.
+///
+/// Both knobs exist because the caller is a preemption warning with a window
+/// nobody here chooses: an operator who knows their window and their storage
+/// tunes the pass to fit it, rather than discovering that the default did not.
+#[derive(Debug, Config, Clone)]
+pub struct DrainConfig {
+    /// Sandboxes paused and published at once.
+    ///
+    /// Each one writes a memory image, so this trades how much of the window a
+    /// pass covers against how hard it leans on the node's storage while the
+    /// sandboxes still on it are serving traffic.
+    #[config(default = 4usize)]
+    pub concurrency: usize,
+    /// Deadline applied when the request does not carry one.
+    #[config(default = 30000u64)]
+    pub deadline_ms: u64,
 }
 
 /// Custom extension service integration.
@@ -786,6 +928,8 @@ impl_config_default!(
     EnvdConfig,
     SandboxConfig,
     MachineConfig,
+    BalloonConfig,
+    MemoryControlConfig,
     SnapshotConfig,
     SnapshotImagePublishConfig,
     UblkTomlConfig,
@@ -936,8 +1080,8 @@ impl AppConfig {
         let pool = &self.pool.network;
 
         warm_pool::PoolConfig {
-            low_watermark: self.pool.low_watermark,
-            high_watermark: self.pool.high_watermark,
+            low_watermark: pool.low_watermark.unwrap_or(self.pool.low_watermark),
+            high_watermark: pool.high_watermark.unwrap_or(self.pool.high_watermark),
             maintenance_enabled: pool.enabled && pool.maintenance_enabled,
             startup_prewarm: pool.startup_prewarm,
         }
@@ -956,8 +1100,8 @@ impl AppConfig {
         }
 
         Some(warm_pool::PoolConfig {
-            low_watermark: self.pool.low_watermark,
-            high_watermark: self.pool.high_watermark,
+            low_watermark: pool.low_watermark.unwrap_or(self.pool.low_watermark),
+            high_watermark: pool.high_watermark.unwrap_or(self.pool.high_watermark),
             // The ublk daemon uses async request-time refill because the
             // reusable device shape is image/size dependent.
             maintenance_enabled: false,
@@ -974,8 +1118,8 @@ impl AppConfig {
 
         Some(ResolvedFirecrackerPoolConfig {
             pool: warm_pool::PoolConfig {
-                low_watermark: self.pool.low_watermark,
-                high_watermark: self.pool.high_watermark,
+                low_watermark: pool.low_watermark.unwrap_or(self.pool.low_watermark),
+                high_watermark: pool.high_watermark.unwrap_or(self.pool.high_watermark),
                 maintenance_enabled: pool.maintenance_enabled,
                 startup_prewarm: pool.startup_prewarm,
             },
@@ -1061,6 +1205,14 @@ impl AppConfig {
         // validation so an existing PVM configuration needs no new override.
         if self.virtualization_mode == VirtualizationMode::Pvm {
             self.memory_snapshot.track_dirty_pages = false;
+            // PVM runs a different Firecracker binary than the KVM path, and
+            // the balloon statistics and free-page-hinting endpoints are
+            // patches carried by the KVM build. Requesting them there would
+            // fail the pre-boot `PUT /balloon` and take the whole boot with
+            // it, so a PVM node silently keeps the plain reporting balloon.
+            self.machine.balloon.stats_polling_interval_s = 0;
+            self.machine.balloon.free_page_hinting = false;
+            self.machine.balloon.free_page_hinting_on_capture = false;
         }
 
         self.cluster.normalize();
@@ -1096,7 +1248,76 @@ impl AppConfig {
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
+        self.validate_balloon()?;
+        self.validate_memory_control()?;
         self.validate_kill_switch()?;
+        Ok(())
+    }
+
+    /// Refuse a balloon block whose parts contradict each other.
+    ///
+    /// The device feature bit is pre-boot and the run switch is per-capture,
+    /// so asking for a run without the bit is not a staged configuration that
+    /// will start working later: the capability probe reads the bit off the
+    /// live VM and the run is skipped forever. That is the same silent-no-op
+    /// shape [`Self::validate_disk_rate_limit`] exists to reject.
+    fn validate_balloon(&self) -> Result<()> {
+        let cfg = &self.machine.balloon;
+        if cfg.free_page_hinting_on_capture && !cfg.free_page_hinting {
+            bail!(
+                "machine.balloon: free_page_hinting_on_capture is set but free_page_hinting is \
+                 false; the device feature bit is pre-boot only, so the run would be silently \
+                 skipped for every sandbox"
+            );
+        }
+        Ok(())
+    }
+
+    /// Reject a control loop that would move guest memory the wrong way.
+    ///
+    /// Skipped while disabled, like the disk rate limiter above: dormant
+    /// values must not block a node from starting. When enabled, every one of
+    /// these mistakes is a single typo that silently inverts the policy — a
+    /// zero node watermark puts the node permanently over it, and an inverted
+    /// band makes a guest both distressed and slack at once.
+    fn validate_memory_control(&self) -> Result<()> {
+        let cfg = &self.machine.memory_control;
+        if !cfg.enabled {
+            return Ok(());
+        }
+        if cfg.interval_secs == 0 {
+            bail!("machine.memory_control: interval_secs must be > 0 when enabled");
+        }
+        if cfg.max_step_mib == 0 {
+            bail!(
+                "machine.memory_control: max_step_mib must be > 0 when enabled; a zero step is a \
+                 loop that samples every guest and can never move one"
+            );
+        }
+        for (name, value) in [
+            ("grow_available_percent", cfg.grow_available_percent),
+            ("shrink_available_percent", cfg.shrink_available_percent),
+            ("node_memory_high_percent", cfg.node_memory_high_percent),
+        ] {
+            if value > 100 {
+                bail!("machine.memory_control.{name} ({value}) is a percentage and must be <= 100");
+            }
+        }
+        if cfg.node_memory_high_percent == 0 {
+            bail!(
+                "machine.memory_control: node_memory_high_percent must be > 0; zero puts the node \
+                 permanently over its watermark, which refuses growth to every guest on it"
+            );
+        }
+        if cfg.grow_available_percent >= cfg.shrink_available_percent {
+            bail!(
+                "machine.memory_control: grow_available_percent ({}) must be below \
+                 shrink_available_percent ({}); an inverted or empty band leaves a guest both \
+                 distressed and over-provisioned, and the distressed arm wins forever",
+                cfg.grow_available_percent,
+                cfg.shrink_available_percent
+            );
+        }
         Ok(())
     }
 
@@ -1555,6 +1776,72 @@ mod tests {
     }
 
     #[test]
+    fn pvm_disables_balloon_statistics_and_hinting() -> Result<()> {
+        // PVM runs a different Firecracker binary; the statistics and hinting
+        // endpoints are patches carried by the KVM build, and asking for them
+        // there would fail the pre-boot PUT and take the boot with it.
+        let temp = tempdir()?;
+        let path = temp.path().join("pvm.toml");
+        std::fs::write(
+            &path,
+            "virtualization_mode = \"pvm\"\n\
+             [machine.balloon]\n\
+             stats_polling_interval_s = 5\n\
+             free_page_hinting = true\n\
+             free_page_hinting_on_capture = true\n",
+        )?;
+
+        let config = ConfigManager::new_from_path(&path)?;
+        let balloon = &config.config().machine.balloon;
+
+        assert_eq!(balloon.stats_polling_interval_s, 0);
+        assert!(!balloon.free_page_hinting);
+        assert!(!balloon.free_page_hinting_on_capture);
+        Ok(())
+    }
+
+    #[test]
+    fn kvm_keeps_the_balloon_features_the_operator_asked_for() -> Result<()> {
+        // The counterpart to the PVM gate: it must clamp PVM and only PVM.
+        let temp = tempdir()?;
+        let path = temp.path().join("kvm.toml");
+        std::fs::write(
+            &path,
+            "virtualization_mode = \"kvm\"\n\
+             [machine.balloon]\n\
+             stats_polling_interval_s = 5\n\
+             free_page_hinting = true\n\
+             free_page_hinting_on_capture = true\n",
+        )?;
+
+        let config = ConfigManager::new_from_path(&path)?;
+        let balloon = &config.config().machine.balloon;
+
+        assert_eq!(balloon.stats_polling_interval_s, 5);
+        assert!(balloon.free_page_hinting);
+        assert!(balloon.free_page_hinting_on_capture);
+        Ok(())
+    }
+
+    #[test]
+    fn the_bundled_config_ships_the_elastic_memory_switches_off() -> Result<()> {
+        // Free-page hinting rests on an undocumented property of the patched
+        // Firecracker binary, and the control loop moves guest memory. Both
+        // ship off and are opted into per node.
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config = ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        let machine = &config.config().machine;
+
+        assert!(!machine.balloon.free_page_hinting);
+        assert!(!machine.balloon.free_page_hinting_on_capture);
+        assert!(!machine.memory_control.enabled);
+        // Statistics are the exception: they are pre-boot-only, so a node that
+        // ships them off can never turn them on for a sandbox already created.
+        assert_eq!(machine.balloon.stats_polling_interval_s, 1);
+        Ok(())
+    }
+
+    #[test]
     fn sandbox_access_token_seed_is_redacted() {
         let config = SandboxConfig {
             access_token_hash_seed: Some("cluster-secret".to_string()),
@@ -1664,6 +1951,124 @@ mod tests {
         config
             .validate()
             .expect("disabled disk rate limit config is not validated");
+    }
+
+    #[test]
+    fn validate_rejects_a_memory_control_block_that_inverts_its_own_policy() {
+        // Every one of these is a single typo that silently inverts the loop
+        // rather than stopping it, which is what the disk rate limiter's
+        // validation exists to prevent for the block immediately above.
+        let cases = [
+            (
+                MemoryControlConfig {
+                    node_memory_high_percent: 0,
+                    ..enabled_memory_control()
+                },
+                "node_memory_high_percent must be > 0",
+            ),
+            (
+                MemoryControlConfig {
+                    node_memory_high_percent: 101,
+                    ..enabled_memory_control()
+                },
+                "machine.memory_control.node_memory_high_percent (101)",
+            ),
+            (
+                MemoryControlConfig {
+                    grow_available_percent: 40,
+                    shrink_available_percent: 40,
+                    ..enabled_memory_control()
+                },
+                "must be below",
+            ),
+            (
+                MemoryControlConfig {
+                    grow_available_percent: 60,
+                    shrink_available_percent: 40,
+                    ..enabled_memory_control()
+                },
+                "must be below",
+            ),
+            (
+                MemoryControlConfig {
+                    max_step_mib: 0,
+                    ..enabled_memory_control()
+                },
+                "max_step_mib must be > 0",
+            ),
+            (
+                MemoryControlConfig {
+                    interval_secs: 0,
+                    ..enabled_memory_control()
+                },
+                "interval_secs must be > 0",
+            ),
+        ];
+
+        for (memory_control, expected_error) in cases {
+            let mut config = AppConfig::default();
+            config.machine.memory_control = memory_control;
+
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string().contains(expected_error),
+                "expected error containing {expected_error:?}, got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_skips_a_disabled_memory_control_block() {
+        // Nothing reads these while the loop is off, so pre-staged values must
+        // not block a node from starting.
+        let mut config = AppConfig::default();
+        config.machine.memory_control = MemoryControlConfig {
+            enabled: false,
+            node_memory_high_percent: 0,
+            grow_available_percent: 90,
+            shrink_available_percent: 10,
+            max_step_mib: 0,
+            interval_secs: 0,
+            shrink_hysteresis_passes: 0,
+        };
+        config
+            .validate()
+            .expect("a disabled memory control block is not validated");
+    }
+
+    #[test]
+    fn validate_accepts_the_shipped_memory_control_band() {
+        let mut config = AppConfig::default();
+        config.machine.memory_control = enabled_memory_control();
+        config
+            .validate()
+            .expect("the shipped band, switched on, must load");
+    }
+
+    #[test]
+    fn validate_rejects_a_hinting_run_without_the_device_bit() {
+        // The bit is pre-boot and the run is per-capture, so this is not a
+        // staged configuration that starts working later: the probe reads the
+        // bit off the live VM and the run is skipped for every sandbox.
+        let mut config = AppConfig::default();
+        config.machine.balloon.free_page_hinting = false;
+        config.machine.balloon.free_page_hinting_on_capture = true;
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("free_page_hinting_on_capture is set but"),
+            "got: {err}"
+        );
+    }
+
+    /// The shipped band with the loop switched on, which is what an operator
+    /// enabling it types.
+    fn enabled_memory_control() -> MemoryControlConfig {
+        MemoryControlConfig {
+            enabled: true,
+            ..AppConfig::default().machine.memory_control
+        }
     }
 
     #[test]
@@ -1849,6 +2254,7 @@ mod tests {
         config.snapshot.local_cache_path = "./snapshot-local-cache".into();
         config.backend.posix_fs = Some(PosixFsBackendConfig {
             snapshot_store: "./snapshot-store".into(),
+            lock_strategy: Default::default(),
         });
         config.p2p.store_dir = "./p2p-store".into();
         config.ublk.daemon_binary_path = Some("./bin/uvm-ublk-daemon".into());
@@ -2234,5 +2640,32 @@ mod tests {
             err.to_string().contains("resize_timeout_secs must be > 0"),
             "unexpected error: {err}"
         );
+    }
+
+    /// One shared depth for three pools holding different resources is a
+    /// compromise between them. An override applies to its own pool and leaves
+    /// the others on the shared value.
+    #[test]
+    fn a_per_pool_watermark_override_applies_to_that_pool_alone() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("watermarks.toml");
+        std::fs::write(
+            &path,
+            "[pool]\nlow_watermark = 2\nhigh_watermark = 64\n\n\
+             [pool.network]\nlow_watermark = 8\nhigh_watermark = 128\n",
+        )?;
+
+        let config = ConfigManager::new_from_path(&path)?;
+        let network = config.config().network_pool_config();
+        assert_eq!(network.low_watermark, 8);
+        assert_eq!(network.high_watermark, 128);
+
+        let firecracker = config
+            .config()
+            .firecracker_pool_config()
+            .expect("firecracker pool enabled by default");
+        assert_eq!(firecracker.pool.low_watermark, 2);
+        assert_eq!(firecracker.pool.high_watermark, 64);
+        Ok(())
     }
 }

@@ -162,6 +162,18 @@ pub struct FirecrackerCommonConfig {
     /// the process-global config.
     #[serde(default)]
     pub disk_rate_limit: crate::cfg::DiskRateLimitConfig,
+    /// virtio-balloon features this sandbox was booted with.
+    ///
+    /// A record, never an authority. Firecracker restores the balloon device
+    /// from `vm_state.bin` and [`FirecrackerSandbox::start_resume`] deliberately
+    /// does not re-`PUT` it, so on the resume path this value describes the
+    /// node's intent and not the device that actually came back — see
+    /// [`FirecrackerSnapshotConfig::from_runnable_snapshot`], which fills the
+    /// whole common config from the *resuming* node's global config. What the
+    /// restored VM really has is answered by the capability probe against the
+    /// live VM, and only by that.
+    #[serde(default)]
+    pub balloon: crate::cfg::BalloonConfig,
     /// Runtime-only envd credential. It is re-derived from sandbox metadata on
     /// resume and is intentionally excluded from persisted snapshot configs.
     #[serde(skip)]
@@ -199,6 +211,7 @@ impl FirecrackerCommonConfig {
             network_policy: None,
             custom_extension_params: None,
             disk_rate_limit: crate::cfg::DiskRateLimitConfig::default(),
+            balloon: crate::cfg::BalloonConfig::default(),
             envd_access_token: None,
         }
     }
@@ -211,6 +224,7 @@ impl FirecrackerCommonConfig {
         let mut common = Self::new(firecracker_binary, tools_drive_version, runtime_policy);
         common.envd_version = config.envd.version.clone();
         common.disk_rate_limit = config.machine.disk_rate_limit.clone();
+        common.balloon = config.machine.balloon.clone();
         common.track_dirty_pages = config.memory_snapshot.track_dirty_pages;
         common.rootfs_allow_shrink = config.ublk.overlaybd.allow_shrink;
         common.control_plane_port = config.tools.control_plane_port;
@@ -639,7 +653,7 @@ fn validate_overlaybd_extra_drive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cfg::{UblkOverlaybdTomlConfig, UblkTomlConfig};
+    use crate::cfg::{BalloonConfig, UblkOverlaybdTomlConfig, UblkTomlConfig};
     use crate::snapshot::{CommittedSnapshot, SnapshotRecord};
     use std::fs;
     use std::sync::{Mutex, OnceLock};
@@ -907,6 +921,26 @@ mod tests {
         assert!(err
             .to_string()
             .contains("snapshot does not record a tools drive version"));
+    }
+
+    #[test]
+    fn the_node_balloon_block_reaches_the_launch_config() {
+        // Every balloon feature is pre-boot, so this copy is the only moment
+        // the operator's `[machine.balloon]` can reach a sandbox at all. If it
+        // is dropped here the whole block is inert and nothing else in the
+        // tree notices.
+        let mut app_config = base_app_config();
+        app_config.machine.balloon = BalloonConfig {
+            stats_polling_interval_s: 7,
+            free_page_hinting: true,
+            free_page_hinting_on_capture: true,
+            free_page_hinting_timeout_ms: 1234,
+        };
+
+        let common = FirecrackerCommonConfig::from_app_config(&app_config)
+            .expect("common config builds from an app config");
+
+        assert_eq!(common.balloon, app_config.machine.balloon);
     }
 
     #[test]

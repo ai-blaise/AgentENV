@@ -60,7 +60,7 @@ pub struct SandboxStageTimer {
 }
 
 impl SandboxStageTimer {
-    pub fn new(operation: &'static str) -> Self {
+    pub const fn new(operation: &'static str) -> Self {
         Self { operation }
     }
 
@@ -265,13 +265,24 @@ pub fn http_route_label(path: &str) -> &'static str {
         "/v2/sandboxes" => "/v2/sandboxes",
         "/snapshots" => "/snapshots",
         "/templates" => "/templates",
+        "/v2/templates" => "/v2/templates",
         "/v3/templates" => "/v3/templates",
         "/nodes" => "/nodes",
         "/health" => "/health",
+        "/admin/drain" => "/admin/drain",
         _ => dynamic_route_label(path),
     }
 }
 
+/// Maps a request path onto the router template that served it.
+///
+/// Every arm here must name a route declared in `src/api/generated/src/server/mod.rs`.
+/// A route missing from this table is not mislabelled but unattributed: its
+/// latency lands in the `unmatched` bucket together with every proxy-by-host
+/// request, where it cannot be told apart from the others. `/snapshots/{id}`,
+/// `/templates/{id}` and the four `/sandboxes/{id}/…` suffixes were in that
+/// state, which made the snapshot and template surfaces invisible to the
+/// request histogram.
 fn dynamic_route_label(path: &str) -> &'static str {
     let mut parts = path.trim_matches('/').split('/');
     let first = parts.next();
@@ -279,6 +290,19 @@ fn dynamic_route_label(path: &str) -> &'static str {
     let third = parts.next();
     let fourth = parts.next();
     let fifth = parts.next();
+
+    // The proxy is the one prefix that legitimately carries arbitrary depth,
+    // so it is decided before the segment count is capped below.
+    if first == Some("proxy") {
+        return "/proxy/*";
+    }
+
+    // No declared route has six segments. Without this the five-segment arms
+    // would swallow anything longer that shares their prefix and report it as
+    // a real route.
+    if parts.next().is_some() {
+        return "unmatched";
+    }
 
     match (first, second, third, fourth, fifth) {
         (Some("sandboxes"), Some(_), None, None, None) => "/sandboxes/{sandbox_id}",
@@ -293,8 +317,30 @@ fn dynamic_route_label(path: &str) -> &'static str {
             "/sandboxes/{sandbox_id}/resume"
         }
         (Some("sandboxes"), Some(_), Some("fork"), None, None) => "/sandboxes/{sandbox_id}/fork",
+        (Some("sandboxes"), Some(_), Some("connect"), None, None) => {
+            "/sandboxes/{sandbox_id}/connect"
+        }
+        (Some("sandboxes"), Some(_), Some("timeout"), None, None) => {
+            "/sandboxes/{sandbox_id}/timeout"
+        }
+        (Some("sandboxes"), Some(_), Some("refreshes"), None, None) => {
+            "/sandboxes/{sandbox_id}/refreshes"
+        }
+        (Some("sandboxes"), Some(_), Some("custom-extension-params"), None, None) => {
+            "/sandboxes/{sandbox_id}/custom-extension-params"
+        }
+        (Some("snapshots"), Some(_), None, None, None) => "/snapshots/{snapshot_id}",
+        // The alias route is a literal second segment, so it has to be decided
+        // before `/templates/{template_id}` claims any two-segment path.
+        (Some("templates"), Some("aliases"), Some(_), None, None) => "/templates/aliases/{alias}",
+        (Some("templates"), Some(_), None, None, None) => "/templates/{template_id}",
+        (Some("templates"), Some(_), Some("builds"), Some(_), Some("status")) => {
+            "/templates/{template_id}/builds/{build_id}/status"
+        }
+        (Some("v2"), Some("templates"), Some(_), Some("builds"), Some(_)) => {
+            "/v2/templates/{template_id}/builds/{build_id}"
+        }
         (Some("nodes"), Some(_), None, None, None) => "/nodes/{node_id}",
-        (Some("proxy"), _, _, _, _) => "/proxy/*",
         _ => "unmatched",
     }
 }
@@ -332,7 +378,119 @@ mod tests {
         );
         assert_eq!(
             http_route_label("/templates/tpl/builds/build/status"),
+            "/templates/{template_id}/builds/{build_id}/status"
+        );
+    }
+
+    /// Reads the route templates the generated router declares and requires a
+    /// label for each one.
+    ///
+    /// The table in `dynamic_route_label` is hand-written while the router is
+    /// generated from `src/api/openapi.yml`, so the two drift silently: a new
+    /// endpoint ships, its latency lands in `unmatched`, and nothing fails.
+    /// This is the test that catches the *next* endpoint; enumerating today's
+    /// paths by hand cannot.
+    #[test]
+    fn every_declared_route_has_a_label() {
+        for template in declared_routes() {
+            let concrete = concrete_path(&template);
+            assert_eq!(
+                http_route_label(&concrete),
+                template,
+                "route {template} is declared in the generated router but \
+                 {concrete} does not map back to it"
+            );
+        }
+    }
+
+    /// The label is a metric dimension, so its value set must be closed no
+    /// matter what a client asks for.
+    #[test]
+    fn route_labels_are_a_closed_set() {
+        use std::collections::HashSet;
+
+        let mut labels = HashSet::new();
+        for index in 0..1000 {
+            labels.insert(http_route_label(&format!("/sandboxes/sb-{index}")));
+            labels.insert(http_route_label(&format!("/snapshots/snap-{index}")));
+            labels.insert(http_route_label(&format!("/templates/tpl-{index}")));
+            labels.insert(http_route_label(&format!("/proxy/{index}/deep/path")));
+        }
+        assert_eq!(
+            labels.len(),
+            4,
+            "identifiers leaked into the route label: {labels:?}"
+        );
+
+        // Anything the router does not declare stays in one bucket, however
+        // deep. Proxy-by-host traffic arrives here and is told apart by the
+        // `route_source` dimension instead.
+        assert_eq!(http_route_label("/"), "unmatched");
+        assert_eq!(http_route_label("/sandboxes/sb-1/unknown"), "unmatched");
+        assert_eq!(
+            http_route_label("/templates/tpl/builds/build/status/extra"),
             "unmatched"
         );
+    }
+
+    /// Extracts the route templates from the generated Axum router.
+    fn declared_routes() -> Vec<String> {
+        let router = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/api/generated/src/server/mod.rs"
+        ))
+        .expect("generated router source should be readable");
+
+        let mut routes = Vec::new();
+        let mut expecting_path = false;
+        for line in router.lines() {
+            let candidate = if expecting_path {
+                expecting_path = false;
+                quoted(line)
+            } else if let Some((_, rest)) = line.split_once(".route(") {
+                let inline = quoted(rest);
+                // rustfmt breaks long calls right after `.route(`, leaving the
+                // path on the next line.
+                expecting_path = inline.is_none();
+                inline
+            } else {
+                None
+            };
+
+            if let Some(path) = candidate {
+                if path.starts_with('/') {
+                    routes.push(path);
+                }
+            }
+        }
+
+        assert!(
+            routes.len() > 20,
+            "expected the generated router to declare the full API surface, found {}",
+            routes.len()
+        );
+        routes
+    }
+
+    fn quoted(text: &str) -> Option<String> {
+        let start = text.find('"')? + 1;
+        let end = start + text[start..].find('"')?;
+        Some(text[start..end].to_string())
+    }
+
+    /// Substitutes a sample identifier for each `{param}` segment.
+    fn concrete_path(template: &str) -> String {
+        template
+            .split('/')
+            .enumerate()
+            .map(|(index, segment)| {
+                if segment.starts_with('{') {
+                    format!("id-{index}")
+                } else {
+                    segment.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
     }
 }

@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"log"
@@ -10,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,10 +31,16 @@ import (
 
 func main() {
 	configPath := flag.String("config", "", "path to JSON config file")
-	queryOnly := flag.Bool("query-only", false, "run a query-only scheduler that supports only LookupNode; requires scheduler.redis_addr")
+	modeFlag := flag.String("mode", "", "primary (default), replica, or query-only; replica and query-only require scheduler.redis_addr")
+	queryOnly := flag.Bool("query-only", false, "deprecated alias for -mode=query-only")
 	flag.Parse()
 
-	cfg, err := config.LoadScheduler(*configPath, *queryOnly)
+	mode, err := config.ResolveSchedulerMode(*modeFlag, *queryOnly, os.LookupEnv)
+	if err != nil {
+		log.Fatalf("resolve scheduler mode failed: %v", err)
+	}
+
+	cfg, err := config.LoadScheduler(*configPath, mode)
 	if err != nil {
 		log.Fatalf("load config failed: %v", err)
 	}
@@ -44,6 +53,16 @@ func main() {
 
 	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	scheduler.SetSchedulerModeMetric(string(mode))
+	if mode == config.SchedulerModePrimary && strings.TrimSpace(cfg.Scheduler.RedisAddr) == "" {
+		// Said once, at startup: bindings that live only in this process are
+		// lost on every restart, and a second scheduler started against this
+		// config would route from a map of its own.
+		logger.Warn("scheduler is running without a shared binding store; bindings are lost on restart and cannot be replicated",
+			zap.String("enable_with", "scheduler.redis_addr or SCHEDULER_REDIS_ADDR"),
+		)
+	}
 
 	store, closeStore := createBindingStore(logger, cfg)
 	defer closeStore()
@@ -68,21 +87,50 @@ func main() {
 		grpc.ChainUnaryInterceptor(scheduler.MetricsUnaryInterceptor(), scheduler.AuthUnaryInterceptor(authToken)),
 		grpc.ChainStreamInterceptor(scheduler.AuthStreamInterceptor(authToken)),
 	)
-	if *queryOnly {
+	hs := health.NewServer()
+	gate := newReadinessGate(hs, logger)
+	go scheduler.RunStoreProbe(sigCtx, store, gate, cfg.Scheduler.StoreProbeInterval, logger)
+
+	streamEnabled := cfg.Scheduler.NodeStreamEnabledFor(mode)
+	if mode.QueryOnly() {
 		svc := scheduler.NewQueryOnlyService(logger, store)
 		schedulerv1.RegisterSchedulerServer(g, svc)
+		// A query-only scheduler holds no registry and discovers nothing, so
+		// there is nothing for it to warm up: the store probe alone decides
+		// whether it is ready.
+		gate.MarkStarted()
 		logger.Info("scheduler query-only service enabled", zap.String("redis_addr", cfg.Scheduler.RedisAddr))
 	} else {
-		registry := scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
+		base := scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
+		discoveryReady := make(chan struct{})
 		switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode)) {
 		case "kubernetes":
-			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry)
+			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, base, discoveryReady)
 		default:
 			nodes := make([]scheduler.Node, 0, len(cfg.Scheduler.Nodes))
 			for _, n := range cfg.Scheduler.Nodes {
 				nodes = append(nodes, scheduler.Node{ID: n.ID, Endpoint: n.Endpoint})
 			}
-			registry.Set(nodes, nil)
+			base.Set(nodes, nil)
+			close(discoveryReady)
+		}
+
+		var registry scheduler.NodeRegistry = base
+		if streamEnabled {
+			stream, streamReady := startNodeStream(sigCtx, logger, cfg, base, mode, replicaID())
+			if stream != nil {
+				registry = stream
+				defer func() {
+					if err := stream.Close(); err != nil {
+						logger.Warn("close scheduler node stream failed", zap.Error(err))
+					}
+				}()
+			} else {
+				streamEnabled = false
+			}
+			go waitForReadiness(sigCtx, logger, gate, discoveryReady, streamReady, cfg.Scheduler.NodeStreamWarmupTimeout)
+		} else {
+			go waitForReadiness(sigCtx, logger, gate, discoveryReady, nil, cfg.Scheduler.NodeStreamWarmupTimeout)
 		}
 
 		svc := scheduler.NewService(
@@ -112,9 +160,6 @@ func main() {
 		schedulerv1.RegisterSchedulerServer(g, svc)
 	}
 
-	hs := health.NewServer()
-	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
-	hs.SetServingStatus(schedulerv1.Scheduler_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
 	grpc_health_v1.RegisterHealthServer(g, hs)
 
 	lis, err := net.Listen("tcp", cfg.Scheduler.GRPCListenAddr)
@@ -126,7 +171,8 @@ func main() {
 		zap.String("strategy", cfg.Scheduler.Strategy),
 		zap.String("binding_store", bindingStoreName(cfg)),
 		zap.String("mobility_store", bindingStoreName(cfg)),
-		zap.Bool("query_only", *queryOnly),
+		zap.String("mode", string(mode)),
+		zap.Bool("node_stream_enabled", streamEnabled),
 		zap.Bool("auth_enabled", scheduler.AuthEnabled(authToken)),
 		zap.Bool("reservations_enabled", cfg.Scheduler.ReservationsEnabled),
 	)
@@ -162,8 +208,8 @@ func main() {
 	}
 
 	logger.Info("scheduler shutdown signal received")
+	gate.Shutdown()
 	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
-	hs.SetServingStatus(schedulerv1.Scheduler_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_NOT_SERVING)
 
 	gracefulStopDone := make(chan struct{})
 	go func() {
@@ -192,6 +238,127 @@ func main() {
 	if err := <-serveErrCh; err != nil {
 		logger.Fatal("serve failed", zap.Error(err))
 	}
+}
+
+// newReadinessGate splits what liveness reads from what readiness reads.
+//
+// The overall status answers "is this process alive", and is SERVING from the
+// moment the listener is up. The named service answers "is this process fit for
+// traffic", and starts closed: with replicas behind one round-robin client,
+// reporting fitness at startup hands a replica its full share of placements
+// while its registry is still empty, and a replica that has lost its binding
+// store keeps taking them.
+//
+// The split matters because the shipped manifest probes liveness and readiness
+// with the same health check. Gating the overall status would restart a
+// scheduler for an unreachable Redis, turning an outage into a crash loop
+// across the whole tier at once. A readiness probe that passes
+// -service=scheduler.v1.Scheduler is what makes the gate remove a pod from the
+// Service instead.
+func newReadinessGate(health scheduler.HealthStatusSetter, logger *zap.Logger) *scheduler.ReadinessGate {
+	health.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	return scheduler.NewReadinessGate(health, logger, schedulerv1.Scheduler_ServiceDesc.ServiceName)
+}
+
+// replicaID names this process on the node-state bus, so a replica can skip its
+// own echo. The pod name is stable across a restart, which keeps the metric
+// series readable; the random suffix is only for deployments that do not set
+// it, where self-echo skipping degrades to the ordinary staleness check.
+func replicaID() string {
+	if name := strings.TrimSpace(os.Getenv("POD_NAME")); name != "" {
+		return name
+	}
+	host, err := os.Hostname()
+	if err != nil || strings.TrimSpace(host) == "" {
+		host = "scheduler"
+	}
+	suffix := make([]byte, 4)
+	if _, err := rand.Read(suffix); err != nil {
+		return host
+	}
+	return host + "-" + hex.EncodeToString(suffix)
+}
+
+// startNodeStream builds the replicated registry and starts consuming the bus.
+//
+// A replica that cannot reach the bus at startup exits rather than running:
+// without it, it hears from only the nodes whose connections happen to land on
+// it and places all of its traffic there, which is strictly worse than the
+// single scheduler it was scaled out from. Any other mode keeps running with a
+// warning, because there the stream is an addition rather than the premise.
+func startNodeStream(
+	ctx context.Context,
+	logger *zap.Logger,
+	cfg config.Config,
+	base *scheduler.AtomicNodeRegistry,
+	mode config.SchedulerMode,
+	replicaID string,
+) (*scheduler.StreamFedNodeRegistry, <-chan struct{}) {
+	bus, err := scheduler.NewRedisNodeStream(ctx, cfg.Scheduler.RedisAddr, scheduler.NodeStreamOptions{
+		Logger:       logger,
+		MaxLen:       int64(cfg.Scheduler.NodeStreamMaxLen),
+		PublishQueue: cfg.Scheduler.NodeStreamPublishQueue,
+		ReportTTL:    cfg.Scheduler.ReportTTL,
+	})
+	if err != nil {
+		if mode == config.SchedulerModeReplica {
+			logger.Fatal("connect scheduler node stream failed", zap.Error(err), zap.String("addr", cfg.Scheduler.RedisAddr))
+		}
+		logger.Error("connect scheduler node stream failed; this scheduler will see only the nodes that heartbeat to it",
+			zap.Error(err),
+			zap.String("addr", cfg.Scheduler.RedisAddr),
+		)
+		return nil, nil
+	}
+
+	registry := scheduler.NewStreamFedNodeRegistry(base, bus, replicaID, logger)
+	ready, err := registry.Run(ctx)
+	if err != nil {
+		logger.Error("subscribe to scheduler node stream failed", zap.Error(err))
+		if closeErr := bus.Close(); closeErr != nil {
+			logger.Warn("close scheduler node stream failed", zap.Error(closeErr))
+		}
+		return nil, nil
+	}
+	return registry, ready
+}
+
+// waitForReadiness opens the readiness gate once this scheduler knows the fleet.
+//
+// The replay is bounded rather than waited out: NOT_SERVING-forever means a
+// store blip during a rollout takes the whole tier down, while serving early
+// leaves a partial registry that fails open exactly as a single scheduler does
+// after a restart. The timeout is the operator's choice between those and the
+// warm-up gauge says which one happened.
+func waitForReadiness(
+	ctx context.Context,
+	logger *zap.Logger,
+	gate *scheduler.ReadinessGate,
+	discoveryReady <-chan struct{},
+	streamReady <-chan struct{},
+	warmupTimeout time.Duration,
+) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-discoveryReady:
+	}
+
+	if streamReady != nil {
+		timer := time.NewTimer(warmupTimeout)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-streamReady:
+		case <-timer.C:
+			scheduler.MarkNodeStreamWarmupIncomplete()
+			logger.Warn("scheduler node stream warm-up timed out; serving over a partial registry",
+				zap.Duration("timeout", warmupTimeout),
+			)
+		}
+	}
+	gate.MarkStarted()
 }
 
 func createBindingStore(logger *zap.Logger, cfg config.Config) (scheduler.BindingStore, func()) {
@@ -236,7 +403,14 @@ func runKubernetesDiscoveryWithRetry(
 	logger *zap.Logger,
 	cfg config.SchedulerDiscoveryKubernetesConfig,
 	registry *scheduler.AtomicNodeRegistry,
+	ready chan<- struct{},
 ) {
+	var once sync.Once
+	signalReady := func() {
+		once.Do(func() { close(ready) })
+	}
+	defer signalReady()
+
 	const (
 		initialBackoff = 1 * time.Second
 		maxBackoff     = 30 * time.Second
@@ -272,6 +446,14 @@ func runKubernetesDiscoveryWithRetry(
 			backoff = nextBackoff(backoff, maxBackoff)
 			continue
 		}
+
+		go func() {
+			select {
+			case <-ctx.Done():
+			case <-discovery.Ready():
+				signalReady()
+			}
+		}()
 
 		err = discovery.Run(ctx)
 		if err == nil || errors.Is(err, context.Canceled) {

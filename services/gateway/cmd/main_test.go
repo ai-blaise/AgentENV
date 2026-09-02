@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -225,5 +226,172 @@ func TestSchedulerConnCarriesTheConfiguredToken(t *testing.T) {
 				t.Fatalf("authorization = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// countingScheduler is a real gRPC scheduler that counts the lookups it served,
+// so a balancing test can assert on where calls landed rather than on the
+// service-config string that was supposed to send them there.
+type countingScheduler struct {
+	schedulerv1.UnimplementedSchedulerServer
+	mu    sync.Mutex
+	calls int
+}
+
+func (s *countingScheduler) LookupNode(context.Context, *schedulerv1.LookupNodeRequest) (*schedulerv1.LookupNodeResponse, error) {
+	s.mu.Lock()
+	s.calls++
+	s.mu.Unlock()
+	return &schedulerv1.LookupNodeResponse{Node: &schedulerv1.Node{NodeId: "node-a", Endpoint: "http://node-a"}}, nil
+}
+
+func (s *countingScheduler) served() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+type schedulerReplica struct {
+	server  *grpc.Server
+	counter *countingScheduler
+	addr    string
+}
+
+func startSchedulerReplicas(t *testing.T, count int) []*schedulerReplica {
+	t.Helper()
+
+	replicas := make([]*schedulerReplica, 0, count)
+	for i := 0; i < count; i++ {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		server := grpc.NewServer()
+		counter := &countingScheduler{}
+		schedulerv1.RegisterSchedulerServer(server, counter)
+		go func() { _ = server.Serve(listener) }()
+		replica := &schedulerReplica{server: server, counter: counter, addr: listener.Addr().String()}
+		t.Cleanup(replica.server.Stop)
+		replicas = append(replicas, replica)
+	}
+	return replicas
+}
+
+func replicaAddrs(replicas []*schedulerReplica) string {
+	addrs := make([]string, 0, len(replicas))
+	for _, replica := range replicas {
+		addrs = append(addrs, replica.addr)
+	}
+	return strings.Join(addrs, ",")
+}
+
+func lookupN(t *testing.T, client schedulerv1.SchedulerClient, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, err := client.LookupNode(ctx, &schedulerv1.LookupNodeRequest{SandboxId: "sbx-1"})
+		cancel()
+		if err != nil {
+			t.Fatalf("LookupNode %d: %v", i, err)
+		}
+	}
+}
+
+// Without the round-robin service config this fails 6/0/0: grpc.NewClient
+// balances with pick_first, so every gateway pins itself to one scheduler and
+// scaling the tier out moves no traffic at all.
+func TestSchedulerConnRoundRobinsAcrossReplicas(t *testing.T) {
+	replicas := startSchedulerReplicas(t, 3)
+
+	conn, err := newSchedulerConn(replicaAddrs(replicas), "")
+	if err != nil {
+		t.Fatalf("newSchedulerConn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	client := schedulerv1.NewSchedulerClient(conn)
+
+	// The count is taken once every replica has a ready subchannel, because
+	// round_robin spreads only over those.
+	waitForReplicasServed(t, client, replicas)
+	before := make([]int, len(replicas))
+	for i, replica := range replicas {
+		before[i] = replica.counter.served()
+	}
+
+	lookupN(t, client, 6)
+	for i, replica := range replicas {
+		if got := replica.counter.served() - before[i]; got != 2 {
+			t.Fatalf("replica %d served %d of 6 calls, want 2", i, got)
+		}
+	}
+}
+
+// Killing the replica a gateway is talking to must not fail a call. round_robin
+// drops a subchannel that cannot connect; the surviving replicas take the load.
+func TestSchedulerConnSurvivesReplicaLoss(t *testing.T) {
+	replicas := startSchedulerReplicas(t, 3)
+
+	conn, err := newSchedulerConn(replicaAddrs(replicas), "")
+	if err != nil {
+		t.Fatalf("newSchedulerConn: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	client := schedulerv1.NewSchedulerClient(conn)
+
+	waitForReplicasServed(t, client, replicas)
+
+	replicas[1].server.Stop()
+	// The balancer notices the dead subchannel on its next attempt, so one
+	// failure is tolerated here; what must not happen is calls failing after it.
+	_, _ = client.LookupNode(context.Background(), &schedulerv1.LookupNodeRequest{SandboxId: "sbx-1"})
+
+	before := []int{replicas[0].counter.served(), replicas[2].counter.served()}
+	lookupN(t, client, 6)
+	survived := (replicas[0].counter.served() - before[0]) + (replicas[2].counter.served() - before[1])
+	if survived != 6 {
+		t.Fatalf("surviving replicas served %d of 6 calls after a replica was killed", survived)
+	}
+}
+
+// A single address keeps dialling exactly as it did before the list form
+// existed, which is what every shipped config still writes.
+func TestSchedulerDialTargetKeepsASingleAddressUnchanged(t *testing.T) {
+	target, options, err := schedulerDialTarget(" scheduler:9090 ")
+	if err != nil {
+		t.Fatalf("schedulerDialTarget: %v", err)
+	}
+	if target != "scheduler:9090" || len(options) != 0 {
+		t.Fatalf("schedulerDialTarget() = %q with %d options, want the bare address and no resolver", target, len(options))
+	}
+
+	if _, _, err := schedulerDialTarget(" , "); err == nil {
+		t.Fatal("schedulerDialTarget accepted an address naming no host")
+	}
+}
+
+// waitForReplicasServed drives calls until every replica has answered one.
+// round_robin spreads over the subchannels that are ready, and they become
+// ready as their connections come up, so a balancing assertion is only
+// meaningful once they all have.
+func waitForReplicasServed(t *testing.T, client schedulerv1.SchedulerClient, replicas []*schedulerReplica) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		served := 0
+		for _, replica := range replicas {
+			if replica.counter.served() > 0 {
+				served++
+			}
+		}
+		if served == len(replicas) {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d of %d replicas ever served a call", served, len(replicas))
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_, _ = client.LookupNode(ctx, &schedulerv1.LookupNodeRequest{SandboxId: "sbx-1"})
+		cancel()
+		time.Sleep(20 * time.Millisecond)
 	}
 }

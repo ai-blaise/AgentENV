@@ -33,6 +33,93 @@ const defaultSchedulerReportTTL = 30 * time.Second
 // node that stops heartbeating from accumulating phantom load without bound.
 const defaultSchedulerMaxReservationDelta = 512
 
+// defaultSchedulerNodeStreamMaxLen bounds each shard of the node-state stream.
+// It has to hold more than two report TTLs of the whole fleet's heartbeats, or
+// a replica that restarts replays a window with live nodes missing from it.
+const defaultSchedulerNodeStreamMaxLen = 100000
+
+// defaultSchedulerNodeStreamPublishQueue bounds what is waiting to be written
+// when Redis is slow. Publishing never blocks a heartbeat, so a full queue
+// drops instead, which costs one interval of staleness on the other replicas.
+const defaultSchedulerNodeStreamPublishQueue = 4096
+
+// defaultSchedulerNodeStreamWarmupTimeout bounds how long a starting replica
+// waits to replay the fleet before serving anyway.
+//
+// Waiting forever would mean a Redis blip during a rollout takes the whole
+// scheduler tier out; serving early means placing over a partial registry,
+// which is what a single scheduler does after every restart. The timeout is the
+// operator's dial between the two and the warm-up metric says which happened.
+const defaultSchedulerNodeStreamWarmupTimeout = 15 * time.Second
+
+// defaultSchedulerStoreProbeInterval is how often a scheduler asks its binding
+// store whether it is still there.
+const defaultSchedulerStoreProbeInterval = 2 * time.Second
+
+// SchedulerMode is how one scheduler process takes part in a cluster.
+//
+// The distinction that is worth enforcing is not which process leads — nothing
+// in the scheduler is leader-elected — but which may run without a shared
+// store. A primary may: it is the single-scheduler deployment, and in-memory
+// bindings are lost on restart and nowhere else. A replica may not: three
+// replicas with three private binding maps answer a routing lookup correctly
+// one time in three, and nothing about that failure is visible until a client
+// gets a 404 for a sandbox that is running.
+type SchedulerMode string
+
+const (
+	// SchedulerModePrimary is the single-scheduler deployment, and the default.
+	SchedulerModePrimary SchedulerMode = "primary"
+	// SchedulerModeReplica is one of N schedulers sharing a store and a bus.
+	SchedulerModeReplica SchedulerMode = "replica"
+	// SchedulerModeQueryOnly serves LookupNode and nothing else, from the
+	// shared store, so routing survives a restart of the rest of the tier.
+	SchedulerModeQueryOnly SchedulerMode = "query-only"
+)
+
+// ParseSchedulerMode reads the --mode flag or SCHEDULER_MODE.
+func ParseSchedulerMode(raw string) (SchedulerMode, error) {
+	switch SchedulerMode(strings.ToLower(strings.TrimSpace(raw))) {
+	case SchedulerModePrimary:
+		return SchedulerModePrimary, nil
+	case SchedulerModeReplica:
+		return SchedulerModeReplica, nil
+	case SchedulerModeQueryOnly:
+		return SchedulerModeQueryOnly, nil
+	default:
+		return "", fmt.Errorf("scheduler mode %q must be one of primary, replica, query-only", raw)
+	}
+}
+
+// QueryOnly reports whether the mode serves lookups alone.
+func (m SchedulerMode) QueryOnly() bool { return m == SchedulerModeQueryOnly }
+
+// ResolveSchedulerMode settles the mode from the flags and the environment.
+//
+// --query-only is kept as a deprecated alias because it is what every shipped
+// manifest and every operator runbook says today. Setting both is refused
+// rather than resolved by precedence: the two spellings can disagree, and a
+// scheduler that silently picked one would be serving a different contract from
+// the one the deployment asked for.
+func ResolveSchedulerMode(modeFlag string, queryOnlyFlag bool, lookupEnv func(string) (string, bool)) (SchedulerMode, error) {
+	modeFlag = strings.TrimSpace(modeFlag)
+	if modeFlag != "" && queryOnlyFlag {
+		return "", errors.New("--mode and the deprecated --query-only are both set; use --mode=query-only")
+	}
+	if queryOnlyFlag {
+		return SchedulerModeQueryOnly, nil
+	}
+	if modeFlag != "" {
+		return ParseSchedulerMode(modeFlag)
+	}
+	if lookupEnv != nil {
+		if raw, ok := lookupEnv("SCHEDULER_MODE"); ok && strings.TrimSpace(raw) != "" {
+			return ParseSchedulerMode(raw)
+		}
+	}
+	return SchedulerModePrimary, nil
+}
+
 type Node struct {
 	ID       string `json:"id"`
 	Endpoint string `json:"endpoint"`
@@ -133,6 +220,42 @@ type SchedulerConfig struct {
 	// sandbox count from what its last heartbeat reported. Zero uses the
 	// default.
 	MaxReservationDelta int `json:"max_reservation_delta"`
+	// NodeStreamEnabled replicates node state between scheduler replicas, so
+	// each one knows the nodes whose heartbeats went to another. Absent means
+	// on for --mode=replica and off everywhere else; false is the rollback and
+	// reproduces a scheduler that hears only its own nodes.
+	NodeStreamEnabled *bool `json:"node_stream_enabled"`
+	// NodeStreamMaxLen bounds each of the sixteen stream shards, approximately.
+	// Zero uses the default.
+	NodeStreamMaxLen int `json:"node_stream_maxlen"`
+	// NodeStreamPublishQueue bounds the events waiting to be written when the
+	// store is slow. Zero uses the default.
+	NodeStreamPublishQueue int `json:"node_stream_publish_queue"`
+	// NodeStreamWarmupTimeout bounds how long a starting replica stays
+	// NOT_SERVING while it replays the fleet. Zero uses the default.
+	NodeStreamWarmupTimeout time.Duration `json:"node_stream_warmup_timeout"`
+	// StoreProbeInterval is how often the scheduler asks its binding store
+	// whether it is reachable, which is what its readiness reports. Zero uses
+	// the default.
+	StoreProbeInterval time.Duration `json:"store_probe_interval"`
+}
+
+// NodeStreamEnabledFor reports whether node state is replicated, defaulting to
+// on for a replica and off for anything else.
+//
+// A replica that does not replicate is strictly worse than a single scheduler:
+// it places all of its traffic onto the slice of the fleet it happens to hear
+// from, and a freshly started one places onto a fleet it has no capacity data
+// for at all. So the mode that needs it has it by default, and the operator can
+// still turn it off to get today's behaviour back.
+func (s *SchedulerConfig) NodeStreamEnabledFor(mode SchedulerMode) bool {
+	if mode.QueryOnly() {
+		return false
+	}
+	if s.NodeStreamEnabled != nil {
+		return *s.NodeStreamEnabled
+	}
+	return mode == SchedulerModeReplica
 }
 
 // HealthGateEnabled reports whether health-gated placement is on, defaulting
@@ -161,6 +284,11 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		AuthTokenFile           *string                   `json:"auth_token_file"`
 		ReservationsEnabled     *bool                     `json:"reservations_enabled"`
 		MaxReservationDelta     *int                      `json:"max_reservation_delta"`
+		NodeStreamEnabled       *bool                     `json:"node_stream_enabled"`
+		NodeStreamMaxLen        *int                      `json:"node_stream_maxlen"`
+		NodeStreamPublishQueue  *int                      `json:"node_stream_publish_queue"`
+		NodeStreamWarmupTimeout json.RawMessage           `json:"node_stream_warmup_timeout"`
+		StoreProbeInterval      json.RawMessage           `json:"store_probe_interval"`
 	}
 
 	parsed := wire{}
@@ -210,6 +338,15 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	if parsed.MaxReservationDelta != nil {
 		s.MaxReservationDelta = *parsed.MaxReservationDelta
 	}
+	if parsed.NodeStreamEnabled != nil {
+		s.NodeStreamEnabled = parsed.NodeStreamEnabled
+	}
+	if parsed.NodeStreamMaxLen != nil {
+		s.NodeStreamMaxLen = *parsed.NodeStreamMaxLen
+	}
+	if parsed.NodeStreamPublishQueue != nil {
+		s.NodeStreamPublishQueue = *parsed.NodeStreamPublishQueue
+	}
 
 	if len(bytes.TrimSpace(parsed.ReportTTL)) > 0 {
 		d, err := parseSchedulerDuration(parsed.ReportTTL, "scheduler.report_ttl")
@@ -238,6 +375,20 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		s.ReconcileGrace = d
+	}
+	if len(bytes.TrimSpace(parsed.NodeStreamWarmupTimeout)) > 0 {
+		d, err := parseSchedulerDuration(parsed.NodeStreamWarmupTimeout, "scheduler.node_stream_warmup_timeout")
+		if err != nil {
+			return err
+		}
+		s.NodeStreamWarmupTimeout = d
+	}
+	if len(bytes.TrimSpace(parsed.StoreProbeInterval)) > 0 {
+		d, err := parseSchedulerDuration(parsed.StoreProbeInterval, "scheduler.store_probe_interval")
+		if err != nil {
+			return err
+		}
+		s.StoreProbeInterval = d
 	}
 
 	return nil
@@ -419,14 +570,14 @@ type Config struct {
 }
 
 func Load(path string, service string) (Config, error) {
-	return load(path, service, false)
+	return load(path, service, SchedulerModePrimary)
 }
 
-func LoadScheduler(path string, queryOnly bool) (Config, error) {
-	return load(path, "scheduler", queryOnly)
+func LoadScheduler(path string, mode SchedulerMode) (Config, error) {
+	return load(path, "scheduler", mode)
 }
 
-func load(path string, service string, schedulerQueryOnly bool) (Config, error) {
+func load(path string, service string, schedulerMode SchedulerMode) (Config, error) {
 	cfg := defaultConfig(service)
 	if path != "" {
 		data, err := os.ReadFile(path)
@@ -442,7 +593,7 @@ func load(path string, service string, schedulerQueryOnly bool) (Config, error) 
 	}
 	cfg.Service = service
 	cfg.applyDefaults()
-	if err := cfg.validate(schedulerQueryOnly); err != nil {
+	if err := cfg.validate(schedulerMode); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
@@ -513,6 +664,8 @@ func overrideWithEnv(cfg *Config) error {
 		{"SCHEDULER_BINDING_TTL", &cfg.Scheduler.BindingTTL},
 		{"SCHEDULER_RECONCILE_GRACE", &cfg.Scheduler.ReconcileGrace},
 		{"SCHEDULER_HEARTBEAT_INTERVAL", &cfg.Scheduler.HeartbeatInterval},
+		{"SCHEDULER_NODE_STREAM_WARMUP_TIMEOUT", &cfg.Scheduler.NodeStreamWarmupTimeout},
+		{"SCHEDULER_STORE_PROBE_INTERVAL", &cfg.Scheduler.StoreProbeInterval},
 	} {
 		v := strings.TrimSpace(os.Getenv(override.key))
 		if v == "" {
@@ -547,6 +700,14 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid SCHEDULER_RESERVATIONS_ENABLED %q: %w", v, err)
 		}
 		cfg.Scheduler.ReservationsEnabled = b
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_NODE_STREAM_ENABLED")); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_NODE_STREAM_ENABLED %q: %w", v, err)
+		}
+		cfg.Scheduler.NodeStreamEnabled = &b
 	}
 
 	if v := strings.TrimSpace(os.Getenv("SCHEDULER_MAX_RESERVATION_DELTA")); v != "" {
@@ -655,6 +816,18 @@ func (c *Config) applyDefaults() {
 	if c.Scheduler.MaxReservationDelta == 0 {
 		c.Scheduler.MaxReservationDelta = defaultSchedulerMaxReservationDelta
 	}
+	if c.Scheduler.NodeStreamMaxLen == 0 {
+		c.Scheduler.NodeStreamMaxLen = defaultSchedulerNodeStreamMaxLen
+	}
+	if c.Scheduler.NodeStreamPublishQueue == 0 {
+		c.Scheduler.NodeStreamPublishQueue = defaultSchedulerNodeStreamPublishQueue
+	}
+	if c.Scheduler.NodeStreamWarmupTimeout == 0 {
+		c.Scheduler.NodeStreamWarmupTimeout = defaultSchedulerNodeStreamWarmupTimeout
+	}
+	if c.Scheduler.StoreProbeInterval == 0 {
+		c.Scheduler.StoreProbeInterval = defaultSchedulerStoreProbeInterval
+	}
 	if strings.TrimSpace(c.Scheduler.Discovery.Mode) == "" {
 		c.Scheduler.Discovery.Mode = "static"
 	}
@@ -667,10 +840,10 @@ func (c *Config) applyDefaults() {
 }
 
 func (c Config) Validate() error {
-	return c.validate(false)
+	return c.validate(SchedulerModePrimary)
 }
 
-func (c Config) validate(schedulerQueryOnly bool) error {
+func (c Config) validate(schedulerMode SchedulerMode) error {
 	if c.Service == "" {
 		return errors.New("service is required")
 	}
@@ -717,9 +890,28 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		if _, err := CheckReconcileGrace(c.Scheduler.BindingTTL, c.Scheduler.ReconcileGrace, c.Scheduler.HeartbeatInterval); err != nil {
 			return err
 		}
-		if schedulerQueryOnly {
+		if c.Scheduler.NodeStreamMaxLen < 0 {
+			return errors.New("scheduler.node_stream_maxlen must not be negative")
+		}
+		if c.Scheduler.NodeStreamPublishQueue < 0 {
+			return errors.New("scheduler.node_stream_publish_queue must not be negative")
+		}
+		if c.Scheduler.NodeStreamWarmupTimeout < 0 {
+			return errors.New("scheduler.node_stream_warmup_timeout must not be negative")
+		}
+		if c.Scheduler.StoreProbeInterval < 0 {
+			return errors.New("scheduler.store_probe_interval must not be negative")
+		}
+		// A replica without a shared store is the one configuration that fails
+		// silently: N replicas each hold their own binding map, and a routing
+		// lookup is answered correctly one time in N. Refusing to start is the
+		// whole enforceable difference between the modes.
+		if schedulerMode == SchedulerModeReplica && strings.TrimSpace(c.Scheduler.RedisAddr) == "" {
+			return errors.New("scheduler --mode=replica requires scheduler.redis_addr; replicas without a shared binding store answer routing lookups from private maps")
+		}
+		if schedulerMode.QueryOnly() {
 			if strings.TrimSpace(c.Scheduler.RedisAddr) == "" {
-				return errors.New("scheduler --query-only requires scheduler.redis_addr")
+				return errors.New("scheduler --mode=query-only requires scheduler.redis_addr")
 			}
 			return nil
 		}

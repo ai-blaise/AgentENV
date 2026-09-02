@@ -258,10 +258,16 @@ fn domain_matches(hostname: &str, pattern: &str) -> bool {
         })
 }
 
-pub(super) fn initialize_namespace_egress_chain(
+/// The rules that put a fresh namespace's egress chains in place.
+///
+/// Returned rather than applied so the caller can commit them in the same
+/// `iptables-restore` as the namespace's routing rules: both sets run on the
+/// setup thread, back to back, in the same namespace, and each invocation costs
+/// a fork and an xtables-lock acquisition.
+pub(super) fn namespace_egress_chain_commands(
     guest_dns_ip: Ipv4Addr,
     internal_egress_denied_cidrs: &[String],
-) -> Result<()> {
+) -> Vec<IptablesRestoreCommand> {
     let mut commands = vec![
         IptablesRestoreCommand::NewChain {
             table: "filter",
@@ -304,8 +310,7 @@ pub(super) fn initialize_namespace_egress_chain(
         },
     ]);
 
-    apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)
-        .context("initialize AgentENV namespace egress iptables chains")
+    commands
 }
 
 fn build_static_egress_commands(

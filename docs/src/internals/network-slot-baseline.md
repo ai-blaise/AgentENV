@@ -1,6 +1,7 @@
 # Network slot creation baseline
 
-Measured on a 224-core Linux host with
+Measured on a 224-core Linux host, kernel `5.14.0-687.39.1+2.1.el9_8`,
+`iptables v1.8.10 (nf_tables)`, with
 `sandbox::network::manager::tests::network_slot_creation_throughput`:
 
 ```bash
@@ -44,3 +45,23 @@ move the ceiling.
 `iptables-restore` was given `--wait`, concurrent slot setup failed outright on
 the xtables lock rather than queueing, and the pool refill loop abandoned its
 fill on the first such error.
+
+## The iptables backend belongs in the record
+
+Which backend the host's `iptables` binaries front decides whether the lock
+options mean anything at all. `xtables-nft-restore` accepts `--wait` and
+`--wait-interval` and discards them: an nft restore is one kernel netlink
+transaction and never opens `/run/xtables.lock`. Only `iptables-legacy` takes
+that lock, and only there can `agentenv_network_iptables_lock_contention_total`
+ever move.
+
+The numbers above were taken on the **nf_tables** backend, so they carry no
+xtables-lock contention at all — the fill-concurrency knee they show is kernel
+RTNL serialization, not lock waiting. A legacy-backend host is a different
+measurement and has to be recorded as one; the node logs its backend once, with
+the global host rules, as `installed global host iptables rules for sandbox
+networking backend=…`.
+
+Kernel version belongs in the record for the same reason: recent kernels have
+been progressively narrowing RTNL to per-netns scope, so whether slot setups in
+different namespaces contend at all is version-dependent.

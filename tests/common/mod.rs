@@ -95,6 +95,7 @@ pub fn snapshot_test_parts(
         root: root.join("repository"),
         cache_root: Some(root.join("runtime-cache")),
         runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
+        lock_strategy: Default::default(),
     })
     .expect("posix backend");
     let repository = backend.repository();

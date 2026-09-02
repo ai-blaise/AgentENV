@@ -6,6 +6,9 @@ mod envd_supervisor;
 #[path = "integration/fc.rs"]
 mod fc;
 
+#[path = "integration/memory_elasticity.rs"]
+mod memory_elasticity;
+
 #[path = "integration/process.rs"]
 mod process;
 

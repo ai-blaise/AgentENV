@@ -502,7 +502,7 @@ func (s *Service) Heartbeat(ctx context.Context, req *schedulerv1.HeartbeatReque
 
 	now := time.Now()
 	previous, seen := s.nodes.ObservedIncarnation(nodeID)
-	node, cpuConfigJSON, err := s.nodes.Heartbeat(req, now)
+	node, ack, err := s.nodes.Heartbeat(req, now)
 	if err != nil {
 		if errors.Is(err, ErrNodeNotInRegistry) {
 			s.logger.Warn("scheduler rejected observed registration for unknown node",
@@ -577,7 +577,8 @@ func (s *Service) Heartbeat(ctx context.Context, req *schedulerv1.HeartbeatReque
 	}
 
 	return &schedulerv1.HeartbeatResponse{
-		CpuConfigJson:        cpuConfigJSON,
+		CpuConfigJson:        ack.CPUConfigJSON,
+		RequestCpuConfig:     ack.RequestCPUConfig,
 		RequestFullRoster:    requestFullRoster,
 		RosterDigestAccepted: s.mayElideRoster(nodeID, req.GetHeartbeatIntervalMs()),
 	}, nil
@@ -890,6 +891,20 @@ func (s *Service) RunObservedNodesMetrics(ctx context.Context, interval time.Dur
 
 func (s *Service) refreshObservedNodesMetrics(now time.Time) {
 	recordObservedNodes(s.nodes.ListObserved("", now))
+	// Only a stream-fed registry can answer this. On a converged fleet the two
+	// series sum to the fleet size on every replica, which is the cheapest
+	// direct evidence that replication is working.
+	if counter, ok := s.nodes.(observedSourceCounter); ok {
+		rpc, stream := counter.ObservedSourceCounts()
+		schedulerRegistryNodes.WithLabelValues(string(observedSourceRPC)).Set(float64(rpc))
+		schedulerRegistryNodes.WithLabelValues(string(observedSourceStream)).Set(float64(stream))
+	}
+}
+
+// observedSourceCounter is implemented by registries that know how they came by
+// each node.
+type observedSourceCounter interface {
+	ObservedSourceCounts() (rpc int, stream int)
 }
 
 func (s *Service) ListObservedNodes(_ context.Context, req *schedulerv1.ListObservedNodesRequest) (*schedulerv1.ListObservedNodesResponse, error) {

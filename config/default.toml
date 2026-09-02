@@ -173,6 +173,26 @@ always_denied_cidrs = [
   "192.168.0.0/16",
 ]
 
+[network.iptables]
+# How `iptables-restore` is told to wait for the xtables lock. Only the legacy
+# backend takes that lock; the nft backend accepts both flags and ignores them.
+# Both are `=`-bound on the command line because `-w`'s argument is optional in
+# iptables' own getopt table, so a space-separated value is not bound to it.
+# Set wait_secs = 0 to pass neither flag.
+wait_secs = 5
+# Microseconds between lock retries. The binary's default is one second, far
+# longer than the few milliseconds a slot setup holds the lock.
+wait_interval_usec = 20000
+
+[network.slot]
+# Create the namespace end of the veth pair directly in the sandbox namespace
+# instead of creating both ends inside it and moving the host end back out.
+# The move is the one slot operation that holds RTNL across an RCU grace
+# period. Off until the result has been compared against the moved-end path on
+# the target kernel: a kernel that ignores IFLA_NET_NS_FD in the nested peer
+# attributes would put both ends in the wrong namespace and fail every create.
+create_veth_peer_in_namespace = false
+
 [network.internal]
 # Internal address pools for sandbox network namespaces. Change them only when
 # they overlap deployment networks. They must not overlap each other or the
@@ -203,6 +223,50 @@ vcpu_count = 2
 # bandwidth_burst_bytes = 10485760     # 10 MB startup burst; not replenished
 # iops = 3000                          # 3000 sustained IOPS
 # iops_burst = 500                     # 500 startup IOPS; not replenished
+
+[machine.balloon]
+# virtio-balloon device features. All of these are pre-boot only: a sandbox
+# keeps whatever this block said when it first booted, and so does every
+# snapshot taken from it. Changing a value here reaches new sandboxes only.
+# PVM nodes force every field off; the endpoints are KVM-build patches.
+#
+# Seconds between guest statistics refreshes; 0 disables statistics. This is
+# the only source of guest memory consumption that does not double-count the
+# shared memory device across sandboxes.
+stats_polling_interval_s = 1
+# Free-page-hinting device feature bit. Off: the dirty-set saving is a
+# property of the patched binary, not a documented API guarantee, and it has
+# not been measured on this fleet.
+free_page_hinting = false
+# Issue a hinting run before each memory capture. Requires the feature bit
+# above; skipped when the sandbox reports no hinting-capable balloon.
+free_page_hinting_on_capture = false
+# How long a hinting run may hold up a capture. The run happens while the
+# guest is still executing, so this is added pause latency, not guest
+# downtime; on expiry the capture proceeds as if hinting were off.
+free_page_hinting_timeout_ms = 3000
+
+[machine.memory_control]
+# Node memory-pressure control loop. It complements the in-guest DAMON reclaim
+# in the kernel boot args (which runs with skip_anon=Y and so only reclaims
+# page cache) by moving each guest's RAM ceiling from the host side.
+#
+# Off by default. Actuation additionally requires a virtio-mem device on the
+# sandbox; without one the loop only reports.
+enabled = false
+# Seconds between passes.
+interval_secs = 15
+# Grow below this share of guest memory available, or as soon as the guest's
+# allocation-stall counters move.
+grow_available_percent = 10
+# Consider a guest over-provisioned above this share available.
+shrink_available_percent = 40
+# Consecutive over-provisioned passes before anything is taken back.
+shrink_hysteresis_passes = 4
+# Largest single move, in MiB.
+max_step_mib = 512
+# Host memory utilisation above which the node refuses growth and reclaims.
+node_memory_high_percent = 85
 
 [envd]
 # Expected envd version baked into the tools drive.
@@ -249,6 +313,18 @@ retry_after_secs = 2
 # Collecting metrics walks every sandbox, so re-reading per decision would make
 # the gate the bottleneck under the burst it exists to survive.
 snapshot_max_age_ms = 200
+
+[orchestrator.drain]
+# How POST /admin/drain empties this node. Sandboxes paused and published at
+# once; each writes a memory image, so this leans on storage that the sandboxes
+# still running here are also using.
+concurrency = 4
+# Deadline for one drain pass when the request omits deadlineMs. A pass reports
+# what is left rather than running to completion, so the caller polls.
+deadline_ms = 30000
+# Publishing paused state to the repository additionally requires
+# [snapshot.mobility].enabled: the published snapshot is only reachable through
+# the mobility record naming it, so without one it is an upload nothing reads.
 
 [snapshot]
 # Node-local cache for snapshot artifacts.
@@ -303,6 +379,13 @@ p2p_enabled = true
 # snapshot filesystem.
 # [backend.posix_fs]
 # snapshot_store = "/mnt/aenv-snapshots"
+# How the catalog takes its alias and record locks. "flock" is the default:
+# kernel-enforced, and released when the holding process dies. "create_new" is
+# for filesystems that do not honour flock between every writer sharing one
+# repository — some NFS and FUSE mounts. It is strictly weaker: a holder that
+# dies leaves its lock behind until it ages out, and everything waiting on that
+# alias waits with it. Choose it only when flock does not work.
+# lock_strategy = "flock"
 
 # OSS requires an endpoint, bucket, region, and either credential_process or
 # static credentials. credential_process takes precedence over static values.
@@ -368,6 +451,9 @@ startup_prewarm = true
 # Slots built concurrently per refill batch. Slot creation is dominated by
 # RTNL-serialized netlink work, so this does not scale linearly.
 fill_concurrency = 4
+# Per-pool overrides of the shared watermarks above. Omit to follow [pool].
+# low_watermark = 2
+# high_watermark = 64
 
 [pool.block]
 # Enable the reusable OverlayBD ublk-device pool. This is its only switch:

@@ -1,0 +1,47 @@
+syntax = "proto3";
+
+package scheduler.v1;
+
+import "api/proto/scheduler.proto";
+
+option go_package = "agentenv/services/api/proto;schedulerv1";
+
+// The node-state bus, by which one scheduler replica tells the others about the
+// nodes only it heard from.
+//
+// It lives beside the service definition rather than in it because nothing
+// outside the control plane speaks it: nodes are unaware there is more than one
+// scheduler, and the Rust client compiled from scheduler.proto has no use for
+// these messages.
+
+// NodeStateEvent carries one node's heartbeat from the scheduler replica that
+// received it to the replicas that did not.
+//
+// A node's connection to the scheduler is sticky: kube-proxy binds it to one
+// replica for the life of the TCP connection, so with N replicas each hears
+// from roughly 1/N of the fleet and would place blind on the rest. The replica
+// that took the heartbeat republishes it, and every replica converges on the
+// whole fleet's liveness and capacity without the node knowing there is more
+// than one scheduler.
+message NodeStateEvent {
+  // Which replica published this, so a replica skips its own echo.
+  string origin_replica_id = 1;
+
+  // When the publishing replica saw the heartbeat, on its own clock.
+  //
+  // Applied verbatim rather than restamped on arrival: a stream that backs up
+  // would otherwise make every node look freshly seen and disable the health
+  // gate across the fleet. Replica clocks are compared against each other
+  // here, never against a node's.
+  int64 last_seen_unix_ms = 2;
+
+  // The heartbeat as received, minus everything that belongs to the one
+  // replica that took the RPC: the roster and its digest, and the emitted
+  // event count. Roster reconciliation has a single writer per node by
+  // design, and republishing rosters would make this stream O(sandboxes).
+  HeartbeatRequest heartbeat = 3;
+
+  // Reserved for the reservation ledger's own fan-out, which replicates a
+  // cumulative delta plus a per-publisher sequence rather than raw events.
+  reserved 4, 5;
+}

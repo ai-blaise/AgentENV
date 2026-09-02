@@ -10,3 +10,9 @@ anyhow = "1.0"
 axum = "0.8"
 metrics-exporter-prometheus = "0.18.3"
 tokio = { version = "1", features = ["net", "rt", "time"] }
+
+[dev-dependencies]
+# Recording into a locally-scoped copy of the exported recorder, so the bucket
+# ladders can be asserted on rendered exposition without claiming the
+# once-per-process global recorder slot.
+metrics = "0.24"

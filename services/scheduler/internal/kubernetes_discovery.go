@@ -31,7 +31,15 @@ type KubernetesDiscovery struct {
 	endpointSliceInformer cache.SharedIndexInformer
 	ignorePodInformer     cache.SharedIndexInformer
 	noSchedulePodInformer cache.SharedIndexInformer
+	// ready closes once the registry holds the fleet the informer found. Run
+	// blocks until its context ends, so this is the only way for a caller to
+	// tell "discovering" from "discovered" — and a scheduler that reports
+	// itself ready before it can is one that places over an empty registry.
+	ready chan struct{}
 }
+
+// Ready closes once discovery has populated the registry for the first time.
+func (d *KubernetesDiscovery) Ready() <-chan struct{} { return d.ready }
 
 func NewKubernetesDiscovery(
 	logger *zap.Logger,
@@ -87,6 +95,7 @@ func NewKubernetesDiscovery(
 		endpointSliceInformer: endpointSliceInformer,
 		ignorePodInformer:     ignorePodInformer,
 		noSchedulePodInformer: noSchedulePodInformer,
+		ready:                 make(chan struct{}),
 	}
 	// A registration that does not take means the node view silently freezes
 	// at whatever it last held, so this fails construction rather than
@@ -178,6 +187,11 @@ func (d *KubernetesDiscovery) Run(ctx context.Context) error {
 	}
 
 	d.syncFromStore()
+	select {
+	case <-d.ready:
+	default:
+		close(d.ready)
+	}
 
 	<-ctx.Done()
 	return ctx.Err()

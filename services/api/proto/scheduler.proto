@@ -304,6 +304,17 @@ message HeartbeatResponse {
   // cannot carry that signal: false there means "no need", which is exactly
   // what an older scheduler also sends.
   bool roster_digest_accepted = 3;
+
+  // Asks the node to send its CPU configuration on the next heartbeat.
+  //
+  // The scheduler intersects every node's CPU configuration so a sandbox
+  // snapshotted on one node resumes on any other, and it holds the result in
+  // memory only. A restarted scheduler therefore has nothing, and the node
+  // that sent its configuration once, to a process that is gone, has no reason
+  // to send it again. This is that reason. It is set whenever the scheduler
+  // holds no configuration for the node, so the tens of kilobytes are paid
+  // when they are missing rather than on every heartbeat.
+  bool request_cpu_config = 4;
 }
 
 enum SandboxEventType {

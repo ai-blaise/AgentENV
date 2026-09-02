@@ -176,6 +176,41 @@ components:
       minimum: 0
       description: Disk size for the sandbox in MiB
 
+    DrainRequest:
+      type: object
+      properties:
+        deadlineMs:
+          type: integer
+          format: uint64
+          description: >-
+            How long this pass may spend pausing and publishing. Omitted, the
+            node's own configured deadline applies. A pass reports what is left
+            rather than running to completion, so the caller polls.
+
+    DrainProgress:
+      type: object
+      required:
+        - remaining
+        - published
+        - failed
+      properties:
+        remaining:
+          type: integer
+          format: uint32
+          description: >-
+            Sandboxes on this node that are not paused yet. Zero means nothing
+            is lost by stopping the process.
+        published:
+          type: integer
+          format: uint32
+          description: >-
+            Paused sandboxes this pass committed to the repository, so another
+            node can take them over.
+        failed:
+          type: integer
+          format: uint32
+          description: Sandboxes this pass tried and could not pause or publish.
+
     EnvdVersion:
       type: string
       description: Version of the envd running in the sandbox
@@ -2340,5 +2375,37 @@ paths:
           $ref: "#/components/responses/401"
         "404":
           $ref: "#/components/responses/404"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /admin/drain:
+    post:
+      summary: Drain the node
+      description: >-
+        Stops this node admitting new sandboxes, then pauses and publishes what
+        it is already holding for as long as the deadline allows. Irreversible
+        for the life of the process, and bounded rather than complete: one call
+        reports what is left, so a preStop hook polls it until `remaining` is
+        zero.
+      tags: [admin]
+      security:
+        - AdminApiKeyAuth: []
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DrainRequest"
+      responses:
+        "200":
+          description: The drain pass completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DrainProgress"
+        "400":
+          $ref: "#/components/responses/400"
+        "401":
+          $ref: "#/components/responses/401"
         "500":
           $ref: "#/components/responses/500"

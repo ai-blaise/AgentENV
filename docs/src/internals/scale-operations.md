@@ -165,17 +165,51 @@ disk and the plan will keep refusing it.
 So the sequence for a drainable node is: mobility enabled, an object-store
 repository, and each paused sandbox snapshotted.
 
-### Planning and executing
+### Emptying a node
 
-Draining is planned before it is run, and the plan can be inspected without
-touching anything. What it cannot place is reported with why — "no compatible
-node" and "no room" are kept distinct because they call for opposite
-responses.
+`POST /admin/drain` closes the node to new work — irreversibly, for the life of
+the process — and then pauses and publishes what it is already holding. It is
+bounded rather than complete: one call runs a single pass under `deadlineMs`
+and answers `{remaining, published, failed}`, so the caller polls until both
+`remaining` and `failed` are zero. Both, because a publish that failed leaves
+its sandbox paused and so out of `remaining`, and stopping there would report a
+node as drained while those sandboxes' state never reached the repository. That
+shape exists because the caller is a preemption warning with a fixed window,
+and a call that ran to completion would simply be killed part-way through with
+no answer at all. The pod's `preStop` hook
+(`deploy/k8s/base/agentenv-daemonset.yaml`) is that caller.
+
+Polling is cheap because a pass skips any sandbox an earlier pass already
+committed: repeated passes converge on what is left rather than re-uploading
+every memory image on the node each time round.
+
+A sandbox mid-transition is left for a later pass rather than waited on. One
+wedged sandbox would otherwise consume a whole window on a wait that is capped
+at a minute, and pause nothing else.
+
+`[orchestrator.drain]` tunes the pass; publishing additionally requires
+`snapshot.mobility.enabled`, since a published snapshot is reachable only
+through the mobility record naming it.
+
+### Planning and executing a move
+
+Draining *to another node* is planned before it is run, and the plan can be
+inspected without touching anything. What it cannot place is reported with why
+— "no compatible node" and "no room" are kept distinct because they call for
+opposite responses.
 
 Execution is bounded on three axes: concurrency (every move is a memory image
 crossing a network that is also carrying live traffic), a failure budget (a
 systematic failure should be discovered once, not once per sandbox), and a
 per-move timeout.
+
+**Both are still library code with no operator entry point.** The planner and
+the saga are complete and tested, but the step between them — a destination
+being asked to claim and restore — is the cross-node call named below as
+missing, and neither is reachable from an API or a CLI until it exists.
+`POST /admin/drain` is the local half only: it makes a node's sandboxes movable
+and stops the node taking more, which is what a `preStop` hook needs, and is
+not the same thing as moving them.
 
 The safety property — never two live copies of one sandbox — depends on clock
 synchronisation. It holds exactly while skew between any two nodes stays

@@ -6,14 +6,16 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
+use futures::stream::StreamExt;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
 
-use crate::cfg::ConfigManager;
+use crate::cfg::{ConfigManager, MemoryControlConfig};
 use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
+use crate::observability::prometheus::{MetricGuard, SandboxStageTimer};
 use crate::sandbox::{
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, FirecrackerPausedState,
     FirecrackerSandboxFactory, FirecrackerSnapshotManifest, FreshSandboxBuildSpec,
@@ -27,7 +29,9 @@ use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
 use super::admission::{AdmissionController, AdmissionGuard, NodeCapacityInputs};
 use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
-    aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
+    aggregate_resource_metrics, run_memory_control_pass, MemoryControlPassReport,
+    MemoryControlSandbox, MemoryControlState, OrchestratorCounters, OrchestratorMetrics,
+    SandboxContribution,
 };
 use super::mobility::{MobilityHooks, ResumeFence};
 use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, SandboxPersister};
@@ -46,6 +50,17 @@ type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
 /// never completes (e.g. the task holding the state panics without rolling back).
 const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
+const MEMORY_CONTROL_PASS_METRIC: &str = "agentenv_memory_control_pass_duration_seconds";
+
+/// Sub-stage timings for a resume, under the same `operation` the API handler
+/// already reports the whole call as.
+///
+/// The handler's single stage says how long a resume took and nothing about
+/// where it went. These say which part: the fence, which is a scheduler round
+/// trip in a cluster, and the launch, which is the guest coming back. The
+/// timer holds nothing but the operation name, so one shared value is the same
+/// thing as constructing one per call.
+const RESUME_STAGES: SandboxStageTimer = SandboxStageTimer::new("resume");
 
 #[derive(Clone, Debug)]
 enum ShutdownOutcome {
@@ -68,6 +83,35 @@ impl ShutdownOutcome {
             Self::Failed(message) => Err(OrchestratorError::InternalError(message.clone())),
         }
     }
+}
+
+/// Committing a paused sandbox's state where the rest of the cluster can read
+/// it.
+///
+/// A drain needs this and the orchestrator cannot do it: the repository and
+/// its snapshot manager are built on top of the orchestrator, and handing it
+/// either would invert that. So whoever already holds both supplies one.
+#[async_trait::async_trait]
+pub trait PausedStatePublisher: Send + Sync {
+    /// Publishes a paused sandbox's artifacts and records it as movable.
+    async fn publish_paused(&self, sandbox_id: SandboxId) -> anyhow::Result<()>;
+}
+
+/// What one drain pass managed.
+///
+/// Shaped for a `preStop` hook to poll. `remaining` is the field that decides
+/// whether the process can be killed, and it counts what the node is actually
+/// still holding rather than what this pass happened to get through — a pass
+/// that did nothing because everything was already paused reports zero, which
+/// is the answer the caller needs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DrainProgress {
+    /// Sandboxes on this node that are not paused yet.
+    pub remaining: usize,
+    /// Paused sandboxes this pass committed to the repository.
+    pub published: usize,
+    /// Sandboxes this pass tried and could not pause or publish.
+    pub failed: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,6 +305,12 @@ where
                 }
             }
         }
+
+        Self::start_memory_control_task(
+            Arc::clone(&orchestrator),
+            app_config.machine.memory_control.clone(),
+            orchestrator.shutdown_tx.subscribe(),
+        );
 
         orchestrator.roster_complete.store(true, Ordering::Release);
 
@@ -1235,6 +1285,152 @@ where
         outcome.as_result()
     }
 
+    /// Empties the node: refuses new work, then pauses and publishes what it
+    /// is already holding, bounded by `deadline`.
+    ///
+    /// Refusing comes first, and is irreversible for the life of the process.
+    /// A drain that paused first would race the creates still arriving and
+    /// would never converge — every sandbox it published could be replaced by
+    /// one that landed while it was working.
+    ///
+    /// Bounded rather than complete. The caller is a preemption warning with a
+    /// fixed window, and a pass that overruns it is killed part-way through a
+    /// pause. So one pass does what it can under one deadline and reports what
+    /// is left, and the caller polls until `remaining` and `failed` are both
+    /// zero or its own window runs out — `failed` too, because a sandbox this
+    /// pass paused but could not publish is no longer counted in `remaining`
+    /// while its state has still not left the node. Sandboxes mid-transition
+    /// are left for a later pass
+    /// rather than waited on: [`WAIT_TRANSITION_TIMEOUT`] is a minute, and
+    /// spending a whole window on one wedged sandbox is exactly how the
+    /// sequential shutdown loop this replaces fails to fit any window at all.
+    ///
+    /// Publishing is skipped entirely on a node with no mobility installed.
+    /// The published snapshot is only reachable through the mobility record
+    /// that names it, so without one the upload is a copy of every byte the
+    /// sandbox owns that nothing will ever read. It is skipped per sandbox for
+    /// state an earlier pass already committed, which is what keeps repeated
+    /// passes cheap: the caller polls, so most of what a pass sees is what the
+    /// pass before it published.
+    pub async fn drain(
+        self: &Arc<Self>,
+        deadline: Duration,
+        concurrency: usize,
+        publisher: &dyn PausedStatePublisher,
+    ) -> Result<DrainProgress> {
+        let was_already_closed = self.is_shutting_down.swap(true, Ordering::AcqRel);
+        let _ = self.shutdown_tx.send_replace(true);
+        if !was_already_closed {
+            info!(
+                deadline_ms = deadline.as_millis(),
+                "node drain requested; this node will admit no further sandboxes"
+            );
+        }
+
+        let published = std::sync::atomic::AtomicUsize::new(0);
+        let failed = std::sync::atomic::AtomicUsize::new(0);
+
+        let candidates = self.store.list().await?;
+        let pass = futures::stream::iter(candidates)
+            .for_each_concurrent(concurrency.max(1), |metadata| {
+                let this = Arc::clone(self);
+                let published = &published;
+                let failed = &failed;
+                async move {
+                    let sandbox_id = metadata.id;
+                    match metadata.state {
+                        SandboxState::Running => {
+                            match this.pause_sandbox(sandbox_id).await {
+                                Ok(()) => {}
+                                // Gone between the roster read and the pause,
+                                // which is not a failure to report: there is
+                                // nothing left to preserve, and counting it
+                                // would send an operator looking for a sandbox
+                                // that no longer exists.
+                                Err(OrchestratorError::SandboxNotFound(_)) => return,
+                                Err(error) => {
+                                    warn!(%sandbox_id, error = %error, "drain could not pause a sandbox");
+                                    failed.fetch_add(1, Ordering::Relaxed);
+                                    return;
+                                }
+                            }
+                        }
+                        SandboxState::Paused => {}
+                        // Someone else's operation owns this sandbox. It will
+                        // be Running or Paused by the next pass, and by then
+                        // whoever owns it has finished rather than been
+                        // interrupted half-way.
+                        _ => return,
+                    }
+                    let Some(mobility) = this.mobility() else {
+                        return;
+                    };
+                    // Already in the repository, so this pass has nothing to
+                    // add. A caller polls until the node is empty, so most
+                    // passes are looking mostly at sandboxes an earlier pass
+                    // published: re-uploading each one's memory image would
+                    // make a poll cost more the longer the node takes to
+                    // converge, against storage the sandboxes still running
+                    // here are using. And the second upload is not even a
+                    // no-op — it commits a new snapshot id over the record, so
+                    // the snapshot the last pass published is left in the
+                    // repository with nothing naming it.
+                    if let Some(snapshot_id) = mobility.committed_snapshot(&sandbox_id).await {
+                        debug!(
+                            %sandbox_id,
+                            %snapshot_id,
+                            "drain skipped a sandbox whose paused state is already published"
+                        );
+                        return;
+                    }
+                    match publisher.publish_paused(sandbox_id).await {
+                        Ok(()) => {
+                            published.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(error) => {
+                            warn!(
+                                %sandbox_id,
+                                error = ?error,
+                                "drain paused a sandbox but could not publish it; it stays on this node"
+                            );
+                            failed.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+
+        if tokio::time::timeout(deadline, pass).await.is_err() {
+            warn!(
+                deadline_ms = deadline.as_millis(),
+                "drain pass hit its deadline; reporting what is left"
+            );
+        }
+
+        // Counted after the pass rather than tracked through it, so a sandbox
+        // another task paused concurrently is not still reported as work.
+        let remaining = self
+            .store
+            .list_filtered(SandboxListFilter {
+                excluded_states: Some(vec![SandboxState::Paused]),
+                ..SandboxListFilter::matches_all()
+            })
+            .await?
+            .len();
+
+        let progress = DrainProgress {
+            remaining,
+            published: published.into_inner(),
+            failed: failed.into_inner(),
+        };
+        info!(
+            remaining = progress.remaining,
+            published = progress.published,
+            failed = progress.failed,
+            "drain pass finished"
+        );
+        Ok(progress)
+    }
+
     /// Pauses a running sandbox by taking a snapshot and stopping its VM.
     ///
     /// If another `pause_sandbox` call is already in progress for the same
@@ -1493,15 +1689,30 @@ where
         // Taking rather than reading: a destination that claims between a
         // check and the resume would leave two nodes running one sandbox.
         if let Some(mobility) = self.mobility() {
-            match mobility.claim_for_local_resume(&sandbox_id).await {
-                ResumeFence::Allowed => {}
-                ResumeFence::ClaimedElsewhere { by_node_id } => {
+            // Timed as its own stage. A claim is a round trip to the scheduler
+            // in a cluster, and a resume that is slow because of it looks
+            // identical, from one timer around the whole call, to a resume
+            // that is slow because the guest took a while to come back.
+            // Refusals are recorded as the stage's error status, which is what
+            // separates "nothing was granted" from "granting took a while".
+            let claim = RESUME_STAGES
+                .time("claim", async {
+                    match mobility.claim_for_local_resume(&sandbox_id).await {
+                        ResumeFence::Allowed => Ok(()),
+                        refused => Err(refused),
+                    }
+                })
+                .await;
+            match claim {
+                Ok(()) => {}
+                Err(ResumeFence::Allowed) => unreachable!("a granted claim is not a refusal"),
+                Err(ResumeFence::ClaimedElsewhere { by_node_id }) => {
                     return Err(OrchestratorError::SandboxHeldElsewhere {
                         sandbox_id,
                         reason: format!("{by_node_id} is taking it over"),
                     });
                 }
-                ResumeFence::Evacuated { to_node_id } => {
+                Err(ResumeFence::Evacuated { to_node_id }) => {
                     return Err(OrchestratorError::SandboxHeldElsewhere {
                         sandbox_id,
                         reason: format!("it now runs on {to_node_id}"),
@@ -1624,16 +1835,19 @@ where
             OrchestratorError::InternalError("missing paused state".to_string())
         })?;
 
-        let resumed = self
-            .launch_sandbox(LaunchPlan::for_resume(
-                sandbox_id,
-                Arc::clone(paused_state),
-                timeout,
-                metadata.resources,
-                metadata
-                    .secure
-                    .then(|| self.access_tokens.generate(metadata.id)),
-            ))
+        let resumed = RESUME_STAGES
+            .time(
+                "launch",
+                self.launch_sandbox(LaunchPlan::for_resume(
+                    sandbox_id,
+                    Arc::clone(paused_state),
+                    timeout,
+                    metadata.resources,
+                    metadata
+                        .secure
+                        .then(|| self.access_tokens.generate(metadata.id)),
+                )),
+            )
             .await;
         // `resume_sandbox` owns the claim from before the first read to after
         // the last, so a failure here needs nothing: every exit is covered
@@ -2305,6 +2519,114 @@ where
         });
     }
 
+    /// Starts the background loop that keeps each sandbox's guest memory sized
+    /// to what it is actually using.
+    ///
+    /// The `enabled` switch is honoured here rather than at the call site so
+    /// that whether the loop runs is decided in the same place as what it
+    /// does when it runs.
+    fn start_memory_control_task(
+        this: Arc<Self>,
+        config: MemoryControlConfig,
+        mut shutdown_rx: watch::Receiver<bool>,
+    ) {
+        if !config.enabled {
+            return;
+        }
+        let Ok(runtime_handle) = tokio::runtime::Handle::try_current() else {
+            warn!("memory control task not started: no Tokio runtime available");
+            return;
+        };
+
+        let interval = Duration::from_secs(config.interval_secs.max(1));
+        let this = Arc::downgrade(&this);
+        runtime_handle.spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            // Built once and reused: the collector's first sample pays a
+            // blocking window to produce a real CPU figure, and a fresh
+            // collector per pass would pay it every pass.
+            let host_metrics = crate::observability::HostMetricsCollector::new();
+            // Per-sandbox history lives with the loop, not in the metadata
+            // store: it is derived, node-local, and meaningless after a
+            // restart, and a periodic writer into the store would contend
+            // with the sandbox state machine for nothing.
+            let mut states: HashMap<SandboxId, MemoryControlState> = HashMap::new();
+            info!(interval = ?interval, "memory control task started");
+
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            debug!("memory control task stopping because orchestrator is shutting down");
+                            break;
+                        }
+                    }
+                    _ = ticker.tick() => {
+                        let Some(this) = this.upgrade() else {
+                            debug!("memory control task stopping because orchestrator was dropped");
+                            break;
+                        };
+
+                        let mut guard =
+                            MetricGuard::stage(MEMORY_CONTROL_PASS_METRIC, "pass");
+                        let outcome = this
+                            .memory_control_pass(&config, &host_metrics, &mut states)
+                            .await;
+                        guard.finish(&outcome);
+                        match outcome {
+                            Ok(report) => debug!(?report, "memory control pass complete"),
+                            Err(err) => warn!("memory control pass failed: {err:#}"),
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    async fn memory_control_pass(
+        &self,
+        config: &MemoryControlConfig,
+        host_metrics: &crate::observability::HostMetricsCollector,
+        states: &mut HashMap<SandboxId, MemoryControlState>,
+    ) -> Result<MemoryControlPassReport> {
+        // `collect` samples CPU with a blocking window on its first call, so it
+        // must not run on a Tokio worker.
+        let host_metrics = host_metrics.clone();
+        let host = tokio::task::spawn_blocking(move || host_metrics.collect())
+            .await
+            .context("collect host metrics for the memory control pass")?;
+        let node_under_pressure = host.memory_total_bytes > 0
+            && host.memory_used_bytes.saturating_mul(100) / host.memory_total_bytes
+                >= u64::from(config.node_memory_high_percent);
+
+        let mut roster = Vec::new();
+        self.store
+            .list_with_callback(|metadata| {
+                roster.push((metadata.id, metadata.state, metadata.resources.memory_mib));
+            })
+            .await?;
+
+        let handles = self.sandboxes.read().await;
+        let sandboxes = roster
+            .into_iter()
+            .filter_map(|(id, state, ceiling_mib)| {
+                handles
+                    .get(&id)
+                    .cloned()
+                    .map(|handle| MemoryControlSandbox {
+                        id,
+                        state,
+                        ceiling_mib,
+                        handle,
+                    })
+            })
+            .collect();
+        drop(handles);
+
+        Ok(run_memory_control_pass(sandboxes, node_under_pressure, config, states).await)
+    }
+
     #[tracing::instrument(skip(self, plan))]
     async fn launch_sandbox(self: &Arc<Self>, plan: LaunchPlan) -> Result<SandboxMetadata> {
         self.ensure_accepting_lifecycle_operations()?;
@@ -2938,3 +3260,11 @@ fn configured_runtime_versions() -> SnapshotRuntimeVersions {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "drain_tests.rs"]
+mod drain_tests;
+
+#[cfg(test)]
+#[path = "resume_stage_tests.rs"]
+mod resume_stage_tests;

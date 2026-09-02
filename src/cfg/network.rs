@@ -16,6 +16,45 @@ pub struct NetworkConfig {
     pub egress: NetworkEgressConfig,
     #[config(nested)]
     pub internal: NetworkInternalConfig,
+    #[config(nested)]
+    pub iptables: NetworkIptablesConfig,
+    #[config(nested)]
+    pub slot: NetworkSlotConfig,
+}
+
+#[derive(Debug, Config, Clone)]
+pub struct NetworkSlotConfig {
+    /// Create the namespace side of the veth pair directly in the sandbox
+    /// namespace, rather than creating both ends in the namespace and moving
+    /// the host end back out.
+    ///
+    /// The move is `dev_change_net_namespace()`, the one operation on the slot
+    /// path documented to hold RTNL across an RCU grace period, and the kernel
+    /// accepts `IFLA_NET_NS_FD` inside the peer's nested attributes precisely
+    /// so it can be skipped. Off by default until the equivalence has been
+    /// asserted on the target kernel: a kernel that ignores the nested
+    /// attribute would put both ends in the wrong namespace and fail every
+    /// create.
+    #[config(default = false)]
+    pub create_veth_peer_in_namespace: bool,
+}
+
+#[derive(Debug, Config, Clone)]
+pub struct NetworkIptablesConfig {
+    /// Seconds `iptables-restore` may block waiting for the xtables lock.
+    ///
+    /// Zero passes no `--wait` at all and leaves the binary's own behavior in
+    /// place, which is the off switch for hosts where the flag misbehaves.
+    #[config(default = 5u64)]
+    pub wait_secs: u64,
+    /// Microseconds between lock retries while waiting.
+    ///
+    /// The binary's own default is one second, which is an eternity next to a
+    /// slot setup that holds the lock for a few milliseconds: a refill batch
+    /// would spend its whole budget sleeping between retries rather than
+    /// contending.
+    #[config(default = 20_000u64)]
+    pub wait_interval_usec: u64,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -128,7 +167,13 @@ impl NetworkConfig {
     }
 }
 
-super::impl_config_default!(NetworkConfig, NetworkEgressConfig, NetworkInternalConfig);
+super::impl_config_default!(
+    NetworkConfig,
+    NetworkEgressConfig,
+    NetworkInternalConfig,
+    NetworkIptablesConfig,
+    NetworkSlotConfig
+);
 
 pub(crate) fn normalize_dns_name(domain: &str) -> Option<String> {
     let domain = domain.to_ascii_lowercase();
@@ -174,6 +219,8 @@ mod tests {
                 host_interaction_cidr: "100.64.0.0/16".to_string(),
                 veth_cidr: "100.65.0.0/16".to_string(),
             },
+            iptables: NetworkIptablesConfig::default(),
+            slot: NetworkSlotConfig::default(),
         };
 
         NetworkConfig::validate(&config)

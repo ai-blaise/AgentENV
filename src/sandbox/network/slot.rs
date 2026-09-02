@@ -1,19 +1,24 @@
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use futures::future::BoxFuture;
 use futures::{stream::TryStreamExt, StreamExt};
 use netlink_packet_route::address::{AddressAttribute, AddressMessage};
 use netlink_packet_route::link::{
     InfoData, InfoKind, InfoVeth, LinkAttribute, LinkFlags, LinkInfo,
 };
 use netlink_packet_route::{AddressFamily, RouteNetlinkMessage};
+use nix::libc;
 use nix::mount::{mount, MsFlags};
 use nix::sched::{unshare, CloneFlags};
 use rtnetlink::packet_core::{
@@ -22,18 +27,138 @@ use rtnetlink::packet_core::{
 use rtnetlink::{new_connection, Handle};
 use tracing::{debug, info, warn};
 
+use crate::observability::prometheus::MetricGuard;
+
 use super::egress_proxy::EgressProxy;
-use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
-use super::policy::{
-    initialize_namespace_egress_chain, set_namespace_egress_policy, SandboxNetworkPolicy,
+use super::iptables_util::{
+    apply_iptables_commands, group_commands_by_table, IptablesRestoreCommand, OpenFailurePolicy,
 };
-use super::{NetworkAddressPlan, NetworkError, HOST_VETH_PREFIX, MAX_SLOTS, NETNS_PREFIX};
+use super::policy::{
+    namespace_egress_chain_commands, set_namespace_egress_policy, SandboxNetworkPolicy,
+};
+use super::{NetworkAddressPlan, NetworkError, HOST_VETH_PREFIX, MAX_SLOTS};
 
 /// Process-wide baseline network namespace fd.
 ///
-/// Captured once from the current calling thread before any `unshare(CLONE_NEWNET)`.
-/// All subsequent slot creations move host-side interfaces back to this namespace.
+/// Captured once from the calling thread. Namespace membership is per-thread
+/// and `/proc/thread-self/ns/net` names the *caller's* namespace, so the
+/// capture has to happen before any thread in the process can `unshare` or
+/// `setns`: a first capture taken on a thread already inside a sandbox
+/// namespace would send every later host-side veth into that sandbox, silently
+/// and for the life of the process. [`capture_host_ns_fd`] does that at
+/// startup; the lazy path below only covers callers that skipped it.
 static HOST_NS_FD: OnceLock<OwnedFd> = OnceLock::new();
+
+/// How many times the startup capture has run.
+///
+/// Whether `HOST_NS_FD` is filled says nothing about who filled it: the lazy
+/// path in [`host_ns_fd`] fills the same cell from whatever thread asks first,
+/// which is precisely the case the startup capture exists to pre-empt. Counted
+/// so that call can be observed on its own.
+static STARTUP_CAPTURES: AtomicUsize = AtomicUsize::new(0);
+
+/// Captures the baseline network namespace, if it is not captured already.
+///
+/// Called from `prepare_runtime` during server startup, on the startup thread,
+/// before the network manager or any slot exists.
+pub(crate) fn capture_host_ns_fd() -> Result<()> {
+    if HOST_NS_FD.get().is_none() {
+        let file = File::open(HOST_NS_PATH)
+            .with_context(|| format!("open the baseline network namespace at {HOST_NS_PATH}"))?;
+        let _ = HOST_NS_FD.set(OwnedFd::from(file));
+    }
+    STARTUP_CAPTURES.fetch_add(1, Ordering::Release);
+    Ok(())
+}
+
+/// How many times [`capture_host_ns_fd`] has run in this process.
+#[cfg(test)]
+pub(super) fn startup_captures() -> usize {
+    STARTUP_CAPTURES.load(Ordering::Acquire)
+}
+
+const HOST_NS_PATH: &str = "/proc/thread-self/ns/net";
+
+/// Latency of one stage of slot setup, so the per-slot cost can be attributed
+/// rather than inferred from the total.
+const SLOT_STAGE_DURATION: &str = "agentenv_network_slot_stage_duration_seconds";
+
+const TUN_DEVICE_PATH: &str = "/dev/net/tun";
+const VPEER_NAME: &str = "vpeer";
+const TAP_NAME: &str = "tap0";
+
+/// `_IOW(kind, number, size)`, the encoding the tun ioctls are declared with.
+const fn iow(kind: u8, number: u8, size: usize) -> libc::c_ulong {
+    const WRITE_DIRECTION: libc::c_ulong = 1 << 30;
+    WRITE_DIRECTION
+        | ((size as libc::c_ulong) << 16)
+        | ((kind as libc::c_ulong) << 8)
+        | number as libc::c_ulong
+}
+
+const TUNSETIFF: libc::c_ulong = iow(b'T', 202, std::mem::size_of::<libc::c_int>());
+const TUNSETPERSIST: libc::c_ulong = iow(b'T', 203, std::mem::size_of::<libc::c_int>());
+
+/// The `ifreq` TUNSETIFF reads.
+///
+/// Written out here, and pinned by a test, because the kernel reads a fixed
+/// 40-byte structure: a layout that disagreed would be read as different flags
+/// rather than rejected.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TunSetIffRequest {
+    name: [libc::c_char; libc::IFNAMSIZ],
+    flags: libc::c_short,
+    padding: [u8; 22],
+}
+
+/// Builds the TUNSETIFF request for a tap device.
+///
+/// `IFF_VNET_HDR` is deliberately absent: iproute2 does not set it either, and
+/// Firecracker sets it itself when it opens the tap by name. Setting it here
+/// would silently change guest offload behavior.
+fn tun_set_iff_request(name: &str) -> Result<TunSetIffRequest> {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() >= libc::IFNAMSIZ {
+        return Err(anyhow!("interface name {name:?} does not fit IFNAMSIZ"));
+    }
+
+    let mut request = TunSetIffRequest {
+        name: [0; libc::IFNAMSIZ],
+        flags: (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short,
+        padding: [0; 22],
+    };
+    for (slot, byte) in request.name.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    Ok(request)
+}
+
+/// Interface index by name, in the caller's network namespace.
+fn interface_index(name: &str) -> Result<u32> {
+    let name = std::ffi::CString::new(name).context("interface name contains a NUL")?;
+    // SAFETY: `name` is a NUL-terminated C string that outlives the call.
+    let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
+    if index == 0 {
+        return Err(std::io::Error::last_os_error()).context("look up the interface index");
+    }
+    Ok(index)
+}
+
+/// Whether the in-process tap path should defer to the shell-out.
+///
+/// Refusal is the expected case: capabilities are per-thread and this thread's
+/// are whatever the caller left it holding. A missing `/dev/net/tun` counts
+/// too — the shell-out is no more likely to succeed, but it is the path this
+/// replaced and it reports the failure the way the node already knows.
+fn is_permission_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+        )
+    })
+}
 
 const ARP_RETRANS_TIME_MS: &str = "100";
 const NEIGH_SYSCTL_RETRIES: usize = 5;
@@ -43,7 +168,11 @@ const NEIGH_SYSCTL_RETRY_DELAY_MS: u64 = 20;
 pub(super) fn host_ns_fd() -> BorrowedFd<'static> {
     HOST_NS_FD
         .get_or_init(|| {
-            let file = File::open("/proc/thread-self/ns/net")
+            warn!(
+                "capturing the baseline network namespace lazily; it should have been \
+                 captured at startup"
+            );
+            let file = File::open(HOST_NS_PATH)
                 .expect("Failed to open host network namespace from /proc/thread-self/ns/net");
             OwnedFd::from(file)
         })
@@ -85,21 +214,30 @@ struct NamespaceSetup {
 /// cloned, so one connection serves the whole process.
 ///
 /// The connection lives on a dedicated thread with its own current-thread
-/// runtime rather than on whichever runtime happened to create it first.
-/// Teardown runs on short-lived scratch runtimes (see `run_async`), and a
-/// connection spawned onto one of those would die with it, taking every
-/// outstanding request on other threads with it.
+/// runtime rather than on whichever runtime happened to create it first: a
+/// connection spawned onto a caller's runtime dies with it, taking every
+/// outstanding request on other threads with it. That thread also runs the
+/// requests themselves, so no caller builds a runtime of its own.
 ///
 /// This deliberately does not cover the in-namespace configuration path: that
 /// runs on a thread that has already `setns`'d into the sandbox's namespace,
 /// and a netlink socket carries the namespace it was opened in. Sharing a host
 /// socket there would silently configure the host.
-static HOST_NETLINK: OnceLock<std::result::Result<Handle, String>> = OnceLock::new();
+static HOST_NETLINK: OnceLock<std::result::Result<HostNetlink, String>> = OnceLock::new();
 
-fn host_netlink_handle() -> Result<Handle> {
+/// Work handed to the shared netlink thread.
+type NetlinkJob = Box<dyn FnOnce(Handle) -> BoxFuture<'static, ()> + Send>;
+
+#[derive(Clone)]
+struct HostNetlink {
+    jobs: tokio::sync::mpsc::UnboundedSender<NetlinkJob>,
+}
+
+fn host_netlink() -> Result<HostNetlink> {
     HOST_NETLINK
         .get_or_init(|| {
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let (job_tx, mut job_rx) = tokio::sync::mpsc::unbounded_channel::<NetlinkJob>();
             thread::Builder::new()
                 .name("agentenv-netlink".to_string())
                 .spawn(move || {
@@ -128,11 +266,16 @@ fn host_netlink_handle() -> Result<Handle> {
                                 return;
                             }
                         };
-                        if ready_tx.send(Ok(handle)).is_err() {
+                        tokio::spawn(connection);
+                        if ready_tx.send(Ok(HostNetlink { jobs: job_tx })).is_err() {
                             return;
                         }
-                        // Owns the connection for the life of the process.
-                        connection.await;
+                        // Owns the connection and the work queue for the life
+                        // of the process. Each job is spawned rather than
+                        // awaited so a refill batch's slots overlap.
+                        while let Some(job) = job_rx.recv().await {
+                            tokio::spawn(job(handle.clone()));
+                        }
                     });
                 })
                 .map_err(|error| format!("spawn the netlink connection thread: {error}"))?;
@@ -145,6 +288,37 @@ fn host_netlink_handle() -> Result<Handle> {
         .map_err(|error| anyhow!("{error}"))
 }
 
+/// Runs one host-netlink operation on the shared connection thread.
+///
+/// Jobs must not block: one current-thread runtime drives every request, so a
+/// job that parks its thread parks the whole connection.
+///
+/// Each host-side operation used to build a current-thread runtime on a freshly
+/// spawned thread just to block on one request — twice per slot lifetime, on
+/// top of the socket each of them opened. The work now travels to the thread
+/// that already owns a runtime and a connection; the caller blocks on the
+/// answer exactly as it blocked on the thread join before.
+fn run_on_host_netlink<F, T>(job: F) -> Result<T>
+where
+    F: FnOnce(Handle) -> BoxFuture<'static, Result<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    let netlink = host_netlink()?;
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+    netlink
+        .jobs
+        .send(Box::new(move |handle| {
+            Box::pin(async move {
+                let _ = result_tx.send(job(handle).await);
+            })
+        }))
+        .map_err(|_| anyhow!("the shared netlink worker is gone"))?;
+
+    result_rx
+        .recv()
+        .map_err(|_| anyhow!("the shared netlink worker dropped the request"))?
+}
+
 /// Whether the kernel accepts an on-link /32 route added over netlink.
 ///
 /// Adding a route whose gateway sits on a /31 point-to-point link used to fail
@@ -153,6 +327,21 @@ fn host_netlink_handle() -> Result<Handle> {
 /// that may not apply, the first attempt goes over netlink and the answer is
 /// remembered: a kernel that refuses it refuses it every time.
 static NETLINK_ROUTE_ADD_WORKS: OnceLock<bool> = OnceLock::new();
+
+/// Whether the host-side netlink job left an `ip route` call for its caller.
+///
+/// The shell-out cannot run inside the job. `run_with_scoped_capabilities`
+/// spawns a thread and joins it, and the netlink worker's current-thread
+/// runtime also drives the connection, so a job that parks there parks every
+/// other slot's in-flight request with it.
+#[derive(Debug, PartialEq, Eq)]
+enum HostRouteFallback {
+    /// The route is installed; the caller has nothing left to do.
+    Installed,
+    /// The kernel refused the on-link /32 over netlink. The caller adds it with
+    /// `ip route`, on its own thread.
+    ShellOut,
+}
 
 impl Slot {
     fn host_veth_name(idx: u32) -> String {
@@ -173,7 +362,11 @@ impl Slot {
             });
         }
 
-        let namespace_id = format!("{}{}", NETNS_PREFIX, uuid::Uuid::now_v7());
+        // Named for this node and this slot rather than for a fresh UUID: it
+        // is what lets startup tell its own leftovers from a second AgentENV
+        // process's live namespaces, and what ties a leftover `veth-N` back to
+        // the namespace it belonged to.
+        let namespace_id = super::namespace_file_name(idx);
         let (host_interaction_ip, veth_host_ip, veth_vm_ip) = address_plan
             .slot_ips(idx)
             .map_err(NetworkError::NamespaceError)?;
@@ -225,9 +418,8 @@ impl Slot {
         let veth_vm_ip = setup.veth_vm_ip;
         let host_interaction_ip = setup.host_interaction_ip;
 
-        // Get the global host NS FD to move the interface back later.
-        // This uses /proc/1/ns/net to ensure we always get the true host namespace,
-        // even when called from threads that may have modified their namespaces.
+        // The baseline namespace this slot's host-side veth is moved back to.
+        // Captured at startup from the startup thread; see `HOST_NS_FD`.
         let host_ns_fd = host_ns_fd();
 
         // Spawn a thread to perform namespace operations safely.
@@ -241,23 +433,28 @@ impl Slot {
             ))),
         }?;
 
-        // Configure the Host side now.
-        Self::run_async(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("Failed to build tokio runtime")?;
-            rt.block_on(Self::configure_host_interface_async(
+        // Configure the Host side now, on the shared netlink connection.
+        let mut host_stage = MetricGuard::stage(SLOT_STAGE_DURATION, "host_configure");
+        let host_result = run_on_host_netlink(move |handle| {
+            Box::pin(Self::configure_host_interface_async(
+                handle,
                 idx,
                 veth_host_ip,
                 veth_vm_ip,
                 host_interaction_ip,
             ))
-        })
-        .map_err(NetworkError::NamespaceError)?;
+        });
+        host_stage.finish(&host_result);
+        let fallback = host_result.map_err(NetworkError::NamespaceError)?;
+
+        let veth_name = Self::host_veth_name(idx);
+        // Deliberately outside the netlink job: see [`HostRouteFallback`].
+        if fallback == HostRouteFallback::ShellOut {
+            Self::add_host_interaction_route_via_ip(&veth_name, host_interaction_ip, veth_vm_ip)
+                .map_err(NetworkError::NamespaceError)?;
+        }
 
         // Reduce ARP retransmit delay on host-side veth to avoid resume tail latency (issue #272).
-        let veth_name = Self::host_veth_name(idx);
         Self::tune_neigh_retrans_time_ms(&veth_name);
 
         Ok(())
@@ -301,18 +498,21 @@ impl Slot {
             File::create(&netns_path).context("Failed to create netns file")?;
         }
 
-        // Unshare logic
-        unshare(CloneFlags::CLONE_NEWNET).context("Failed to unshare(CLONE_NEWNET)")?;
-
-        // Bind mount the new namespace to make it persistent/named
-        mount(
-            Some("/proc/thread-self/ns/net"),
-            &netns_path,
-            None::<&str>,
-            MsFlags::MS_BIND,
-            None::<&str>,
-        )
-        .context("Failed to bind mount new namespace")?;
+        let mut netns_stage = MetricGuard::stage(SLOT_STAGE_DURATION, "netns_create");
+        let netns_result = (|| -> Result<()> {
+            unshare(CloneFlags::CLONE_NEWNET).context("Failed to unshare(CLONE_NEWNET)")?;
+            // Bind mount the new namespace to make it persistent/named
+            mount(
+                Some("/proc/thread-self/ns/net"),
+                &netns_path,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .context("Failed to bind mount new namespace")
+        })();
+        netns_stage.finish(&netns_result);
+        netns_result?;
 
         // Configure interfaces inside the namespace via netlink
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -322,14 +522,17 @@ impl Slot {
         let tap_ip = address_plan.tap_ip();
         let vm_link_prefix = address_plan.vm_link_prefix();
 
-        rt.block_on(Self::configure_namespace_interfaces(
+        let mut configure_stage = MetricGuard::stage(SLOT_STAGE_DURATION, "ns_configure");
+        let configure_result = rt.block_on(Self::configure_namespace_interfaces(
             idx,
             veth_vm_ip,
             veth_host_ip,
             tap_ip,
             vm_link_prefix,
             host_ns_fd,
-        ))?;
+        ));
+        configure_stage.finish(&configure_result);
+        configure_result?;
 
         // Enable IP forwarding inside this namespace so packets received on tap0
         // (from the VM) can be forwarded to vpeer (towards the host/internet).
@@ -341,12 +544,15 @@ impl Slot {
         Self::tune_neigh_retrans_time_ms("vpeer");
 
         // IPTables Setup
-        Self::configure_namespace_iptables_rules(
+        let mut iptables_stage = MetricGuard::stage(SLOT_STAGE_DURATION, "iptables_apply");
+        let iptables_result = Self::configure_namespace_iptables_rules(
             host_interaction_ip,
             veth_vm_ip,
             address_plan.vm_ip(),
             &address_plan.internal_egress_denied_cidrs(),
-        )
+        );
+        iptables_stage.finish(&iptables_result);
+        iptables_result
     }
 
     /// Configures all network interfaces inside the namespace:
@@ -372,59 +578,48 @@ impl Slot {
 
         // Create Veth Pair (veth-{idx} and vpeer)
         let veth_name = Self::host_veth_name(idx);
-        let vpeer_name = "vpeer";
+        let vpeer_name = VPEER_NAME;
 
-        // Create veth pair using netlink
-        let mut veth_msg = netlink_packet_route::link::LinkMessage::default();
-        veth_msg
-            .attributes
-            .push(LinkAttribute::IfName(veth_name.clone()));
+        let mut veth_stage = MetricGuard::stage(SLOT_STAGE_DURATION, "veth_create");
+        let veth_result = Self::create_veth_pair(&handle, &veth_name).await;
+        veth_stage.finish(&veth_result);
+        veth_result?;
 
-        let mut peer_msg = netlink_packet_route::link::LinkMessage::default();
-        peer_msg
-            .attributes
-            .push(LinkAttribute::IfName(vpeer_name.into()));
+        // One dump for both remaining names. A fresh namespace holds four
+        // devices, so a dump costs less than the name lookups this replaced —
+        // and where the host end still has to be moved out, it has to happen
+        // while that end is still here.
+        let indices = link_indices(&handle, &[&veth_name, "lo", vpeer_name]).await?;
 
-        let info = LinkAttribute::LinkInfo(vec![
-            LinkInfo::Kind(InfoKind::Veth),
-            LinkInfo::Data(InfoData::Veth(InfoVeth::Peer(peer_msg))),
-        ]);
-        veth_msg.attributes.push(info);
-
-        handle
-            .link()
-            .add(veth_msg)
-            .execute()
-            .await
-            .context("Failed to create veth pair")?;
-
-        // Move veth (host end) back to Host NS
-        let mut links = handle.link().get().match_name(veth_name.clone()).execute();
-        if let Some(link) = links.try_next().await? {
+        if let Some(veth_index) = indices.get(veth_name.as_str()).copied() {
+            // The host end was created in this namespace and has to be moved
+            // back out. This is `dev_change_net_namespace()`, which holds RTNL
+            // across `synchronize_net()`; the peer-in-namespace path above
+            // exists to skip it.
             let mut msg = netlink_packet_route::link::LinkMessage::default();
-            msg.header.index = link.header.index;
+            msg.header.index = veth_index;
             msg.attributes
                 .push(LinkAttribute::NetNsFd(host_ns_fd.as_raw_fd()));
-
+            count_netlink_op("RTM_SETLINK");
             handle
                 .link()
                 .set(msg)
                 .execute()
                 .await
                 .context("Failed to move veth to host ns")?;
-        } else {
+        } else if !create_veth_peer_in_namespace() {
             return Err(anyhow!("Created veth interface not found"));
         }
 
         // Configure IPs inside NS
         // Loopback UP
-        let mut lo_links = handle.link().get().match_name("lo".to_string()).execute();
-        if let Some(lo) = lo_links.try_next().await? {
+        if let Some(lo_index) = indices.get("lo").copied() {
             let mut msg = netlink_packet_route::link::LinkMessage::default();
-            msg.header.index = lo.header.index;
+            msg.header.index = lo_index;
             msg.header.flags.insert(LinkFlags::Up);
             msg.header.change_mask.insert(LinkFlags::Up);
 
+            count_netlink_op("RTM_SETLINK");
             handle
                 .link()
                 .set(msg)
@@ -435,23 +630,18 @@ impl Slot {
 
         // Vpeer setup
         // For /31 point-to-point links (RFC 3021), we should NOT set a broadcast address.
-        let vpeer_name_str = "vpeer";
-        let mut vpeer_links = handle
-            .link()
-            .get()
-            .match_name(vpeer_name_str.to_string())
-            .execute();
-        if let Some(vpeer) = vpeer_links.try_next().await? {
+        if let Some(vpeer_index) = indices.get(vpeer_name).copied() {
             // Add IP without broadcast (RFC 3021 for /31)
-            Self::add_address_no_broadcast(&handle, vpeer.header.index, veth_vm_ip, 31)
+            Self::add_address_no_broadcast(&handle, vpeer_index, veth_vm_ip, 31)
                 .await
                 .context("Failed to add address to vpeer")?;
 
             // Set vpeer UP
             let mut link_msg = netlink_packet_route::link::LinkMessage::default();
-            link_msg.header.index = vpeer.header.index;
+            link_msg.header.index = vpeer_index;
             link_msg.header.flags.insert(LinkFlags::Up);
             link_msg.header.change_mask.insert(LinkFlags::Up);
+            count_netlink_op("RTM_SETLINK");
             handle
                 .link()
                 .set(link_msg)
@@ -460,47 +650,37 @@ impl Slot {
                 .context("Failed to set vpeer up")?;
         }
 
-        // Create tap0 interface (Tun/Tap)
-        let status = crate::privileges::run_with_scoped_capabilities(
-            &[crate::privileges::CAP_NET_ADMIN],
-            || {
-                Command::new("ip")
-                    .args(["tuntap", "add", "tap0", "mode", "tap"])
-                    .status()
-                    .context("Failed to execute ip tuntap")
-            },
-        )?;
-        if !status.success() {
-            return Err(anyhow!("ip tuntap add failed"));
-        }
+        // Create tap0, in process. The ioctl answers with nothing, but the
+        // device is addressable by name immediately, so its index comes from
+        // `if_nametoindex` rather than the RTM_GETLINK this used to need.
+        let tap_index = Self::create_tap_interface(TAP_NAME)?;
 
-        // Enable tap0 and add strict IP via Netlink
-        let mut tap_links = handle.link().get().match_name("tap0".to_string()).execute();
-        if let Some(tap) = tap_links.try_next().await? {
-            handle
-                .address()
-                .add(tap.header.index, IpAddr::V4(tap_ip), vm_link_prefix)
-                .execute()
-                .await
-                .context("Failed to add address to tap0")?;
+        count_netlink_op("RTM_NEWADDR");
+        handle
+            .address()
+            .add(tap_index, IpAddr::V4(tap_ip), vm_link_prefix)
+            .execute()
+            .await
+            .context("Failed to add address to tap0")?;
 
-            let mut link_msg = netlink_packet_route::link::LinkMessage::default();
-            link_msg.header.index = tap.header.index;
-            link_msg.header.flags.insert(LinkFlags::Up);
-            link_msg.header.change_mask.insert(LinkFlags::Up);
-            handle
-                .link()
-                .set(link_msg)
-                .execute()
-                .await
-                .context("Failed to set tap0 up")?;
-        }
+        let mut link_msg = netlink_packet_route::link::LinkMessage::default();
+        link_msg.header.index = tap_index;
+        link_msg.header.flags.insert(LinkFlags::Up);
+        link_msg.header.change_mask.insert(LinkFlags::Up);
+        count_netlink_op("RTM_SETLINK");
+        handle
+            .link()
+            .set(link_msg)
+            .execute()
+            .await
+            .context("Failed to set tap0 up")?;
 
         // Add default route via veth_host_ip (the host side of the veth pair)
         // Using rtnetlink's RouteMessageBuilder API
         let route_msg = rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new()
             .gateway(veth_host_ip)
             .build();
+        count_netlink_op("RTM_NEWROUTE");
         handle
             .route()
             .add(route_msg)
@@ -600,6 +780,11 @@ impl Slot {
     /// - Enabling IP forwarding so the namespace can route between tap0 and vpeer.
     /// - FORWARD rules to permit traffic between the VM (tap0) and the host veth (vpeer).
     /// - SNAT/DNAT for host<->VM communication via host_interaction_ip.
+    ///
+    /// The egress chains go in the same invocation. They used to be a second
+    /// `iptables-restore` immediately after this one, which cost a second fork
+    /// and a second xtables-lock acquisition per slot for rules that end up in
+    /// the same two tables of the same namespace.
     #[tracing::instrument(fields(vm_ip = %vm_ip, host_interaction_ip = %host_interaction_ip))]
     fn configure_namespace_iptables_rules(
         host_interaction_ip: Ipv4Addr,
@@ -607,7 +792,36 @@ impl Slot {
         vm_ip: Ipv4Addr,
         internal_egress_denied_cidrs: &[String],
     ) -> Result<()> {
-        let commands = [
+        let commands = Self::namespace_iptables_commands(
+            host_interaction_ip,
+            veth_vm_ip,
+            vm_ip,
+            internal_egress_denied_cidrs,
+        );
+        apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)
+            .context("apply AgentENV namespace iptables rules")
+    }
+
+    fn namespace_iptables_commands(
+        host_interaction_ip: Ipv4Addr,
+        veth_vm_ip: Ipv4Addr,
+        vm_ip: Ipv4Addr,
+        internal_egress_denied_cidrs: &[String],
+    ) -> Vec<IptablesRestoreCommand> {
+        let mut commands = Self::namespace_routing_commands(host_interaction_ip, veth_vm_ip, vm_ip);
+        commands.extend(namespace_egress_chain_commands(
+            resolve_guest_dns_server(),
+            internal_egress_denied_cidrs,
+        ));
+        group_commands_by_table(commands)
+    }
+
+    fn namespace_routing_commands(
+        host_interaction_ip: Ipv4Addr,
+        veth_vm_ip: Ipv4Addr,
+        vm_ip: Ipv4Addr,
+    ) -> Vec<IptablesRestoreCommand> {
+        vec![
             // FORWARD: Allow traffic from VM (tap0) to host/internet (vpeer).
             IptablesRestoreCommand::Append {
                 table: "filter",
@@ -643,10 +857,124 @@ impl Slot {
                 chain: "PREROUTING",
                 rule: format!("-i vpeer -d {} -j DNAT --to {}", host_interaction_ip, vm_ip),
             },
-        ];
+        ]
+    }
 
-        apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)?;
-        initialize_namespace_egress_chain(resolve_guest_dns_server(), internal_egress_denied_cidrs)
+    /// Creates the veth pair for this slot.
+    ///
+    /// Two shapes, selected by config. The default creates both ends inside the
+    /// namespace and lets the caller move the host end back out. The other
+    /// hands the namespace's fd to the host connection and has the kernel
+    /// register the peer directly in it, which removes the move — the one
+    /// operation on this path documented to hold RTNL across an RCU grace
+    /// period.
+    async fn create_veth_pair(handle: &Handle, veth_name: &str) -> Result<()> {
+        if create_veth_peer_in_namespace() {
+            let veth_name = veth_name.to_string();
+            // This thread is inside the sandbox namespace, so this is its fd.
+            // Held open across the request: the host connection resolves it in
+            // this process's descriptor table.
+            let netns = File::open(HOST_NS_PATH)
+                .context("open the sandbox network namespace for the veth peer")?;
+            let netns_fd = netns.as_raw_fd();
+            // Issued from the host connection: the pair's host end must land in
+            // the host namespace, and a netlink socket writes to the namespace
+            // it was opened in.
+            let created = run_on_host_netlink(move |host_handle| {
+                Box::pin(async move {
+                    let message = veth_create_message(&veth_name, Some(netns_fd));
+                    count_netlink_op("RTM_NEWLINK");
+                    host_handle
+                        .link()
+                        .add(message)
+                        .execute()
+                        .await
+                        .context("Failed to create veth pair with the peer in the namespace")
+                })
+            });
+            drop(netns);
+            return created;
+        }
+
+        let message = veth_create_message(veth_name, None);
+        count_netlink_op("RTM_NEWLINK");
+        handle
+            .link()
+            .add(message)
+            .execute()
+            .await
+            .context("Failed to create veth pair")
+    }
+
+    /// Creates the guest-facing tap device and returns its interface index.
+    ///
+    /// The `tun` driver registers no netlink `newlink` operation, so a tap
+    /// device cannot be created over rtnetlink at all — `ip tuntap` opens
+    /// /dev/net/tun and issues TUNSETIFF, and so does this. Doing it here
+    /// removes a fork, a capability-scoped thread, and the RTM_GETLINK that had
+    /// to find the device afterwards.
+    fn create_tap_interface(name: &str) -> Result<u32> {
+        match Self::create_tap_via_ioctl(name) {
+            Ok(index) => Ok(index),
+            // Asked of the kernel rather than of `/proc/self/status`: that
+            // file describes the thread-group leader, and these capabilities
+            // are per-thread. The shell-out acquires CAP_NET_ADMIN on a thread
+            // of its own, so it can still succeed where this failed.
+            Err(error) if is_permission_error(&error) => {
+                warn!(
+                    error = %error,
+                    "TUNSETIFF refused; falling back to the `ip tuntap` shell-out"
+                );
+                Self::create_tap_via_ip(name)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn create_tap_via_ioctl(name: &str) -> Result<u32> {
+        let request = tun_set_iff_request(name)?;
+        let tun = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(TUN_DEVICE_PATH)
+            .with_context(|| format!("open {TUN_DEVICE_PATH}"))?;
+
+        // SAFETY: TUNSETIFF reads one `ifreq` through the pointer, `request`
+        // is exactly that layout (pinned by `tun_set_iff_request_matches_the_kernel_ifreq`),
+        // and the fd is open for the duration of the call.
+        let created = unsafe { libc::ioctl(tun.as_raw_fd(), TUNSETIFF, &request as *const _) };
+        if created < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("TUNSETIFF for {name}"));
+        }
+
+        // Without this the device disappears when `tun` is dropped at the end
+        // of this function; `ip tuntap add` sets it for the same reason.
+        // SAFETY: TUNSETPERSIST takes an int by value on an open tun fd.
+        let persisted = unsafe { libc::ioctl(tun.as_raw_fd(), TUNSETPERSIST, 1 as libc::c_int) };
+        if persisted < 0 {
+            return Err(std::io::Error::last_os_error())
+                .with_context(|| format!("TUNSETPERSIST for {name}"));
+        }
+
+        interface_index(name)
+    }
+
+    fn create_tap_via_ip(name: &str) -> Result<u32> {
+        let status = crate::privileges::run_with_scoped_capabilities(
+            &[crate::privileges::CAP_NET_ADMIN],
+            || {
+                Command::new("ip")
+                    .args(["tuntap", "add", name, "mode", "tap"])
+                    .status()
+                    .context("Failed to execute ip tuntap")
+            },
+        )?;
+        if !status.success() {
+            return Err(anyhow!("ip tuntap add failed"));
+        }
+        interface_index(name)
     }
 
     fn tune_neigh_retrans_time_ms(interface: &str) {
@@ -683,27 +1011,6 @@ impl Slot {
         }
     }
 
-    /// Helper to run async code, handling the case where we might already be in a tokio runtime.
-    fn run_async<F, T>(f: F) -> Result<T>
-    where
-        F: FnOnce() -> Result<T> + Send + 'static,
-        T: Send + 'static,
-    {
-        let has_current_runtime =
-            std::panic::catch_unwind(|| tokio::runtime::Handle::try_current().is_ok())
-                .unwrap_or(false);
-
-        if has_current_runtime {
-            // We're inside a runtime, spawn a blocking thread to avoid nested runtime
-            std::thread::spawn(f)
-                .join()
-                .map_err(|e| anyhow!("Thread panicked: {:?}", e))?
-        } else {
-            // Not inside a runtime, we can run directly
-            f()
-        }
-    }
-
     #[tracing::instrument(
         fields(
             slot = idx,
@@ -714,16 +1021,16 @@ impl Slot {
         )
     )]
     async fn configure_host_interface_async(
+        handle: Handle,
         idx: u32,
         veth_host_ip: Ipv4Addr,
         veth_vm_ip: Ipv4Addr,
         host_interaction_ip: Ipv4Addr,
-    ) -> Result<()> {
-        let handle = host_netlink_handle().context("Netlink connect host")?;
-
+    ) -> Result<HostRouteFallback> {
         let veth_name = Self::host_veth_name(idx);
 
         // Wait/Check for interface
+        count_netlink_op("RTM_GETLINK");
         let mut links = handle.link().get().match_name(veth_name.clone()).execute();
         if let Some(link) = links.try_next().await? {
             // Add only the veth link IP, not the host_interaction_ip.
@@ -739,6 +1046,7 @@ impl Slot {
             link_msg.header.index = link.header.index;
             link_msg.header.flags.insert(LinkFlags::Up);
             link_msg.header.change_mask.insert(LinkFlags::Up);
+            count_netlink_op("RTM_SETLINK");
             handle
                 .link()
                 .set(link_msg)
@@ -751,47 +1059,63 @@ impl Slot {
             // VM's internal address.
             Self::add_host_interaction_route(
                 &handle,
+                &NETLINK_ROUTE_ADD_WORKS,
                 link.header.index,
                 &veth_name,
                 host_interaction_ip,
                 veth_vm_ip,
             )
-            .await?;
+            .await
         } else {
-            return Err(anyhow!(
+            Err(anyhow!(
                 "Host veth interface {} not found after move",
                 veth_name
-            ));
+            ))
         }
-        Ok(())
     }
 
     /// Adds the host-to-namespace route, over netlink when the kernel allows it.
     ///
     /// The gateway sits on a /31 point-to-point link, which some kernel
     /// configurations reject over netlink. The first slot finds out; every slot
-    /// after it takes the answer from [`NETLINK_ROUTE_ADD_WORKS`] rather than
-    /// re-probing, so a working kernel never forks and a rejecting one forks
-    /// exactly as often as it did before.
+    /// after it takes the answer from `netlink_works` rather than re-probing,
+    /// so a working kernel never forks and a rejecting one forks exactly as
+    /// often as it did before.
+    ///
+    /// Runs on the shared netlink worker, so it never forks itself: a refusing
+    /// kernel is reported back as [`HostRouteFallback::ShellOut`] and the
+    /// caller runs `ip route` on its own thread.
+    ///
+    /// `netlink_works` is passed rather than read from
+    /// [`NETLINK_ROUTE_ADD_WORKS`] so a test can drive the refusing-kernel
+    /// branch without latching that answer for the whole process.
     async fn add_host_interaction_route(
         handle: &Handle,
+        netlink_works: &OnceLock<bool>,
         link_index: u32,
         veth_name: &str,
         host_interaction_ip: Ipv4Addr,
         veth_vm_ip: Ipv4Addr,
-    ) -> Result<()> {
-        if NETLINK_ROUTE_ADD_WORKS.get() != Some(&false) {
+    ) -> Result<HostRouteFallback> {
+        if netlink_works.get() != Some(&false) {
+            count_netlink_op("RTM_NEWROUTE");
             let route = rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
                 .destination_prefix(host_interaction_ip, 32)
                 .gateway(veth_vm_ip)
                 .output_interface(link_index)
+                // iproute2 stamps RTPROT_BOOT on a route added from the command
+                // line; the builder defaults to RTPROT_STATIC. The tag is what
+                // route-flushing tools filter on, so the two paths have to
+                // agree — `the_netlink_route_and_the_ip_route_are_the_same_route`
+                // caught them disagreeing.
+                .protocol(netlink_packet_route::route::RouteProtocol::Boot)
                 .build();
             match handle.route().add(route).execute().await {
                 Ok(()) => {
-                    let _ = NETLINK_ROUTE_ADD_WORKS.set(true);
-                    return Ok(());
+                    let _ = netlink_works.set(true);
+                    return Ok(HostRouteFallback::Installed);
                 }
-                Err(error) if NETLINK_ROUTE_ADD_WORKS.get() == Some(&true) => {
+                Err(error) if netlink_works.get() == Some(&true) => {
                     // Netlink has worked on this kernel before, so this is a
                     // real failure for this route rather than a capability gap.
                     return Err(anyhow!(
@@ -800,7 +1124,7 @@ impl Slot {
                     ));
                 }
                 Err(error) => {
-                    let _ = NETLINK_ROUTE_ADD_WORKS.set(false);
+                    let _ = netlink_works.set(false);
                     warn!(
                         error = %error,
                         "kernel rejected an on-link /32 route over netlink; \
@@ -810,7 +1134,7 @@ impl Slot {
             }
         }
 
-        Self::add_host_interaction_route_via_ip(veth_name, host_interaction_ip, veth_vm_ip)
+        Ok(HostRouteFallback::ShellOut)
     }
 
     fn add_host_interaction_route_via_ip(
@@ -850,16 +1174,16 @@ impl Slot {
 
     /// Async helper to delete veth interface.
     /// Idempotent: succeeds even if the interface doesn't exist.
-    async fn delete_veth_interface_async(idx: u32) -> Result<()> {
-        let handle = host_netlink_handle()?;
-
+    async fn delete_veth_interface_async(handle: Handle, idx: u32) -> Result<()> {
         let veth_name = Self::host_veth_name(idx);
+        count_netlink_op("RTM_GETLINK");
         let mut links = handle.link().get().match_name(veth_name.clone()).execute();
 
         // try_next returns Err if interface doesn't exist (ENODEV), treat as success
         match links.try_next().await {
             Ok(Some(link)) => {
                 // Interface exists, try to delete; ignore "not found" race
+                count_netlink_op("RTM_DELLINK");
                 if let Err(e) = handle.link().del(link.header.index).execute().await {
                     let msg = e.to_string();
                     if !msg.contains("No such device") && !msg.contains("ENODEV") {
@@ -878,18 +1202,11 @@ impl Slot {
         Ok(())
     }
 
-    /// Deletes host veth using Tokio-assisted netlink cleanup.
+    /// Deletes the host veth over the shared netlink connection.
     ///
-    /// This is the regular (non-shutdown) cleanup path and preserves the
-    /// previous runtime behavior used by normal slot release.
-    fn delete_host_veth_interface_with_tokio(idx: u32) -> Result<()> {
-        Self::run_async(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| anyhow!("Failed to build runtime: {}", e))?;
-            rt.block_on(Self::delete_veth_interface_async(idx))
-        })
+    /// This is the regular (non-shutdown) cleanup path.
+    fn delete_host_veth_interface_over_netlink(idx: u32) -> Result<()> {
+        run_on_host_netlink(move |handle| Box::pin(Self::delete_veth_interface_async(handle, idx)))
     }
 
     /// Deletes host veth using `ip link del`.
@@ -928,24 +1245,24 @@ impl Slot {
         ))
     }
 
-    /// Tries Tokio-assisted veth cleanup first and falls back to synchronous
-    /// cleanup on either regular error or panic.
+    /// Tries netlink veth cleanup first and falls back to the `ip link del`
+    /// shell-out on either regular error or panic.
     #[tracing::instrument(fields(slot = idx, host_veth = %Self::host_veth_name(idx)))]
     fn delete_host_veth_interface(idx: u32) -> Result<()> {
-        match std::panic::catch_unwind(|| Self::delete_host_veth_interface_with_tokio(idx)) {
+        match std::panic::catch_unwind(|| Self::delete_host_veth_interface_over_netlink(idx)) {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => {
                 info!(
                     slot = idx,
                     error = %err,
-                    "tokio-assisted slot cleanup failed; falling back to sync cleanup"
+                    "netlink slot cleanup failed; falling back to sync cleanup"
                 );
                 Self::delete_host_veth_interface_sync(idx)
             }
             Err(_) => {
                 info!(
                     slot = idx,
-                    "tokio-assisted slot cleanup panicked; falling back to sync cleanup"
+                    "netlink slot cleanup panicked; falling back to sync cleanup"
                 );
                 Self::delete_host_veth_interface_sync(idx)
             }
@@ -1045,6 +1362,7 @@ impl Slot {
         msg.attributes
             .push(AddressAttribute::Local(IpAddr::V4(addr)));
 
+        count_netlink_op("RTM_NEWADDR");
         let mut req = NetlinkMessage::from(RouteNetlinkMessage::NewAddress(msg));
         req.header.flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_EXCL;
 
@@ -1056,6 +1374,154 @@ impl Slot {
         }
         Ok(())
     }
+}
+
+/// The fields that decide whether two routes are the same route.
+///
+/// The netlink path and the `ip route` path have to produce identical kernel
+/// state, and "the command exited zero" does not say that: the defect this
+/// guards against is a builder that omits `RTA_OIF`, leaving the kernel to
+/// resolve the gateway by lookup instead of being told the egress device — on
+/// a freshly brought-up /31 exactly the fragile case.
+#[cfg(test)]
+use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
+
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RouteIdentity {
+    destination: Option<IpAddr>,
+    destination_prefix_length: u8,
+    gateway: Option<IpAddr>,
+    output_interface: Option<u32>,
+    table: u8,
+    protocol: u8,
+    scope: u8,
+    kind: u8,
+}
+
+#[cfg(test)]
+fn route_identity(route: &RouteMessage) -> RouteIdentity {
+    let mut identity = RouteIdentity {
+        destination: None,
+        destination_prefix_length: route.header.destination_prefix_length,
+        gateway: None,
+        output_interface: None,
+        table: route.header.table,
+        protocol: route.header.protocol.into(),
+        scope: route.header.scope.into(),
+        kind: route.header.kind.into(),
+    };
+
+    for attribute in &route.attributes {
+        match attribute {
+            RouteAttribute::Destination(RouteAddress::Inet(address)) => {
+                identity.destination = Some(IpAddr::V4(*address));
+            }
+            RouteAttribute::Gateway(RouteAddress::Inet(address)) => {
+                identity.gateway = Some(IpAddr::V4(*address));
+            }
+            RouteAttribute::Oif(index) => identity.output_interface = Some(*index),
+            RouteAttribute::Table(table) => {
+                // RTA_TABLE carries the table when it does not fit the header
+                // byte; when both are present they agree.
+                identity.table = (*table).min(u8::MAX as u32) as u8;
+            }
+            _ => {}
+        }
+    }
+
+    identity
+}
+
+/// Dumps the IPv4 main-table routes as identities, for equivalence checks.
+#[cfg(test)]
+async fn route_identities(handle: &Handle) -> Result<Vec<RouteIdentity>> {
+    let mut routes = handle
+        .route()
+        .get(rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new().build())
+        .execute();
+    let mut identities = Vec::new();
+    while let Some(route) = routes.try_next().await? {
+        identities.push(route_identity(&route));
+    }
+    Ok(identities)
+}
+
+/// Builds the `RTM_NEWLINK` message for a veth pair.
+///
+/// `peer_netns_fd` puts `IFLA_NET_NS_FD` inside the peer's nested attribute
+/// block, which is where `veth_newlink` reads it: the kernel resolves the
+/// peer's namespace from that block and registers it there directly. Absent,
+/// both ends are created wherever the message is sent and the caller has to
+/// move one of them.
+fn veth_create_message(
+    veth_name: &str,
+    peer_netns_fd: Option<std::os::fd::RawFd>,
+) -> netlink_packet_route::link::LinkMessage {
+    let mut veth_msg = netlink_packet_route::link::LinkMessage::default();
+    veth_msg
+        .attributes
+        .push(LinkAttribute::IfName(veth_name.to_string()));
+
+    let mut peer_msg = netlink_packet_route::link::LinkMessage::default();
+    peer_msg
+        .attributes
+        .push(LinkAttribute::IfName(VPEER_NAME.to_string()));
+    if let Some(fd) = peer_netns_fd {
+        peer_msg.attributes.push(LinkAttribute::NetNsFd(fd));
+    }
+
+    veth_msg.attributes.push(LinkAttribute::LinkInfo(vec![
+        LinkInfo::Kind(InfoKind::Veth),
+        LinkInfo::Data(InfoData::Veth(InfoVeth::Peer(peer_msg))),
+    ]));
+    veth_msg
+}
+
+/// Whether to register the veth peer directly in the sandbox namespace.
+fn create_veth_peer_in_namespace() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::cfg::ConfigManager::global_config()
+            .network
+            .slot
+            .create_veth_peer_in_namespace
+    })
+}
+
+/// Counts one netlink operation.
+///
+/// The label set is the fixed list of message types this module sends, so it
+/// stays bounded. This is the measurement the per-slot netlink inventory is
+/// read from: an op-count delta per slot is asserted directly rather than
+/// inferred from latency.
+fn count_netlink_op(op: &'static str) {
+    metrics::counter!("agentenv_network_slot_netlink_ops_total", "op" => op).increment(1);
+}
+
+/// Interface indices for `wanted`, from a single RTM_GETLINK dump.
+async fn link_indices(handle: &Handle, wanted: &[&str]) -> Result<HashMap<String, u32>> {
+    count_netlink_op("RTM_GETLINK");
+    let mut links = handle.link().get().execute();
+    let mut found = HashMap::new();
+    while let Some(link) = links.try_next().await? {
+        let Some(name) = link_name(&link) else {
+            continue;
+        };
+        if wanted.contains(&name.as_str()) {
+            found.insert(name, link.header.index);
+        }
+    }
+    Ok(found)
+}
+
+fn link_name(link: &netlink_packet_route::link::LinkMessage) -> Option<String> {
+    link.attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            LinkAttribute::IfName(name) => Some(name.clone()),
+            _ => None,
+        })
 }
 
 impl Drop for Slot {
@@ -1115,7 +1581,238 @@ fn parse_nameserver_ipv4(contents: &str) -> Option<Ipv4Addr> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::iptables_util::build_restore_script;
     use super::*;
+
+    /// The rules of one rendered script, keyed by table, in the order the
+    /// script commits them.
+    fn rules_by_table(script: &str) -> Vec<(String, Vec<String>)> {
+        let mut tables: Vec<(String, Vec<String>)> = Vec::new();
+        for line in script.lines() {
+            if let Some(table) = line.strip_prefix('*') {
+                tables.push((table.to_string(), Vec::new()));
+            } else if line != "COMMIT" {
+                tables
+                    .last_mut()
+                    .expect("a rule line must follow a table header")
+                    .1
+                    .push(line.to_string());
+            }
+        }
+        tables
+    }
+
+    /// The namespace's routing rules and its egress chains used to be two
+    /// `iptables-restore` invocations back to back on the same thread in the
+    /// same namespace — two forks, two xtables-lock acquisitions. Merging them
+    /// is only safe if the resulting ruleset is the one the two invocations
+    /// produced: these rules are appended and inserted at positions that
+    /// depend on their order within a table.
+    #[test]
+    fn the_merged_namespace_batch_commits_what_the_two_batches_committed() {
+        let host_interaction_ip = Ipv4Addr::new(10, 11, 0, 7);
+        let veth_vm_ip = Ipv4Addr::new(10, 12, 0, 15);
+        let vm_ip = Ipv4Addr::new(169, 254, 0, 21);
+        let denied = vec!["10.0.0.0/8".to_string()];
+
+        let routing = build_restore_script(&Slot::namespace_routing_commands(
+            host_interaction_ip,
+            veth_vm_ip,
+            vm_ip,
+        ));
+        let egress = build_restore_script(&group_commands_by_table(
+            namespace_egress_chain_commands(resolve_guest_dns_server(), &denied),
+        ));
+        let merged = build_restore_script(&Slot::namespace_iptables_commands(
+            host_interaction_ip,
+            veth_vm_ip,
+            vm_ip,
+            &denied,
+        ));
+
+        let mut expected: Vec<(String, Vec<String>)> = Vec::new();
+        for (table, rules) in rules_by_table(&routing)
+            .into_iter()
+            .chain(rules_by_table(&egress))
+        {
+            match expected.iter_mut().find(|(name, _)| name == &table) {
+                Some((_, existing)) => existing.extend(rules),
+                None => expected.push((table, rules)),
+            }
+        }
+
+        assert_eq!(
+            rules_by_table(&merged),
+            expected,
+            "the merged batch must commit each table's rules in the order the \
+             two separate batches committed them"
+        );
+    }
+
+    /// The three in-namespace name lookups became one dump, so the name has to
+    /// be read out of the dumped message rather than asked for.
+    #[test]
+    fn a_dumped_link_is_matched_by_its_name_attribute() {
+        let mut named = netlink_packet_route::link::LinkMessage::default();
+        named.header.index = 12;
+        named
+            .attributes
+            .push(LinkAttribute::IfName("vpeer".to_string()));
+        assert_eq!(link_name(&named).as_deref(), Some("vpeer"));
+
+        let unnamed = netlink_packet_route::link::LinkMessage::default();
+        assert_eq!(link_name(&unnamed), None);
+    }
+
+    /// The peer's namespace has to travel inside the nested `VETH_INFO_PEER`
+    /// block: that is where `veth_newlink` reads it, and it is what makes the
+    /// separate `RTM_SETLINK` move — the one operation here that holds RTNL
+    /// across an RCU grace period — unnecessary.
+    #[test]
+    fn the_veth_peer_carries_its_namespace_in_the_nested_peer_block() {
+        let peer_of = |message: &netlink_packet_route::link::LinkMessage| {
+            message
+                .attributes
+                .iter()
+                .find_map(|attribute| match attribute {
+                    LinkAttribute::LinkInfo(info) => Some(info.clone()),
+                    _ => None,
+                })
+                .expect("the message carries link info")
+                .into_iter()
+                .find_map(|info| match info {
+                    LinkInfo::Data(InfoData::Veth(InfoVeth::Peer(peer))) => Some(peer),
+                    _ => None,
+                })
+                .expect("the link info carries a peer")
+        };
+
+        let in_namespace = veth_create_message("veth-9", Some(41));
+        let peer = peer_of(&in_namespace);
+        assert!(
+            peer.attributes
+                .iter()
+                .any(|attribute| matches!(attribute, LinkAttribute::NetNsFd(41))),
+            "the peer must carry the namespace it is to be created in: {peer:?}"
+        );
+        assert!(peer
+            .attributes
+            .iter()
+            .any(|attribute| matches!(attribute, LinkAttribute::IfName(name) if name == "vpeer")));
+        assert!(
+            !in_namespace
+                .attributes
+                .iter()
+                .any(|attribute| matches!(attribute, LinkAttribute::NetNsFd(_))),
+            "only the peer moves; the host end stays where the message is sent"
+        );
+
+        let both_ends_here = veth_create_message("veth-9", None);
+        assert!(
+            !peer_of(&both_ends_here)
+                .attributes
+                .iter()
+                .any(|attribute| matches!(attribute, LinkAttribute::NetNsFd(_))),
+            "without a namespace fd the pair is created wherever the message is sent"
+        );
+    }
+
+    /// The lever is off until it has been compared against the moved-end path
+    /// on the target kernel: a kernel that ignored the nested attribute would
+    /// put both ends in the wrong namespace and fail every create.
+    #[test]
+    fn the_peer_in_namespace_path_ships_off() {
+        assert!(!crate::cfg::NetworkSlotConfig::default().create_veth_peer_in_namespace);
+        assert!(!create_veth_peer_in_namespace());
+    }
+
+    /// TUNSETIFF and TUNSETPERSIST as the kernel declares them. Written out as
+    /// literals: a wrong direction or size bit produces a request the driver
+    /// does not recognise, which fails as `ENOTTY` rather than as a bad flag.
+    #[test]
+    fn the_tun_ioctl_request_codes_match_the_kernel() {
+        assert_eq!(TUNSETIFF, 0x4004_54ca);
+        assert_eq!(TUNSETPERSIST, 0x4004_54cb);
+    }
+
+    /// The kernel reads a fixed 40-byte `ifreq`. `IFF_VNET_HDR` must stay off:
+    /// iproute2 does not set it, and Firecracker sets it itself when it opens
+    /// the tap by name — setting it here would silently change guest offload
+    /// behavior.
+    #[test]
+    fn tun_set_iff_request_matches_the_kernel_ifreq() {
+        assert_eq!(std::mem::size_of::<TunSetIffRequest>(), 40);
+
+        let request = tun_set_iff_request("tap0").expect("tap0 fits IFNAMSIZ");
+        let name: Vec<u8> = request.name.iter().map(|byte| *byte as u8).collect();
+        assert_eq!(&name[..4], b"tap0");
+        assert!(
+            name[4..].iter().all(|byte| *byte == 0),
+            "the name must be NUL padded"
+        );
+        assert_eq!(
+            request.flags,
+            (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short
+        );
+        assert_eq!(
+            request.flags as libc::c_int & libc::IFF_VNET_HDR,
+            0,
+            "IFF_VNET_HDR must not be set here"
+        );
+
+        assert!(tun_set_iff_request("").is_err());
+        assert!(tun_set_iff_request("an-interface-name-far-too-long").is_err());
+    }
+
+    /// The in-process path either creates the device or is refused for want of
+    /// CAP_NET_ADMIN — and the refusal has to be recognised as one, because
+    /// that is what selects the `ip tuntap` fallback. A wrong request code
+    /// would fail here as an unclassified error instead.
+    #[test]
+    fn creating_a_tap_device_is_either_done_here_or_refused_as_a_permission_error() {
+        let name = "aenvtaptest0";
+        match Slot::create_tap_via_ioctl(name) {
+            Ok(index) => {
+                assert!(index > 0, "a created device must have an index");
+                let _ = Command::new("ip").args(["link", "del", name]).status();
+            }
+            Err(error) => assert!(
+                is_permission_error(&error),
+                "TUNSETIFF failed for a reason the fallback does not recognise: {error:#}"
+            ),
+        }
+    }
+
+    /// The netlink route and the `ip route` route have to be the same route.
+    /// The defect this exists for is a builder that omits `RTA_OIF`: the
+    /// command still succeeds, and the kernel resolves the gateway by lookup
+    /// instead of being told the device.
+    #[test]
+    fn route_identity_notices_a_missing_output_interface() {
+        let with_oif = rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(Ipv4Addr::new(10, 11, 0, 3), 32)
+            .gateway(Ipv4Addr::new(10, 12, 0, 7))
+            .output_interface(9)
+            .build();
+        let same = rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(Ipv4Addr::new(10, 11, 0, 3), 32)
+            .gateway(Ipv4Addr::new(10, 12, 0, 7))
+            .output_interface(9)
+            .build();
+        let without_oif = rtnetlink::RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(Ipv4Addr::new(10, 11, 0, 3), 32)
+            .gateway(Ipv4Addr::new(10, 12, 0, 7))
+            .build();
+
+        assert_eq!(route_identity(&with_oif), route_identity(&same));
+        assert_ne!(route_identity(&with_oif), route_identity(&without_oif));
+        assert_eq!(route_identity(&with_oif).output_interface, Some(9));
+        assert_eq!(route_identity(&without_oif).output_interface, None);
+        assert_eq!(
+            route_identity(&with_oif).destination,
+            Some(IpAddr::V4(Ipv4Addr::new(10, 11, 0, 3)))
+        );
+    }
 
     fn test_slot(idx: u32, address_plan: NetworkAddressPlan) -> Result<Slot, NetworkError> {
         Slot::new(
@@ -1141,12 +1838,36 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Serialises the tests that build real slots.
+    ///
+    /// They pick an index by scanning the host for an unused `veth-N`, so two
+    /// running at once pick the same one and collide in the kernel.
+    static HOST_NETWORK_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn unused_test_slot() -> Slot {
         let address_plan = NetworkAddressPlan::default();
         (30_000..MAX_SLOTS as u32)
             .find(|idx| !host_veth_exists(*idx))
             .and_then(|idx| test_slot(idx, address_plan).ok())
             .expect("failed to find an unused high-numbered network test slot")
+    }
+
+    /// The name `Slot::new` stamps is what startup reads back: a leftover
+    /// `veth-N` is attributed to a crashed run only through the namespace file
+    /// that belonged to it. A bare UUID parses as nobody's slot, so the reaper
+    /// never fires and `reserve_existing_host_veth_slots` burns that index for
+    /// the life of the node.
+    #[test]
+    fn a_slots_namespace_name_names_its_owner_and_its_index() {
+        let slot = test_slot(37, NetworkAddressPlan::default()).expect("slot 37 is in range");
+
+        assert_eq!(
+            super::super::classify_namespace_file(
+                &slot.namespace_id,
+                super::super::namespace_owner_id()
+            ),
+            super::super::StaleNamespace::Reap(37)
+        );
     }
 
     #[test]
@@ -1179,6 +1900,8 @@ mod tests {
                 host_interaction_cidr: "100.64.0.0/16".to_string(),
                 veth_cidr: "100.65.0.0/16".to_string(),
             },
+            iptables: crate::cfg::NetworkIptablesConfig::default(),
+            slot: crate::cfg::NetworkSlotConfig::default(),
         };
         let address_plan = NetworkAddressPlan::from_config(&config).unwrap();
         let slot = test_slot(2, address_plan).expect("slot should be valid");
@@ -1292,10 +2015,70 @@ mod tests {
         assert!(!slot.user_egress_rules_present);
     }
 
+    /// The equivalence the netlink route path rests on: the route it installs
+    /// and the route `ip route add` installs must be the same seven fields.
+    /// Needs a real veth, so it runs only where the capabilities exist.
+    #[test]
+    #[ignore = "requires CAP_NET_ADMIN/CAP_SYS_ADMIN and affects system configuration"]
+    fn the_netlink_route_and_the_ip_route_are_the_same_route() {
+        crate::logging::init_for_tests();
+        let _serialized = HOST_NETWORK_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut slot = unused_test_slot();
+        slot.create_network().expect("create the slot network");
+
+        let host_interaction_ip = slot.host_interaction_ip;
+        let veth_vm_ip = slot.veth_vm_ip;
+        let veth_name = Slot::host_veth_name(slot.idx);
+
+        let identity_of = |ip: Ipv4Addr| -> Option<RouteIdentity> {
+            run_on_host_netlink(move |handle| {
+                Box::pin(async move {
+                    let identities = route_identities(&handle).await?;
+                    Ok(identities
+                        .into_iter()
+                        .find(|identity| identity.destination == Some(IpAddr::V4(ip))))
+                })
+            })
+            .expect("dump routes")
+        };
+
+        let over_netlink = identity_of(host_interaction_ip)
+            .expect("the netlink path should have installed the route");
+
+        let deleted = Command::new("ip")
+            .args([
+                "route",
+                "del",
+                &format!("{host_interaction_ip}/32"),
+                "via",
+                &veth_vm_ip.to_string(),
+                "dev",
+                &veth_name,
+            ])
+            .status()
+            .expect("delete the netlink-installed route");
+        assert!(deleted.success(), "the route should have been removable");
+
+        Slot::add_host_interaction_route_via_ip(&veth_name, host_interaction_ip, veth_vm_ip)
+            .expect("install the same route through `ip route`");
+        let over_ip = identity_of(host_interaction_ip)
+            .expect("the `ip` path should have installed the route");
+
+        assert_eq!(
+            over_netlink, over_ip,
+            "the two paths installed different routes"
+        );
+    }
+
     #[test]
     #[ignore = "requires CAP_NET_ADMIN/CAP_SYS_ADMIN and affects system configuration"]
     fn test_network_lifecycle() {
         crate::logging::init_for_tests();
+        let _serialized = HOST_NETWORK_TESTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // Use a free high slot ID to avoid collisions with dev/prod and stale
         // devices from interrupted test runs.
@@ -1375,41 +2158,119 @@ mod host_netlink_tests {
     use super::*;
 
     /// The shared connection has to outlive whatever runtime first asked for a
-    /// handle. Slot teardown runs on short-lived scratch runtimes (see
-    /// `run_async`), so a connection spawned onto the first caller's runtime
-    /// would already be dead by the second call — and would take every
-    /// in-flight request on other threads down with it.
+    /// handle: a connection spawned onto a caller's runtime would already be
+    /// dead by the second call, and would take every in-flight request on
+    /// other threads down with it.
+    /// A link dump, as a request that exercises the whole connection.
+    fn dump_one_link() -> Result<()> {
+        run_on_host_netlink(|handle| {
+            Box::pin(async move {
+                let mut links = handle.link().get().execute();
+                links.try_next().await?;
+                Ok(())
+            })
+        })
+    }
+
     #[test]
     fn the_shared_connection_outlives_the_runtime_that_created_it() {
-        let first = {
+        {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("scratch runtime");
-            // Dropped at the end of this block, exactly as a teardown scratch
-            // runtime is.
-            runtime.block_on(async { host_netlink_handle() })
-        };
-        // Not tolerated as "netlink is unavailable here": AF_NETLINK exists in
-        // every Linux network namespace and opening a socket needs no
-        // privilege, so a failure means the connection is broken.
-        let first = first.expect("a handle onto the shared netlink connection");
-
-        let second = host_netlink_handle().expect("a second handle onto the same connection");
-
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("second runtime");
-        for (label, handle) in [("first", first), ("second", second)] {
-            let dumped = runtime.block_on(async {
-                let mut links = handle.link().get().execute();
-                links.try_next().await
-            });
-            assert!(
-                dumped.is_ok(),
-                "the {label} handle should still serve requests: {dumped:?}"
-            );
+            // Dropped at the end of this block, exactly as a caller's runtime
+            // is. Not tolerated as "netlink is unavailable here": AF_NETLINK
+            // exists in every Linux network namespace and opening a socket
+            // needs no privilege, so a failure means the connection is broken.
+            runtime
+                .block_on(async { dump_one_link() })
+                .expect("the first request should be served");
         }
+
+        dump_one_link().expect("the connection should still serve requests");
+    }
+
+    /// Every host-side operation used to spawn a thread and build a runtime to
+    /// block on one netlink request. The work must now run on the thread that
+    /// already owns the connection.
+    #[test]
+    fn host_netlink_work_runs_on_the_shared_connection_thread() {
+        let thread_name = run_on_host_netlink(|_handle| {
+            Box::pin(async move {
+                Ok(thread::current()
+                    .name()
+                    .map(str::to_string)
+                    .unwrap_or_default())
+            })
+        })
+        .expect("the shared netlink worker should run the job");
+
+        assert_eq!(
+            thread_name, "agentenv-netlink",
+            "the request ran on {thread_name:?} rather than the shared connection thread"
+        );
+    }
+
+    /// A kernel that refuses the on-link /32 must not make the netlink worker
+    /// fork: `run_with_scoped_capabilities` joins a thread, and this worker's
+    /// current-thread runtime drives the connection for every slot on the node,
+    /// so the job reports the fallback back to its caller instead of running
+    /// it. Driven on the real shared worker, through the real production
+    /// function, with the refusing-kernel answer supplied rather than latched.
+    #[test]
+    fn a_refusing_kernel_hands_the_shell_out_back_to_the_caller() {
+        static REFUSES_THE_ROUTE: OnceLock<bool> = OnceLock::new();
+        let _ = REFUSES_THE_ROUTE.set(false);
+
+        let outcome = run_on_host_netlink(|handle| {
+            Box::pin(async move {
+                Slot::add_host_interaction_route(
+                    &handle,
+                    &REFUSES_THE_ROUTE,
+                    // Never dereferenced: the refusal is decided before any
+                    // message is built.
+                    0,
+                    "veth-none-here",
+                    Ipv4Addr::new(169, 254, 0, 1),
+                    Ipv4Addr::new(169, 254, 0, 2),
+                )
+                .await
+            })
+        })
+        .expect("the job must return rather than shell out on the netlink worker");
+
+        assert_eq!(outcome, HostRouteFallback::ShellOut);
+    }
+
+    /// Requests overlap: a refill batch builds several slots at once, and a
+    /// worker that awaited each job in turn would serialize their host-side
+    /// configuration behind one another.
+    #[test]
+    fn queued_netlink_jobs_overlap_rather_than_serializing() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        std::thread::scope(|scope| {
+            let first = scope.spawn(move || {
+                run_on_host_netlink(move |_handle| {
+                    Box::pin(async move {
+                        started_tx.send(()).expect("the first job announces itself");
+                        let _ = release_rx.await;
+                        Ok(())
+                    })
+                })
+            });
+
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the first job should start");
+
+            run_on_host_netlink(|_handle| Box::pin(async move { Ok(()) }))
+                .expect("a second job must not wait behind the first");
+
+            release_tx.send(()).expect("release the first job");
+            first.join().expect("first job thread").expect("first job");
+        });
     }
 }

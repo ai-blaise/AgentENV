@@ -23,6 +23,8 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/resolver"
+	"google.golang.org/grpc/resolver/manual"
 )
 
 const (
@@ -32,12 +34,58 @@ const (
 	maxAPIKeyFileLen  = maxAPIKeyLen + 2
 )
 
+// schedulerLoadBalancingConfig spreads RPCs over every scheduler the resolver
+// names.
+//
+// Without it grpc.NewClient balances with pick_first, which uses one address
+// and keeps one connection: every gateway pins itself to whichever scheduler it
+// resolved first, so scaling the tier out moves no traffic and rolling it
+// blacks routing out until the client reconnects. round_robin also drops a
+// subchannel that fails to connect, which is what makes killing a replica
+// invisible to clients.
+const schedulerLoadBalancingConfig = `{"loadBalancingConfig":[{"round_robin":{}}]}`
+
 func newSchedulerConn(addr string, authToken string) (*grpc.ClientConn, error) {
+	target, resolverOptions, err := schedulerDialTarget(addr)
+	if err != nil {
+		return nil, err
+	}
 	options := append(
-		[]grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())},
+		[]grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithDefaultServiceConfig(schedulerLoadBalancingConfig),
+		},
 		gateway.SchedulerDialOptions(authToken)...,
 	)
-	return grpc.NewClient(addr, options...)
+	return grpc.NewClient(target, append(options, resolverOptions...)...)
+}
+
+// schedulerDialTarget turns a configured address into something to dial.
+//
+// A single address dials exactly as before — in Kubernetes that is a headless
+// service name, and its DNS record is what makes round-robin span the replicas.
+// A comma-separated list is resolved from the list itself, which mirrors
+// scheduler.redis_addr and is the only form available where there is no
+// cluster DNS to ask.
+func schedulerDialTarget(addr string) (string, []grpc.DialOption, error) {
+	addresses := make([]resolver.Address, 0, 1)
+	for _, part := range strings.Split(addr, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			addresses = append(addresses, resolver.Address{Addr: part})
+		}
+	}
+	switch len(addresses) {
+	case 0:
+		return "", nil, fmt.Errorf("scheduler address %q names no host", addr)
+	case 1:
+		return addresses[0].Addr, nil, nil
+	}
+
+	// The builder is passed to this connection alone rather than registered
+	// globally, so the two scheduler connections cannot collide on a scheme.
+	builder := manual.NewBuilderWithScheme("agentenv-scheduler")
+	builder.InitialState(resolver.State{Addresses: addresses})
+	return builder.Scheme() + ":///scheduler", []grpc.DialOption{grpc.WithResolvers(builder)}, nil
 }
 
 // serverOptionsFromConfig is the one place a gateway config key becomes a

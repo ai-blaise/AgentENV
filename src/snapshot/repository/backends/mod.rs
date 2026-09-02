@@ -13,7 +13,7 @@ use crate::p2p::P2pTransport;
 use crate::snapshot::artifact_cache::LocalArtifactCache;
 use crate::snapshot::repository::interfaces::{SnapshotRepository, SnapshotRuntimeResolver};
 pub use oss::OssBackend;
-pub use posixfs::{PosixFsBackend, PosixFsBackendConfig};
+pub use posixfs::{PosixFsBackend, PosixFsBackendConfig, PosixFsLockStrategy};
 
 /// Builds the configured snapshot repository backend and its matching runtime resolver from the global configuration.
 pub fn build_snapshot_backend(
@@ -35,11 +35,18 @@ pub fn build_snapshot_backend(
                 .snapshot_store
                 .join("repository");
             let cache = LocalArtifactCache::new(shared_cache_root.clone(), None)?;
+            let lock_strategy = config
+                .backend
+                .posix_fs
+                .as_ref()
+                .map(|posix_fs| posix_fs.lock_strategy)
+                .unwrap_or_default();
             Ok(PosixFsBackend::from_parts(
                 PosixFsBackendConfig {
                     root,
                     cache_root: Some(shared_cache_root.clone()),
                     runtime_cache_root: Some(shared_cache_root.join("runtime")),
+                    lock_strategy,
                 },
                 overlaybd_layers,
                 cache,

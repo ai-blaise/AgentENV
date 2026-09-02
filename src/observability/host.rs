@@ -3,13 +3,11 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use nix::sys::statvfs::statvfs;
 use tracing::warn;
 
-const FIRST_REQUEST_CPU_SAMPLE_WINDOW: Duration = Duration::from_millis(100);
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 const PROC_SELF_CGROUP: &str = "/proc/self/cgroup";
 
@@ -36,9 +34,10 @@ pub struct HostMetrics {
 ///
 /// Each call reads current host state and returns a fresh snapshot.
 ///
-/// CPU utilization uses two samples; on the first call the collector waits
-/// `FIRST_REQUEST_CPU_SAMPLE_WINDOW` between samples so it can return a
-/// measured value immediately.
+/// CPU utilization needs two samples. The first is taken when the collector is
+/// constructed, so no call has to manufacture a window by sleeping between two
+/// reads: that sleep ran on whichever thread asked first, which during startup
+/// is the thread priming the warm pools.
 #[derive(Clone)]
 pub struct HostMetricsCollector {
     previous_cpu: Arc<RwLock<Option<CpuSample>>>,
@@ -67,7 +66,7 @@ struct CgroupFilePaths {
 impl HostMetricsCollector {
     pub fn new() -> Self {
         Self {
-            previous_cpu: Arc::new(RwLock::new(None)),
+            previous_cpu: Arc::new(RwLock::new(Self::read_cpu_sample().ok())),
             cgroup_files: Arc::new(CgroupFilePaths::detect()),
         }
     }
@@ -94,12 +93,10 @@ impl HostMetricsCollector {
         let (baseline_cpu, current_cpu) = if let Some(previous) = previous_cpu {
             (previous, Self::read_cpu_sample()?)
         } else {
-            // On the first request, take two short-window samples so CPU usage
-            // is computed immediately instead of returning a synthetic zero.
-            let first = Self::read_cpu_sample()?;
-            std::thread::sleep(FIRST_REQUEST_CPU_SAMPLE_WINDOW);
-            let second = Self::read_cpu_sample()?;
-            (first, second)
+            // No baseline: the constructor's read failed. Seed one and report
+            // zero for this call rather than sleeping to manufacture a window.
+            let sample = Self::read_cpu_sample()?;
+            (sample, sample)
         };
         let cpu_percent = cpu_percent_between(baseline_cpu, current_cpu);
 
@@ -514,6 +511,54 @@ mod tests {
                     filesystem_type: "proc".to_string(),
                 },
             ]
+        );
+    }
+
+    /// The baseline used to be seeded by the first `collect`, which paid for it
+    /// with a 100 ms `std::thread::sleep` on the calling thread — during
+    /// startup, the thread priming the warm pools.
+    #[test]
+    fn constructing_the_collector_seeds_the_cpu_baseline() {
+        let collector = HostMetricsCollector::new();
+        assert!(
+            collector
+                .previous_cpu
+                .read()
+                .expect("baseline lock")
+                .is_some(),
+            "the collector should already hold a CPU sample"
+        );
+    }
+
+    /// The remaining no-baseline case — the constructor's own read failed —
+    /// reports zero rather than sleeping 100 ms to manufacture a window. The
+    /// time bound is generous because this runs beside a thousand other tests;
+    /// the defect it excludes adds a fixed 100 ms on top of whatever the load
+    /// costs.
+    #[test]
+    fn a_collect_without_a_baseline_neither_sleeps_nor_invents_a_window() {
+        let collector = HostMetricsCollector::new();
+        *collector.previous_cpu.write().expect("baseline lock") = None;
+
+        let started = std::time::Instant::now();
+        let metrics = collector.collect();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            metrics.cpu_percent, 0,
+            "with no baseline there is no window to measure over"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(90),
+            "the collect took {elapsed:?}; it is sampling with a sleep again"
+        );
+        assert!(
+            collector
+                .previous_cpu
+                .read()
+                .expect("baseline lock")
+                .is_some(),
+            "the sample it did take must become the next baseline"
         );
     }
 }

@@ -79,19 +79,49 @@ spec:
                   - /bin/sh
                   - "-c"
                   - |
-                    echo "preStop: waiting for sandboxes to drain..."
+                    # Ask the node to drain, rather than waiting for it to empty
+                    # by itself. The old loop polled GET /sandboxes until it read
+                    # zero, which never caused anything to be preserved: it just
+                    # waited out whatever the sandboxes did on their own, and any
+                    # create landing meanwhile reset it.
+                    #
+                    # Each POST closes the node to new work and runs one bounded
+                    # pass, so this loop is a poll on real state. It stops well
+                    # inside terminationGracePeriodSeconds so a node that cannot
+                    # converge is still stopped deliberately rather than by SIGKILL.
+                    echo "preStop: draining node..."
+                    give_up=$(( $(date +%s) + 3000 ))
                     while true; do
-                      count=$(curl -sf -H "X-API-Key: ${AENV_API_KEY}" http://localhost:8000/sandboxes | jq 'length') || count=""
-                      if [ -z "$count" ]; then
-                        echo "preStop: failed to query sandbox count, retrying..."
-                        sleep 3
-                        continue
+                      progress=$(curl -sf -X POST \
+                        -H "X-API-Key: ${AENV_API_KEY}" \
+                        -H "Content-Type: application/json" \
+                        -d '{"deadlineMs":30000}' \
+                        http://localhost:8000/admin/drain) || progress=""
+                      if [ -z "$progress" ]; then
+                        echo "preStop: drain request failed, retrying..."
+                      else
+                        echo "preStop: $progress"
+                        remaining=$(echo "$progress" | jq '.remaining')
+                        # A publish that failed leaves its sandbox paused, so it
+                        # drops out of "remaining" while its state never reached
+                        # the repository. Exiting on "remaining" alone would let
+                        # a transient object-store failure be reported as a
+                        # drained node and take those sandboxes down with it.
+                        failed=$(echo "$progress" | jq '.failed')
+                        if [ "$remaining" = "0" ] && [ "$failed" = "0" ]; then
+                          echo "preStop: node drained, exiting"
+                          break
+                        fi
                       fi
-                      echo "preStop: $count sandbox(es) remaining"
-                      if [ "$count" = "0" ]; then
-                        echo "preStop: all sandboxes drained, exiting"
+                      if [ "$(date +%s)" -ge "$give_up" ]; then
+                        echo "preStop: giving up with sandboxes still on this node"
                         break
                       fi
+                      # Between every pass, not only after a failed request. One
+                      # sandbox that cannot be paused or published keeps the
+                      # counters non-zero for the whole window, and a loop with
+                      # no delay would re-POST continuously for it — pinning a
+                      # CPU on a node that is leaving.
                       sleep 3
                     done
             postStart:

@@ -77,7 +77,7 @@ func TestLoadSchedulerAllowsQueryOnlyWithRedisWithoutNodes(t *testing.T) {
 		t.Fatalf("write config file failed: %v", err)
 	}
 
-	cfg, err := LoadScheduler(path, true)
+	cfg, err := LoadScheduler(path, SchedulerModeQueryOnly)
 	if err != nil {
 		t.Fatalf("load query-only scheduler config failed: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestLoadSchedulerRejectsQueryOnlyWithoutRedis(t *testing.T) {
 		t.Fatalf("write config file failed: %v", err)
 	}
 
-	if _, err := LoadScheduler(path, true); err == nil {
+	if _, err := LoadScheduler(path, SchedulerModeQueryOnly); err == nil {
 		t.Fatal("expected query-only scheduler without redis_addr to fail")
 	}
 }
@@ -771,7 +771,7 @@ func TestLoadRejectsMisorderedReconcileGrace(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			path := writeSchedulerConfig(t, tc.body)
-			_, err := LoadScheduler(path, false)
+			_, err := LoadScheduler(path, SchedulerModePrimary)
 			if err == nil {
 				t.Fatal("a misordered grace loaded")
 			}
@@ -780,7 +780,7 @@ func TestLoadRejectsMisorderedReconcileGrace(t *testing.T) {
 			}
 
 			queryOnly := writeSchedulerConfig(t, tc.body+`, "redis_addr": "127.0.0.1:6379"`)
-			if _, err := LoadScheduler(queryOnly, true); err == nil || !strings.Contains(err.Error(), tc.want) {
+			if _, err := LoadScheduler(queryOnly, SchedulerModeQueryOnly); err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("query-only load: err = %v, want it to contain %q", err, tc.want)
 			}
 		})
@@ -791,7 +791,7 @@ func TestLoadRejectsMisorderedReconcileGrace(t *testing.T) {
 // follows it down. A 10s TTL with the grace unset used to be refused for
 // reaching the 10s default the operator never wrote.
 func TestLoadDerivesTheReconcileGraceFromAShortBindingTTL(t *testing.T) {
-	cfg, err := LoadScheduler(writeSchedulerConfig(t, `"binding_ttl": "10s"`), false)
+	cfg, err := LoadScheduler(writeSchedulerConfig(t, `"binding_ttl": "10s"`), SchedulerModePrimary)
 	if err != nil {
 		t.Fatalf("a 10s binding ttl with the grace unset was refused: %v", err)
 	}

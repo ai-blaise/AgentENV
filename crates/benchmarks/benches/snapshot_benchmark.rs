@@ -1,9 +1,17 @@
+use agentenv::cfg::ConfigManager;
 use agentenv::image::ImageResolver;
-use agentenv::sandbox::{
-    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotConfig, OverlaybdConfig,
-    SandboxExecutor, UblkDeviceManager,
+use agentenv::orchestrator::{
+    CreateSandboxRequest, DisabledSandboxPersister, InMemoryMetadataStore, NewTimeout,
+    Orchestrator, SandboxLaunchSource, SandboxTimeoutAction,
 };
-use anyhow::{Context, Result};
+use agentenv::sandbox::{
+    FirecrackerSandbox, FirecrackerSandboxConfig, FirecrackerSnapshotConfig, MockBackendFactory,
+    NodeBackendFactory, OverlaybdConfig, SandboxBackendKind, SandboxExecutor, SandboxNetworkPolicy,
+    UblkDeviceManager,
+};
+use agentenv::snapshot::CommandContext;
+use agentenv::types::{ImageConfigs, SandboxId};
+use anyhow::{anyhow, bail, Context, Result};
 use criterion::Criterion;
 use overlaybd::config::UpperMode;
 use std::path::PathBuf;
@@ -68,6 +76,8 @@ fn filtered_benchmark_names() -> Result<Option<Vec<String>>> {
         println!("snapshot_resume_cold");
         println!("snapshot_resume");
         println!("concurrent_resume");
+        println!("repeated_capture_latency");
+        println!("fork_fanout");
         return Ok(None);
     }
 
@@ -106,19 +116,40 @@ fn print_samples(name: &str, samples: &[Duration]) {
     }
 }
 
-fn run_default_benchmark<F>(name: &str, filters: &[String], mut run: F) -> bool
-where
+/// What the benchmarks in one run did.
+///
+/// A benchmark that errored has to be distinguishable from one that was
+/// filtered out and from one that measured a flat curve: the entire output of
+/// these targets is a number, so a run that produced none of them must not be
+/// able to leave through the same exit code as a run that produced all of them.
+#[derive(Default)]
+struct BenchOutcomes {
+    measured: usize,
+    failed: Vec<&'static str>,
+}
+
+fn run_default_benchmark<F>(
+    name: &'static str,
+    filters: &[String],
+    outcomes: &mut BenchOutcomes,
+    mut run: F,
+) where
     F: FnMut() -> Result<Vec<Duration>>,
 {
     if !should_run(name, filters) {
-        return false;
+        return;
     }
 
     match run() {
-        Ok(samples) => print_samples(name, &samples),
-        Err(err) => eprintln!("Skipping {name}: {err:#}"),
+        Ok(samples) => {
+            print_samples(name, &samples);
+            outcomes.measured += 1;
+        }
+        Err(err) => {
+            eprintln!("{name}: no measurement: {err:#}");
+            outcomes.failed.push(name);
+        }
     }
-    true
 }
 
 async fn setup_sandbox() -> Result<FirecrackerSandbox> {
@@ -618,28 +649,50 @@ fn run_default_snapshot_benchmarks() -> Result<()> {
     println!("Running bounded snapshot benchmarks (set AENV_BENCH_FULL=1 for Criterion sampling)");
     let rt = Runtime::new().context("create Tokio runtime for snapshot benchmarks")?;
 
-    let mut ran = false;
-    ran |= run_default_benchmark("snapshot_creation", &filters, || {
+    let mut outcomes = BenchOutcomes::default();
+    run_default_benchmark("snapshot_creation", &filters, &mut outcomes, || {
         default_snapshot_creation(&rt)
     });
-    ran |= run_default_benchmark("snapshot_creation_1gdisk", &filters, || {
+    run_default_benchmark("snapshot_creation_1gdisk", &filters, &mut outcomes, || {
         default_snapshot_creation_1gdisk(&rt)
     });
-    ran |= run_default_benchmark("snapshot_creation_1gmem", &filters, || {
+    run_default_benchmark("snapshot_creation_1gmem", &filters, &mut outcomes, || {
         default_snapshot_creation_1gmem(&rt)
     });
-    ran |= run_default_benchmark("snapshot_resume_cold", &filters, || {
+    run_default_benchmark("snapshot_resume_cold", &filters, &mut outcomes, || {
         default_snapshot_resume_cold(&rt)
     });
-    ran |= run_default_benchmark("snapshot_resume", &filters, || default_snapshot_resume(&rt));
-    ran |= run_default_benchmark("concurrent_resume", &filters, || {
+    run_default_benchmark("snapshot_resume", &filters, &mut outcomes, || {
+        default_snapshot_resume(&rt)
+    });
+    run_default_benchmark("concurrent_resume", &filters, &mut outcomes, || {
         default_concurrent_resume(&rt)
     });
+    run_default_benchmark("repeated_capture_latency", &filters, &mut outcomes, || {
+        default_repeated_capture_latency(&rt)
+    });
+    run_default_benchmark("fork_fanout", &filters, &mut outcomes, || {
+        default_fork_fanout(&rt)
+    });
 
-    if !ran {
+    if outcomes.measured == 0 && outcomes.failed.is_empty() {
         eprintln!(
             "No snapshot benchmarks matched filter(s): {}",
             filters.join(", ")
+        );
+    }
+
+    // A benchmark named on the command line that produced no number fails the
+    // run. `make bench-snapshot-mock` names both of its benchmarks, so a host
+    // where they cannot build an orchestrator now says so through the exit
+    // code instead of printing two skip lines and exiting 0. An unfiltered run
+    // keeps skipping: on a host without /dev/kvm the six hypervisor
+    // benchmarks are expected to be unrunnable, and that is not this run's
+    // failure.
+    if !filters.is_empty() && !outcomes.failed.is_empty() {
+        bail!(
+            "no measurement from benchmark(s) asked for by name: {}",
+            outcomes.failed.join(", ")
         );
     }
 
@@ -654,6 +707,8 @@ fn run_full_snapshot_benchmarks() {
     bench_snapshot_resume_cold(&mut criterion);
     bench_snapshot_resume(&mut criterion);
     bench_snapshot_concurrent_resume(&mut criterion);
+    bench_repeated_capture_latency(&mut criterion);
+    bench_fork_fanout(&mut criterion);
     criterion.final_summary();
 }
 
@@ -663,5 +718,220 @@ fn main() {
     } else if let Err(err) = run_default_snapshot_benchmarks() {
         eprintln!("snapshot benchmark failed: {err:#}");
         std::process::exit(1);
+    }
+}
+
+// ── Orchestrator-path benchmarks (no hypervisor) ─────────────────────────────
+//
+// The six benchmarks above need /dev/kvm and ublk_drv. The two below drive
+// `Orchestrator` against the mock sandbox backend, so they run anywhere the
+// workspace builds.
+//
+// What they measure is the orchestrator's own cost per capture and per fork
+// child: the state-machine transitions, the metadata store, the handle map,
+// the proxy route table and the lifecycle event fan-out. What they do NOT
+// measure is anything a guest does — a mock sandbox has no guest, so there is
+// no pause, no dirty-page scan, no memory layer and no restore. A number from
+// here is a control-plane number and is worthless as a snapshot number.
+//
+// They are still the right instrument for two questions the hypervisor
+// benchmarks cannot answer on their own: whether repeated capture of one
+// sandbox costs more each time for reasons that have nothing to do with the
+// memory chain, and how the fork path scales as `count` approaches the API's
+// limit of 100 children.
+
+/// Fanouts `bench_fork_fanout` reports, up to the API's `count` ceiling.
+const FORK_FANOUTS: [u32; 4] = [1, 8, 32, 100];
+/// Capture counts `bench_repeated_capture_latency` reports.
+const CAPTURE_ROUNDS: [usize; 4] = [1, 2, 4, 8];
+
+type MockOrchestrator =
+    Orchestrator<InMemoryMetadataStore, NodeBackendFactory, DisabledSandboxPersister>;
+
+/// Builds an orchestrator over the mock backend, or explains why it will not.
+///
+/// The backend is a process-wide config decision, so this refuses rather than
+/// overriding it: a run that silently swapped the backend would report mock
+/// numbers under the names of the hypervisor benchmarks.
+async fn mock_orchestrator() -> Result<Arc<MockOrchestrator>> {
+    let config = ConfigManager::init_global()?.config();
+    if config.machine.backend != SandboxBackendKind::Mock {
+        bail!(
+            "orchestrator-path benchmarks need [machine].backend = \"mock\"; \
+             re-run with AENV_SANDBOX_BACKEND=mock (see `make bench-snapshot-mock`)"
+        );
+    }
+
+    Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        NodeBackendFactory::Mock(MockBackendFactory::new()),
+        DisabledSandboxPersister,
+    )
+    .await
+    // Wrapped rather than formatted: `OrchestratorError`'s own Display drops
+    // the cause, and the cause is the whole diagnostic here — a config load
+    // that failed because [home_path] is not writable reads as "failed to load
+    // sandbox config" without it.
+    .map_err(|error| anyhow::Error::new(error).context("build mock orchestrator"))
+}
+
+/// Creates one running mock sandbox and returns its id.
+async fn create_mock_sandbox(orchestrator: &Arc<MockOrchestrator>) -> Result<SandboxId> {
+    let app_config = ConfigManager::global_config();
+    let resolver = ImageResolver::new(app_config);
+    let resolved = resolver
+        .resolve(resolver.default_image())
+        .await
+        .context("resolve the mock placeholder image")?;
+    let base = resolved.base_context;
+
+    let request = CreateSandboxRequest {
+        source: SandboxLaunchSource::Image {
+            image_ref: resolved.image_ref,
+            overlaybd_config_path: resolved.overlaybd_config_path,
+            context: Box::new(CommandContext::from_env_and_workdir(
+                base.env_vars,
+                base.workdir,
+            )),
+            resources: None,
+            extra_drives: Vec::new(),
+            extra_boot_args: None,
+            image_configs: Box::new(ImageConfigs::new()),
+        },
+        timeout: Some(Duration::from_secs(600)),
+        timeout_action: SandboxTimeoutAction::Delete,
+        auto_resume: false,
+        user_metadata: None,
+        env_vars: None,
+        network_policy: SandboxNetworkPolicy::default(),
+        secure: false,
+        custom_extension_params: None,
+    };
+
+    orchestrator
+        .create_sandbox(request)
+        .await
+        .map(|metadata| metadata.id)
+        .map_err(|error| anyhow!("create mock sandbox: {error}"))
+}
+
+/// Times `CAPTURE_ROUNDS.last()` captures of one sandbox, in order.
+///
+/// The returned durations are per capture, so the caller sees the shape of the
+/// curve rather than a total. A rising curve here is orchestrator-side, since
+/// the mock backend's capture is constant work by construction.
+async fn repeated_capture_samples(rounds: usize) -> Result<Vec<Duration>> {
+    let orchestrator = mock_orchestrator().await?;
+    let sandbox_id = create_mock_sandbox(&orchestrator).await?;
+
+    let mut samples = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        let start = std::time::Instant::now();
+        orchestrator
+            .capture_snapshot(sandbox_id)
+            .await
+            .map_err(|error| anyhow!("capture {} of {rounds}: {error}", round + 1))?;
+        samples.push(start.elapsed());
+    }
+
+    let _ = orchestrator.delete_sandbox(sandbox_id).await;
+    Ok(samples)
+}
+
+/// Times one fork of `count` children, returning the per-child cost.
+async fn fork_fanout_sample(count: u32) -> Result<Duration> {
+    let orchestrator = mock_orchestrator().await?;
+    let sandbox_id = create_mock_sandbox(&orchestrator).await?;
+
+    let start = std::time::Instant::now();
+    let children = orchestrator
+        .fork_sandbox(sandbox_id, count, NewTimeout::UseExisting)
+        .await
+        .map_err(|error| anyhow!("fork {count} children: {error}"))?;
+    let elapsed = start.elapsed();
+
+    let failures = children.iter().filter(|child| child.is_err()).count();
+    if failures > 0 {
+        bail!("{failures} of {count} fork children failed");
+    }
+
+    for child in children.into_iter().flatten() {
+        let _ = orchestrator.delete_sandbox(child.id).await;
+    }
+    let _ = orchestrator.delete_sandbox(sandbox_id).await;
+
+    Ok(elapsed / count)
+}
+
+fn default_repeated_capture_latency(rt: &Runtime) -> Result<Vec<Duration>> {
+    let rounds = *CAPTURE_ROUNDS
+        .last()
+        .expect("CAPTURE_ROUNDS is a non-empty literal");
+    let samples = rt.block_on(repeated_capture_samples(rounds))?;
+
+    for round in CAPTURE_ROUNDS {
+        println!(
+            "  capture #{round:<3} {}",
+            format_duration(samples[round - 1])
+        );
+    }
+    Ok(samples)
+}
+
+fn default_fork_fanout(rt: &Runtime) -> Result<Vec<Duration>> {
+    let mut samples = Vec::with_capacity(FORK_FANOUTS.len());
+    for count in FORK_FANOUTS {
+        let per_child = rt.block_on(fork_fanout_sample(count))?;
+        println!(
+            "  fanout {count:<4} {} per child",
+            format_duration(per_child)
+        );
+        samples.push(per_child);
+    }
+    Ok(samples)
+}
+
+fn bench_repeated_capture_latency(c: &mut Criterion) {
+    let rt = Runtime::new().expect("create Tokio runtime");
+    let rounds = *CAPTURE_ROUNDS
+        .last()
+        .expect("CAPTURE_ROUNDS is a non-empty literal");
+
+    c.bench_function("repeated_capture_latency", |b| {
+        b.iter_custom(|iters| {
+            let mut total = Duration::ZERO;
+            for _ in 0..iters {
+                match rt.block_on(repeated_capture_samples(rounds)) {
+                    Ok(samples) => total += samples.iter().copied().sum::<Duration>(),
+                    Err(error) => {
+                        eprintln!("repeated_capture_latency: {error:#}");
+                        return Duration::ZERO;
+                    }
+                }
+            }
+            total
+        });
+    });
+}
+
+fn bench_fork_fanout(c: &mut Criterion) {
+    let rt = Runtime::new().expect("create Tokio runtime");
+
+    for count in FORK_FANOUTS {
+        c.bench_function(&format!("fork_fanout_{count}"), |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    match rt.block_on(fork_fanout_sample(count)) {
+                        Ok(per_child) => total += per_child,
+                        Err(error) => {
+                            eprintln!("fork_fanout_{count}: {error:#}");
+                            return Duration::ZERO;
+                        }
+                    }
+                }
+                total
+            });
+        });
     }
 }

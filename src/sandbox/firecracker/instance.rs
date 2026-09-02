@@ -10,8 +10,9 @@ use firecracker_client::models::instance_action_info::ActionType;
 use firecracker_client::models::vm::State as VmState;
 use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig, PartialDrive};
 use firecracker_client::models::{
-    Balloon, BootSource, DirtyMemoryRanges, Drive, InstanceActionInfo, Logger,
-    MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, RateLimiter,
+    Balloon, BalloonHintingStatus, BalloonStartCmd, BalloonStats, BootSource, DirtyMemoryRanges,
+    Drive, FullVmConfiguration, InstanceActionInfo, Logger, MachineConfiguration, MemoryBackend,
+    MemoryHotplugSizeUpdate, MemoryHotplugStatus, NetworkInterface, NetworkOverride, RateLimiter,
     SnapshotCreateParams, SnapshotLoadParams, Vm,
 };
 use hyper::Method;
@@ -24,6 +25,7 @@ use tracing::{debug, trace, warn};
 
 use super::mmds::MmdsMetadata;
 use super::socket::UnixSocketClient;
+use crate::cfg::BalloonConfig;
 
 /// Maximum size (in bytes) of the MMDS data store. The Firecracker default is
 /// 51200 (50 KiB); we raise it to 1 MiB to accommodate raw image configs
@@ -409,18 +411,120 @@ impl FirecrackerInstance {
     /// `deflate_on_oom = true` as a safety net. The primary purpose is to
     /// enable free page reporting so the guest kernel can return unused pages
     /// to the host via `MADV_DONTNEED`, reducing host memory pressure.
-    pub async fn set_balloon(&self) -> Result<()> {
+    ///
+    /// `amount_mib` stays at zero for every caller: the balloon is a reporting
+    /// device here, and driving it as a second reclaim actuator would fight
+    /// the in-guest DAMON watermarks configured in the kernel boot args.
+    pub async fn set_balloon(&self, config: &BalloonConfig) -> Result<()> {
         let balloon = Balloon {
             amount_mib: 0,
             deflate_on_oom: true,
-            stats_polling_interval_s: None,
-            free_page_hinting: None,
+            // Firecracker reads zero as "statistics disabled", which is also
+            // its own default, so omitting the field and sending zero are the
+            // same request. Omit it to keep the pre-existing wire shape.
+            stats_polling_interval_s: (config.stats_polling_interval_s > 0)
+                .then(|| i32::try_from(config.stats_polling_interval_s))
+                .transpose()
+                .context("machine.balloon.stats_polling_interval_s does not fit in i32")?,
+            free_page_hinting: config.free_page_hinting.then_some(true),
             free_page_reporting: Some(true),
         };
         self.client
             .request_no_content(Method::PUT, "/balloon", Some(&balloon))
             .await
             .context("Failed to set balloon configuration")
+    }
+
+    /// Reads back the VM's whole device configuration.
+    ///
+    /// This is the memory-capability probe. One 200 answers every question the
+    /// control loop has — is there a balloon at all, were statistics armed
+    /// pre-boot, is hinting on, is there a virtio-mem device — without relying
+    /// on classifying an error status, and without needing the guest driver to
+    /// have enumerated yet.
+    pub async fn vm_config(&self) -> Result<FullVmConfiguration> {
+        self.client
+            .request::<(), FullVmConfiguration>(Method::GET, "/vm/config", None)
+            .await
+            .context("Failed to read VM configuration")
+    }
+
+    /// Reads the guest-reported balloon statistics.
+    ///
+    /// Returns whatever the guest last pushed at its polling interval, so the
+    /// sample is up to one interval stale, and the first sample after a resume
+    /// may be older still. Fails with a 400 when statistics were not armed
+    /// before boot; they cannot be turned on afterwards.
+    pub async fn balloon_statistics(&self) -> Result<BalloonStats> {
+        self.client
+            .request::<(), BalloonStats>(Method::GET, "/balloon/statistics", None)
+            .await
+            .context("Failed to read balloon statistics")
+    }
+
+    /// Asks the guest to begin declaring its free pages.
+    ///
+    /// The guest answers asynchronously; poll
+    /// [`free_page_hinting_status`][Self::free_page_hinting_status] for
+    /// completion. With `acknowledge_on_stop` Firecracker acknowledges the
+    /// guest's done command itself, so the host does not have to race it.
+    pub async fn start_free_page_hinting(&self, acknowledge_on_stop: bool) -> Result<()> {
+        let cmd = BalloonStartCmd {
+            acknowledge_on_stop: Some(acknowledge_on_stop),
+        };
+        self.client
+            .request_no_content(Method::PATCH, "/balloon/hinting/start", Some(&cmd))
+            .await
+            .context("Failed to start free page hinting")
+    }
+
+    /// Reads the free-page-hinting handshake counters.
+    ///
+    /// The run is complete once `guest_cmd` has caught up with `host_cmd`. A
+    /// `guest_cmd` of `None` means the guest has not answered at all — which
+    /// is what a paused VM always reports, because a stopped vCPU cannot drain
+    /// the balloon queue.
+    pub async fn free_page_hinting_status(&self) -> Result<BalloonHintingStatus> {
+        self.client
+            .request::<(), BalloonHintingStatus>(Method::GET, "/balloon/hinting/status", None)
+            .await
+            .context("Failed to read free page hinting status")
+    }
+
+    /// Moves the virtio-mem device's requested size.
+    ///
+    /// The guest services the request asynchronously by plugging or unplugging
+    /// blocks, so `plugged_size_mib` trails `requested_size_mib` and may never
+    /// reach it — read
+    /// [`memory_hotplug_status`][Self::memory_hotplug_status] to see where it
+    /// actually landed.
+    pub async fn patch_memory_hotplug(&self, requested_mib: u32) -> Result<()> {
+        let update = MemoryHotplugSizeUpdate {
+            requested_size_mib: Some(
+                i32::try_from(requested_mib)
+                    .context("hot-plug memory target does not fit in i32 MiB")?,
+            ),
+        };
+        self.client
+            .request_no_content(Method::PATCH, "/hotplug/memory", Some(&update))
+            .await
+            .context("Failed to update hot-plug memory size")
+    }
+
+    /// Reads the virtio-mem device's geometry and current plugged size.
+    pub async fn memory_hotplug_status(&self) -> Result<MemoryHotplugStatus> {
+        self.client
+            .request::<(), MemoryHotplugStatus>(Method::GET, "/hotplug/memory", None)
+            .await
+            .context("Failed to read hot-plug memory status")
+    }
+
+    /// Ends the current free-page-hinting run.
+    pub async fn stop_free_page_hinting(&self) -> Result<()> {
+        self.client
+            .request_no_content(Method::PATCH, "/balloon/hinting/stop", None::<&()>)
+            .await
+            .context("Failed to stop free page hinting")
     }
 
     /// Starts the microVM.
@@ -613,6 +717,235 @@ mod tests {
     use super::*;
     use std::process::Command as StdCommand;
     use tempfile::tempdir;
+
+    use super::super::socket::fake::{FakeFirecracker, FakeReply};
+    use hyper::StatusCode;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+
+    fn balloon_config(
+        stats_polling_interval_s: u32,
+        free_page_hinting: bool,
+    ) -> crate::cfg::BalloonConfig {
+        crate::cfg::BalloonConfig {
+            stats_polling_interval_s,
+            free_page_hinting,
+            free_page_hinting_on_capture: false,
+            free_page_hinting_timeout_ms: 200,
+        }
+    }
+
+    #[tokio::test]
+    async fn set_balloon_arms_the_configured_statistics_and_hinting_features() -> Result<()> {
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let fake = FakeFirecracker::spawn(&instance.socket_path, |_method, _path| {
+            FakeReply::no_content()
+        })?;
+
+        instance.set_balloon(&balloon_config(5, true)).await?;
+
+        let body = fake.body_of("/balloon").expect("balloon PUT recorded");
+        assert_eq!(body["stats_polling_interval_s"], 5);
+        assert_eq!(body["free_page_hinting"], true);
+        assert_eq!(body["free_page_reporting"], true);
+        // The balloon is a reporting device. Inflating it would fight the
+        // in-guest DAMON watermarks, so the target size is always zero.
+        assert_eq!(body["amount_mib"], 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn set_balloon_omits_statistics_when_the_interval_is_zero() -> Result<()> {
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let fake = FakeFirecracker::spawn(&instance.socket_path, |_method, _path| {
+            FakeReply::no_content()
+        })?;
+
+        instance.set_balloon(&balloon_config(0, false)).await?;
+
+        let body = fake.body_of("/balloon").expect("balloon PUT recorded");
+        assert!(
+            body.get("stats_polling_interval_s").is_none(),
+            "a zero interval must leave the field off the wire, not send zero: {body}"
+        );
+        assert!(body.get("free_page_hinting").is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vm_config_reports_the_devices_the_vm_actually_has() -> Result<()> {
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let _fake = FakeFirecracker::spawn(&instance.socket_path, |_method, path| {
+            assert_eq!(path, "/vm/config");
+            FakeReply::json(serde_json::json!({
+                "balloon": {
+                    "amount_mib": 0,
+                    "deflate_on_oom": true,
+                    "stats_polling_interval_s": 1,
+                    "free_page_hinting": true,
+                },
+            }))
+        })?;
+
+        let config = instance.vm_config().await?;
+        let balloon = config.balloon.expect("balloon device reported");
+        assert_eq!(balloon.stats_polling_interval_s, Some(1));
+        assert_eq!(balloon.free_page_hinting, Some(true));
+        assert!(config.memory_hotplug.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn free_page_hinting_status_reports_the_handshake_counters() -> Result<()> {
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let _fake = FakeFirecracker::spawn(&instance.socket_path, |_method, path| match path {
+            "/balloon/hinting/start" => FakeReply::no_content(),
+            "/balloon/hinting/status" => {
+                FakeReply::json(serde_json::json!({"host_cmd": 3, "guest_cmd": 3}))
+            }
+            other => panic!("unexpected path {other}"),
+        })?;
+
+        instance.start_free_page_hinting(true).await?;
+        let status = instance.free_page_hinting_status().await?;
+
+        assert_eq!(status.host_cmd, 3);
+        assert_eq!(status.guest_cmd, Some(3));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn balloon_statistics_surface_the_guest_pressure_counters() -> Result<()> {
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let _fake = FakeFirecracker::spawn(&instance.socket_path, |_method, _path| {
+            FakeReply::json(serde_json::json!({
+                "target_pages": 0,
+                "actual_pages": 0,
+                "target_mib": 0,
+                "actual_mib": 0,
+                "available_memory": 512_000_000,
+                "total_memory": 1_024_000_000,
+                "alloc_stall": 7,
+                "oom_kill": 1,
+            }))
+        })?;
+
+        let stats = instance.balloon_statistics().await?;
+
+        assert_eq!(stats.available_memory, Some(512_000_000));
+        assert_eq!(stats.alloc_stall, Some(7));
+        assert_eq!(stats.oom_kill, Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn balloon_statistics_fail_when_they_were_never_armed() -> Result<()> {
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let _fake = FakeFirecracker::spawn(&instance.socket_path, |_method, _path| {
+            FakeReply::bad_request("balloon device statistics are not enabled")
+        })?;
+
+        let err = instance
+            .balloon_statistics()
+            .await
+            .expect_err("statistics disabled pre-boot must surface as an error");
+
+        assert!(err.to_string().contains("balloon statistics"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn patch_memory_hotplug_sends_the_requested_size() -> Result<()> {
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let fake = FakeFirecracker::spawn(&instance.socket_path, |_method, _path| {
+            FakeReply::no_content()
+        })?;
+
+        instance.patch_memory_hotplug(768).await?;
+
+        let body = fake
+            .body_of("/hotplug/memory")
+            .expect("hotplug PATCH recorded");
+        assert_eq!(body["requested_size_mib"], 768);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_hotplug_status_reports_plugged_and_requested_sizes() -> Result<()> {
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let _fake = FakeFirecracker::spawn(&instance.socket_path, |_method, _path| {
+            FakeReply::json(serde_json::json!({
+                "total_size_mib": 2048,
+                "plugged_size_mib": 512,
+                "requested_size_mib": 1024,
+            }))
+        })?;
+
+        let status = instance.memory_hotplug_status().await?;
+
+        assert_eq!(status.plugged_size_mib, Some(512));
+        assert_eq!(status.requested_size_mib, Some(1024));
+        Ok(())
+    }
+
+    /// The status endpoint must be polled, not read once: the guest raises
+    /// `guest_cmd` on its own schedule and a single read almost always lands
+    /// before it has.
+    #[tokio::test]
+    async fn hinting_status_is_polled_until_the_guest_catches_up() -> Result<()> {
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let polls = Arc::new(AtomicUsize::new(0));
+        let server_polls = Arc::clone(&polls);
+        let _fake = FakeFirecracker::spawn(&instance.socket_path, move |_method, path| {
+            if path != "/balloon/hinting/status" {
+                return FakeReply::no_content();
+            }
+            let seen = server_polls.fetch_add(1, AtomicOrdering::SeqCst);
+            let guest_cmd = if seen >= 2 { 1 } else { 0 };
+            FakeReply::json(serde_json::json!({"host_cmd": 1, "guest_cmd": guest_cmd}))
+        })?;
+
+        let mut completed = false;
+        for _ in 0..10 {
+            let status = instance.free_page_hinting_status().await?;
+            if status.guest_cmd == Some(status.host_cmd) {
+                completed = true;
+                break;
+            }
+        }
+
+        assert!(completed, "guest never caught up");
+        assert!(polls.load(AtomicOrdering::SeqCst) >= 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stop_free_page_hinting_sends_an_empty_patch() -> Result<()> {
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        let fake = FakeFirecracker::spawn(&instance.socket_path, |_method, _path| FakeReply {
+            status: StatusCode::OK,
+            body: Vec::new(),
+        })?;
+
+        instance.stop_free_page_hinting().await?;
+
+        let recorded = fake.requests();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].method, "PATCH");
+        assert_eq!(recorded[0].path, "/balloon/hinting/stop");
+        assert!(recorded[0].body.is_empty());
+        Ok(())
+    }
 
     #[tokio::test]
     async fn wait_for_ready_times_out_when_socket_never_appears() {

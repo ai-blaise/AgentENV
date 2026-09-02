@@ -73,6 +73,91 @@ var (
 			Buckets: []float64{0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512},
 		},
 	)
+	// The node-state stream: what one replica told the others about the nodes
+	// only it heard from. None of these carries a node label — the fleet is the
+	// unit here, and a per-node series would be unbounded at fleet scale.
+	schedulerNodeStreamPublishedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_node_stream_published_total",
+			Help: "Node state events this replica published for other replicas.",
+		},
+	)
+	schedulerNodeStreamDroppedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_node_stream_dropped_total",
+			Help: "Node state events lost rather than published or read, by reason.",
+		},
+		[]string{"reason"},
+	)
+	// The outcomes are exclusive: every event read counts once. Whether its
+	// stamp had to be pulled back into this replica's clock is a separate
+	// question about the same event, and has its own counter below.
+	schedulerNodeStreamAppliedTotal = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_node_stream_applied_total",
+			Help: "Replicated node state events by what this replica did with them.",
+		},
+		[]string{"outcome"},
+	)
+	// schedulerNodeStreamClampedTotal counts events whose stamp sat outside
+	// this replica's own clock by more than the skew window. A steady rate is
+	// replicas whose clocks disagree, which makes every freshness decision on
+	// this replica wrong by that much.
+	schedulerNodeStreamClampedTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_node_stream_clamped_total",
+			Help: "Replicated node state events whose freshness stamp was pulled back into the local clock's range.",
+		},
+	)
+	// schedulerNodeStreamLagSeconds is how long ago the publishing replica saw
+	// the node whose state is being applied. It is the single number that says
+	// whether the replicas are converged: a p99 approaching the report TTL means
+	// followers are placing on a view the health gate is about to discard.
+	schedulerNodeStreamLagSeconds = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "agentenv_scheduler_node_stream_lag_seconds",
+			Help:    "Age of a replicated node state event when this replica applied it.",
+			Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60},
+		},
+	)
+	// schedulerNodeStreamWarmupIncomplete is set when a starting replica could
+	// not read back a full report TTL of history, so some live node may be
+	// missing from its registry until that node's next heartbeat.
+	schedulerNodeStreamWarmupIncomplete = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agentenv_scheduler_node_stream_warmup_incomplete",
+			Help: "1 when this replica started without replaying a full report TTL of node state.",
+		},
+	)
+	// schedulerRegistryNodes splits the observed fleet by how this replica came
+	// by it. On a converged fleet the rpc series is the replica's own share of
+	// the nodes and the two series sum to the fleet.
+	schedulerRegistryNodes = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "agentenv_scheduler_registry_nodes",
+			Help: "Observed nodes by how this replica learned of them.",
+		},
+		[]string{"source"},
+	)
+	// schedulerStoreReachable is what the readiness probe reads. A replica that
+	// cannot reach its binding store answers every routing lookup with an
+	// error, and gRPC's round-robin balancer keeps sending it a share of them
+	// because an application error leaves the subchannel ready.
+	schedulerStoreReachable = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "agentenv_scheduler_store_reachable",
+			Help: "1 when this scheduler's binding store answered its last probe.",
+		},
+	)
+	// schedulerMode reports which mode this process runs in, so a dashboard
+	// shows a stray primary running beside the replicas.
+	schedulerMode = promauto.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "agentenv_scheduler_mode",
+			Help: "1 for the mode this scheduler process is running in.",
+		},
+		[]string{"mode"},
+	)
 	// schedulerP2PArtifactEvictionsTotal counts artifact keys the index
 	// dropped for capacity. A non-zero rate means the fleet publishes more
 	// distinct artifacts than scheduler.artifact_store_capacity holds, and

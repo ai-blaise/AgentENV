@@ -1601,6 +1601,310 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<DiskSizeMb> 
     }
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct DrainProgress {
+    /// Sandboxes on this node that are not paused yet. Zero means nothing is lost by stopping the process.
+    #[serde(rename = "remaining")]
+    pub remaining: u32,
+
+    /// Paused sandboxes this pass committed to the repository, so another node can take them over.
+    #[serde(rename = "published")]
+    pub published: u32,
+
+    /// Sandboxes this pass tried and could not pause or publish.
+    #[serde(rename = "failed")]
+    pub failed: u32,
+}
+
+impl DrainProgress {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(remaining: u32, published: u32, failed: u32) -> DrainProgress {
+        DrainProgress {
+            remaining,
+            published,
+            failed,
+        }
+    }
+}
+
+/// Converts the DrainProgress value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for DrainProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("remaining".to_string()),
+            Some(self.remaining.to_string()),
+            Some("published".to_string()),
+            Some(self.published.to_string()),
+            Some("failed".to_string()),
+            Some(self.failed.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a DrainProgress value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for DrainProgress {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub remaining: Vec<u32>,
+            pub published: Vec<u32>,
+            pub failed: Vec<u32>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing DrainProgress".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "remaining" => intermediate_rep.remaining.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "published" => intermediate_rep.published.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "failed" => intermediate_rep.failed.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing DrainProgress".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(DrainProgress {
+            remaining: intermediate_rep
+                .remaining
+                .into_iter()
+                .next()
+                .ok_or_else(|| "remaining missing in DrainProgress".to_string())?,
+            published: intermediate_rep
+                .published
+                .into_iter()
+                .next()
+                .ok_or_else(|| "published missing in DrainProgress".to_string())?,
+            failed: intermediate_rep
+                .failed
+                .into_iter()
+                .next()
+                .ok_or_else(|| "failed missing in DrainProgress".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<DrainProgress> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<DrainProgress>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<DrainProgress>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for DrainProgress - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<DrainProgress> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <DrainProgress as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into DrainProgress - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct DrainRequest {
+    /// How long this pass may spend pausing and publishing. Omitted, the node's own configured deadline applies. A pass reports what is left rather than running to completion, so the caller polls.
+    #[serde(rename = "deadlineMs")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<u64>,
+}
+
+impl DrainRequest {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new() -> DrainRequest {
+        DrainRequest { deadline_ms: None }
+    }
+}
+
+/// Converts the DrainRequest value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for DrainRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            self.deadline_ms
+                .as_ref()
+                .map(|deadline_ms| ["deadlineMs".to_string(), deadline_ms.to_string()].join(",")),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a DrainRequest value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for DrainRequest {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub deadline_ms: Vec<u64>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing DrainRequest".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "deadlineMs" => intermediate_rep.deadline_ms.push(
+                        <u64 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing DrainRequest".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(DrainRequest {
+            deadline_ms: intermediate_rep.deadline_ms.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<DrainRequest> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<DrainRequest>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<DrainRequest>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for DrainRequest - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<DrainRequest> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <DrainRequest as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into DrainRequest - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
 /// Version of the envd running in the sandbox
 #[derive(Debug, Clone, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]

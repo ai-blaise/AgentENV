@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{anyhow, Result};
 #[cfg(test)]
@@ -18,14 +18,256 @@ use warm_pool::{PoolConfig, PoolMaintenanceAction, WarmPool};
 /// How often [`NetworkManager::prime`] rechecks the pool while filling.
 const POOL_PRIME_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+use crate::observability::prometheus::MetricGuard;
+
 use super::egress_proxy::EgressProxy;
-use super::iptables_util::{apply_iptables_commands, IptablesRestoreCommand, OpenFailurePolicy};
+use super::iptables_util::{
+    apply_iptables_commands, iptables_backend, IptablesRestoreCommand, OpenFailurePolicy,
+};
 use super::{NetworkAddressPlan, NetworkError, Slot, HOST_VETH_PREFIX, MAX_SLOTS};
 
 const CONFLICT_SAMPLE_LIMIT: usize = 5;
+/// Latency of a whole slot operation: what the throughput harness reads its
+/// percentiles from.
+const SLOT_OPERATION_DURATION: &str = "agentenv_network_slot_operation_duration_seconds";
 const ERR_SHUTTING_DOWN: &str = "Network manager is shutting down";
 
-static HOST_IPTABLES_INSTALLED: AtomicBool = AtomicBool::new(false);
+/// Publication state for the five global host rules.
+///
+/// A module of its own so `installed` has exactly one writer: publishing the
+/// flag first and applying afterwards let a concurrent filler build a slot
+/// whose namespace SNATs into the host-interaction CIDR while the host
+/// INPUT/FORWARD/MASQUERADE rules that make that traffic legal were still
+/// being written — rare with one filler, routine once refill runs several at
+/// a time. Outside this module the flag can only be raised by completing an
+/// apply.
+mod host_iptables_gate {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    use anyhow::Result;
+
+    pub(super) struct GlobalHostIptables {
+        installed: AtomicBool,
+        install_gate: Mutex<()>,
+    }
+
+    impl GlobalHostIptables {
+        pub(super) const fn new() -> Self {
+            Self {
+                installed: AtomicBool::new(false),
+                install_gate: Mutex::new(()),
+            }
+        }
+
+        pub(super) fn is_installed(&self) -> bool {
+            self.installed.load(Ordering::Acquire)
+        }
+
+        /// Runs `apply` once for the process, with losers blocked until it
+        /// commits.
+        ///
+        /// A failed apply leaves the flag down and the gate open, so the next
+        /// caller retries: the rules are the precondition for every slot, and a
+        /// node that gave up on them once would serve broken sandboxes forever.
+        pub(super) fn install_once(&self, apply: impl FnOnce() -> Result<()>) -> Result<()> {
+            if self.is_installed() {
+                return Ok(());
+            }
+
+            let _gate = self
+                .install_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if self.is_installed() {
+                return Ok(());
+            }
+
+            apply()?;
+            self.installed.store(true, Ordering::Release);
+            Ok(())
+        }
+
+        /// Clears the flag, reporting whether the rules were installed.
+        pub(super) fn take_installed(&self) -> bool {
+            self.installed.swap(false, Ordering::AcqRel)
+        }
+    }
+}
+
+use host_iptables_gate::GlobalHostIptables;
+
+static HOST_IPTABLES: GlobalHostIptables = GlobalHostIptables::new();
+
+/// How long shutdown waits for detached slot releases to finish.
+const BACKGROUND_RELEASE_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Slot releases handed off by `Drop`.
+///
+/// `Drop` cannot await, and releasing inline parks whatever thread runs it for
+/// a veth delete plus an umount loop — on the sandbox drop path, a Tokio
+/// worker. Detaching the work outright is worse: between the handoff and its
+/// completion the slot is in neither the warm pool nor the bitmap, so a
+/// shutdown racing it leaks the veth and the namespace mount, and the next
+/// boot's `reserve_existing_host_veth_slots` turns that leak into a
+/// permanently burned slot index. Shutdown therefore waits for them.
+struct BackgroundReleases {
+    tally: Mutex<ReleaseTally>,
+    drained: std::sync::Condvar,
+}
+
+/// Releases handed to the pool, outstanding and in total.
+///
+/// The total is what distinguishes a release that was tracked and has since
+/// finished from one that was never handed here at all: `in_flight` reads zero
+/// for both.
+struct ReleaseTally {
+    in_flight: usize,
+    handed_off: u64,
+}
+
+impl BackgroundReleases {
+    const fn new() -> Self {
+        Self {
+            tally: Mutex::new(ReleaseTally {
+                in_flight: 0,
+                handed_off: 0,
+            }),
+            drained: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Runs `release` on the blocking pool, or inline when there is no runtime
+    /// to hand it to — `Drop` also runs from plain threads and from the
+    /// process-exit hook.
+    fn spawn(&'static self, release: impl FnOnce() + Send + 'static) {
+        {
+            let mut tally = self
+                .tally
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            tally.in_flight += 1;
+            tally.handed_off += 1;
+        }
+
+        let run = move || {
+            release();
+            self.finish();
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn_blocking(run);
+            }
+            Err(_) => run(),
+        }
+    }
+
+    fn finish(&self) {
+        let mut tally = self
+            .tally
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tally.in_flight = tally.in_flight.saturating_sub(1);
+        if tally.in_flight == 0 {
+            self.drained.notify_all();
+        }
+    }
+
+    /// Waits for the outstanding releases, reporting whether they all finished.
+    fn drain(&self, timeout: Duration) -> bool {
+        let tally = self
+            .tally
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (tally, _) = self
+            .drained
+            .wait_timeout_while(tally, timeout, |tally| tally.in_flight > 0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tally.in_flight == 0
+    }
+
+    /// Every release handed to the pool so far.
+    #[cfg(test)]
+    fn handed_off(&self) -> u64 {
+        self.tally
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .handed_off
+    }
+}
+
+static BACKGROUND_RELEASES: BackgroundReleases = BackgroundReleases::new();
+
+/// Shortest pause after a failed refill batch.
+const FILL_BACKOFF_MIN: Duration = Duration::from_millis(50);
+/// Longest pause after repeated refill failures.
+const FILL_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// Longest a declined maintenance cycle sleeps before returning.
+///
+/// The worker re-enters immediately while the pool is below its target, so the
+/// pause has to happen inside the cycle. Capping it keeps the stop flag —
+/// checked between cycles — visible within this long at shutdown.
+const FILL_DECLINE_SLEEP_MAX: Duration = Duration::from_millis(100);
+
+/// Whether a refill batch may run now.
+///
+/// A failing fill is otherwise an unthrottled spin: the maintenance worker
+/// recomputes its action, still finds the pool below target, and re-enters with
+/// no sleep — forking `iptables-restore` and running a dozen RTNL operations
+/// per iteration for as long as whatever broke stays broken. Exhaustion is
+/// worse than slow: no amount of retrying produces a slot index that is not
+/// there, so it is latched off entirely until one is returned.
+#[derive(Debug)]
+struct FillGate {
+    next_allowed_at_millis: AtomicU64,
+    backoff_millis: AtomicU64,
+    slots_exhausted: AtomicBool,
+}
+
+impl FillGate {
+    const fn new() -> Self {
+        Self {
+            next_allowed_at_millis: AtomicU64::new(0),
+            backoff_millis: AtomicU64::new(0),
+            slots_exhausted: AtomicBool::new(false),
+        }
+    }
+
+    /// `None` when a fill may run, otherwise how long the caller should wait.
+    fn blocked_for(&self, now_millis: u64) -> Option<Duration> {
+        if self.slots_exhausted.load(Ordering::Acquire) {
+            // Not a duration: only a returned slot can clear this.
+            return Some(FILL_DECLINE_SLEEP_MAX);
+        }
+        let next = self.next_allowed_at_millis.load(Ordering::Acquire);
+        (next > now_millis).then(|| Duration::from_millis(next - now_millis))
+    }
+
+    fn record_failure(&self, now_millis: u64) {
+        let previous = self.backoff_millis.load(Ordering::Acquire);
+        let next = if previous == 0 {
+            FILL_BACKOFF_MIN.as_millis() as u64
+        } else {
+            (previous.saturating_mul(2)).min(FILL_BACKOFF_MAX.as_millis() as u64)
+        };
+        self.backoff_millis.store(next, Ordering::Release);
+        self.next_allowed_at_millis
+            .store(now_millis.saturating_add(next), Ordering::Release);
+    }
+
+    fn record_success(&self) {
+        self.backoff_millis.store(0, Ordering::Release);
+        self.next_allowed_at_millis.store(0, Ordering::Release);
+    }
+
+    fn note_slots_exhausted(&self) {
+        self.slots_exhausted.store(true, Ordering::Release);
+    }
+
+    fn note_slot_returned(&self) {
+        self.slots_exhausted.store(false, Ordering::Release);
+    }
+}
 
 static MANAGER: OnceLock<NetworkManager> = OnceLock::new();
 
@@ -83,6 +325,13 @@ pub(crate) struct NetworkManager {
 
     /// Slots built concurrently per refill batch.
     fill_concurrency: usize,
+
+    /// Throttles refill after a failure, and stops it entirely when the slot
+    /// space is exhausted.
+    fill_gate: FillGate,
+
+    /// Monotonic base for [`FillGate`]'s millisecond deadlines.
+    started_at: std::time::Instant,
 }
 
 /// Network slot capacity as admission control needs to read it.
@@ -170,12 +419,14 @@ impl NetworkManager {
         let manager = Self {
             allocated: AtomicBitSet::new(),
             allocated_count: AtomicUsize::new(0),
-            pool: WarmPool::new(config.pool),
+            pool: WarmPool::named(config.pool, "network"),
             address_plan: config.address_plan,
             netns_dir: config.netns_dir,
             egress_proxy,
             shutting_down: AtomicBool::new(false),
             fill_concurrency: config.fill_concurrency.max(1),
+            fill_gate: FillGate::new(),
+            started_at: std::time::Instant::now(),
         };
 
         // Reserve slot 0 (invalid for IP addresses)
@@ -273,8 +524,15 @@ impl NetworkManager {
     }
 
     /// Takes the next free bit, keeping [`Self::allocated_count`] in step.
+    ///
+    /// Exhaustion is latched here rather than at the call site: the bitmap is
+    /// where it is discovered, and every caller wants refill to stop until a
+    /// slot comes back.
     fn take_next_slot_bit(&self) -> Option<usize> {
-        let idx = self.allocated.set_next_free_bit()?;
+        let Some(idx) = self.allocated.set_next_free_bit() else {
+            self.fill_gate.note_slots_exhausted();
+            return None;
+        };
         self.allocated_count.fetch_add(1, Ordering::Relaxed);
         Some(idx)
     }
@@ -287,6 +545,7 @@ impl NetworkManager {
         let was_set = self.allocated.remove(idx)?;
         if was_set {
             self.allocated_count.fetch_sub(1, Ordering::Relaxed);
+            self.fill_gate.note_slot_returned();
         }
         Some(was_set)
     }
@@ -362,7 +621,14 @@ impl NetworkManager {
         self.cleanup_slot_and_release_bit_inner(slot, false)
     }
 
-    fn cleanup_slot_and_release_bit_inner(&self, mut slot: Slot, sync_cleanup: bool) -> Result<()> {
+    fn cleanup_slot_and_release_bit_inner(&self, slot: Slot, sync_cleanup: bool) -> Result<()> {
+        let mut metric = MetricGuard::operation(SLOT_OPERATION_DURATION, "cleanup");
+        let result = self.cleanup_slot_and_release_bit_timed(slot, sync_cleanup);
+        metric.finish(&result);
+        result
+    }
+
+    fn cleanup_slot_and_release_bit_timed(&self, mut slot: Slot, sync_cleanup: bool) -> Result<()> {
         let idx = slot.idx;
         let cleanup_result = slot.cleanup(sync_cleanup);
         let bitset_result = self.release_slot_bit(idx);
@@ -420,13 +686,23 @@ impl NetworkManager {
     }
 
     fn allocate_fresh_slot(&self) -> Result<Slot> {
+        let mut metric = MetricGuard::operation(SLOT_OPERATION_DURATION, "allocate_fresh");
+        let result = self.allocate_fresh_slot_inner();
+        metric.finish(&result);
+        result
+    }
+
+    fn allocate_fresh_slot_inner(&self) -> Result<Slot> {
         if self.shutting_down() {
             return Err(anyhow!(ERR_SHUTTING_DOWN));
         }
 
-        // Ensure global host iptables rules are installed before allocating slots.
-        // If the initial install failed (e.g., permission denied), retry once.
-        if !HOST_IPTABLES_INSTALLED.load(Ordering::Acquire) {
+        // The global host rules are the precondition for every slot, so a slot
+        // is never built before they are published. If the install at manager
+        // construction failed — most often for want of CAP_NET_ADMIN — this
+        // retries it, and a concurrent filler waits for that attempt rather
+        // than proceeding against a half-written chain.
+        if !HOST_IPTABLES.is_installed() {
             self.install_global_host_iptables()
                 .map_err(NetworkError::HostIptablesError)?;
         }
@@ -486,6 +762,7 @@ impl NetworkManager {
     /// linearly.
     fn fill_warm_slots(&self, to_fill: usize) -> Result<()> {
         let mut remaining = to_fill;
+        let mut cleanup_failures: Vec<String> = Vec::new();
         while remaining > 0 && !self.shutting_down() {
             let batch = remaining.min(self.fill_concurrency);
             let results: Vec<Result<Slot>> = std::thread::scope(|scope| {
@@ -513,7 +790,15 @@ impl NetworkManager {
                                 pool_len = self.pool.len(),
                                 "refilled warm network slot"
                             ),
-                            Err(slot) => self.cleanup_slot_and_release_bit(slot)?,
+                            // Accumulated rather than propagated: one slot that
+                            // will not clean up must not abandon the peers
+                            // built beside it in the same batch, which are
+                            // holding bitmap bits and kernel devices.
+                            Err(slot) => {
+                                if let Err(err) = self.cleanup_slot_and_release_bit(slot) {
+                                    cleanup_failures.push(format!("slot {slot_idx}: {err}"));
+                                }
+                            }
                         }
                     }
                     Err(err) => {
@@ -524,17 +809,34 @@ impl NetworkManager {
             }
 
             if saw_failure {
-                // Stop this cycle rather than spinning: the maintenance worker
-                // will try again on its next tick. A tight retry here would
-                // hammer whatever is failing — most often slot exhaustion or
-                // the xtables lock — for as long as it stays broken.
-                metrics::counter!("agentenv_pool_refill_failures_total", "pool" => "network")
-                    .increment(1);
+                // Stop this cycle rather than continuing: the next attempt is
+                // paced by `fill_gate`, so a persistent failure costs one batch
+                // per backoff interval instead of a full core.
+                self.fill_gate.record_failure(self.now_millis());
+                metrics::counter!(
+                    "agentenv_pool_fill_total",
+                    "pool" => "network",
+                    "status" => "error",
+                )
+                .increment(1);
                 break;
             }
+            metrics::counter!(
+                "agentenv_pool_fill_total",
+                "pool" => "network",
+                "status" => "ok",
+            )
+            .increment(batch as u64);
+            self.fill_gate.record_success();
             remaining -= batch;
         }
-        Ok(())
+
+        slot_cleanup_result(cleanup_failures)
+    }
+
+    /// Milliseconds since this manager was constructed, for [`FillGate`].
+    fn now_millis(&self) -> u64 {
+        self.started_at.elapsed().as_millis() as u64
     }
 
     fn run_pool_maintenance_cycle(&self) -> Result<()> {
@@ -543,21 +845,35 @@ impl NetworkManager {
 
         match action {
             PoolMaintenanceAction::Fill(to_fill) => {
+                if let Some(wait) = self.fill_gate.blocked_for(self.now_millis()) {
+                    // Slept here, not returned immediately: the worker re-enters
+                    // as long as the pool is below target, so returning would
+                    // turn the backoff into a busy loop.
+                    std::thread::sleep(wait.min(FILL_DECLINE_SLEEP_MAX));
+                    return Ok(());
+                }
                 self.fill_warm_slots(to_fill)?;
             }
             PoolMaintenanceAction::Drain(to_drain) => {
+                let mut cleanup_failures: Vec<String> = Vec::new();
                 for _ in 0..to_drain {
                     let maybe_slot = self.pool.try_drain_one();
                     let Some(slot) = maybe_slot else {
                         break;
                     };
                     let slot_idx = slot.idx;
-                    self.cleanup_slot_and_release_bit(slot)?;
+                    if let Err(err) = self.cleanup_slot_and_release_bit(slot) {
+                        cleanup_failures.push(format!("slot {slot_idx}: {err}"));
+                        continue;
+                    }
+                    metrics::counter!("agentenv_pool_drain_total", "pool" => "network")
+                        .increment(1);
                     trace!(
                         slot = slot_idx,
                         "drained excess warm network slot from pool"
                     );
                 }
+                slot_cleanup_result(cleanup_failures)?;
             }
             PoolMaintenanceAction::Idle => {}
         }
@@ -575,9 +891,25 @@ impl NetworkManager {
     /// When pool maintenance is disabled, this keeps the previous bounded-pool
     /// behavior and cleans up immediately once the pool reaches high watermark.
     pub fn release(&self, slot: Slot) -> Result<()> {
+        let mut metric = MetricGuard::operation(SLOT_OPERATION_DURATION, "release");
         let result = self.release_slot(slot);
+        metric.finish(&result);
         self.publish_pool_metrics();
         result
+    }
+
+    /// Releases a slot from a context that cannot await.
+    ///
+    /// The work is the same as [`Self::release`]; only the thread it runs on
+    /// differs. Tracked so [`Self::shutdown`] can wait for it rather than
+    /// racing it.
+    pub fn release_detached(&'static self, slot: Slot) {
+        let slot_idx = slot.idx;
+        BACKGROUND_RELEASES.spawn(move || {
+            if let Err(err) = self.release(slot) {
+                warn!(slot = slot_idx, error = %err, "background network slot release failed");
+            }
+        });
     }
 
     fn release_slot(&self, slot: Slot) -> Result<()> {
@@ -611,6 +943,15 @@ impl NetworkManager {
 
     fn shutdown_inner(&self, sync_cleanup: bool) -> Result<()> {
         self.shutting_down.store(true, Ordering::Release);
+        // Before draining the pool: a release still in flight owns a slot that
+        // is in neither the pool nor the bitmap, and cleaning up around it
+        // would leave its veth and namespace mount behind.
+        if !BACKGROUND_RELEASES.drain(BACKGROUND_RELEASE_DRAIN_TIMEOUT) {
+            warn!(
+                timeout_ms = BACKGROUND_RELEASE_DRAIN_TIMEOUT.as_millis(),
+                "background network slot releases did not finish before shutdown"
+            );
+        }
         let drained_slots = self.pool.drain_all();
         let had_slots = !drained_slots.is_empty();
         let mut failures = Vec::new();
@@ -754,26 +1095,15 @@ impl NetworkManager {
     }
 
     fn install_global_host_iptables(&self) -> Result<()> {
-        if HOST_IPTABLES_INSTALLED.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-
-        let commands = global_host_iptables_commands(self.address_plan.host_interaction_cidr());
-
-        match apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr) {
-            Ok(()) => {
-                debug!("installed global host iptables rules for sandbox networking");
-                Ok(())
-            }
-            Err(e) => {
-                HOST_IPTABLES_INSTALLED.store(false, Ordering::Release);
-                Err(e)
-            }
-        }
+        install_host_iptables(
+            &HOST_IPTABLES,
+            self.address_plan.host_interaction_cidr(),
+            apply_global_host_iptables,
+        )
     }
 
     fn cleanup_global_host_iptables(&self) {
-        if !HOST_IPTABLES_INSTALLED.swap(false, Ordering::AcqRel) {
+        if !HOST_IPTABLES.take_installed() {
             return;
         }
 
@@ -787,6 +1117,46 @@ impl NetworkManager {
             warn!(error = %e, "failed to cleanup global host iptables rules");
         }
     }
+}
+
+/// Publishes the global host rules through `state`, once per process.
+///
+/// `state` and `apply` are parameters rather than the static and the real
+/// restore so the ordering can be exercised where production reads it: an
+/// applier that reports what the flag looked like while it ran is the only way
+/// to see the flag being raised before the rules commit, and a test that drives
+/// `install_once` with a state of its own cannot see it at all.
+fn install_host_iptables(
+    state: &GlobalHostIptables,
+    host_interaction_cidr: Ipv4Network,
+    apply: fn(Ipv4Network) -> Result<()>,
+) -> Result<()> {
+    state.install_once(|| apply(host_interaction_cidr))
+}
+
+fn apply_global_host_iptables(host_interaction_cidr: Ipv4Network) -> Result<()> {
+    let commands = global_host_iptables_commands(host_interaction_cidr);
+    apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr)?;
+    // The backend decides whether the lock options on every later restore mean
+    // anything: nft accepts and discards them because it never opens
+    // /run/xtables.lock. Recorded once, where the first restore of the process
+    // has just proved the binary works.
+    info!(
+        backend = iptables_backend().as_str(),
+        "installed global host iptables rules for sandbox networking"
+    );
+    Ok(())
+}
+
+/// Folds per-slot cleanup failures into one error for the cycle.
+fn slot_cleanup_result(failures: Vec<String>) -> Result<()> {
+    if failures.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "network slot cleanup failed: {}",
+        failures.join(" | ")
+    ))
 }
 
 fn global_host_iptables_commands(
@@ -957,17 +1327,40 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    /// Captures gauge sets so a test can read back what was actually emitted.
-    /// Installed per-thread, so it does not disturb the process-wide recorder
-    /// the server installs.
+    /// Captures gauge sets and counter increments so a test can read back what
+    /// was actually emitted. Installed per-thread, so it does not disturb the
+    /// process-wide recorder the server installs.
     #[derive(Default)]
-    struct GaugeSpy {
+    struct MetricSpy {
         gauges: Arc<Mutex<HashMap<String, f64>>>,
+        counters: Arc<Mutex<HashMap<String, u64>>>,
     }
 
     struct SpyGauge {
         name: String,
         gauges: Arc<Mutex<HashMap<String, f64>>>,
+    }
+
+    struct SpyCounter {
+        name: String,
+        counters: Arc<Mutex<HashMap<String, u64>>>,
+    }
+
+    impl metrics::CounterFn for SpyCounter {
+        fn increment(&self, value: u64) {
+            *self
+                .counters
+                .lock()
+                .unwrap()
+                .entry(self.name.clone())
+                .or_default() += value;
+        }
+        fn absolute(&self, value: u64) {
+            self.counters
+                .lock()
+                .unwrap()
+                .insert(self.name.clone(), value);
+        }
     }
 
     impl metrics::GaugeFn for SpyGauge {
@@ -978,7 +1371,7 @@ mod tests {
         }
     }
 
-    impl metrics::Recorder for GaugeSpy {
+    impl metrics::Recorder for MetricSpy {
         fn describe_counter(
             &self,
             _key: metrics::KeyName,
@@ -1002,10 +1395,13 @@ mod tests {
         }
         fn register_counter(
             &self,
-            _key: &metrics::Key,
+            key: &metrics::Key,
             _metadata: &metrics::Metadata<'_>,
         ) -> metrics::Counter {
-            metrics::Counter::noop()
+            metrics::Counter::from_arc(Arc::new(SpyCounter {
+                name: key.name().to_string(),
+                counters: Arc::clone(&self.counters),
+            }))
         }
         fn register_gauge(
             &self,
@@ -1168,7 +1564,7 @@ mod tests {
     /// maintenance off — that worker never starts.
     #[test]
     fn allocation_and_release_publish_the_slot_gauges() {
-        let spy = GaugeSpy::default();
+        let spy = MetricSpy::default();
         let gauges = Arc::clone(&spy.gauges);
         let manager = manager_with_capacity(2);
 
@@ -1886,5 +2282,354 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Publishing the flag before the rules were applied let a second filler
+    /// build a slot against a half-written host chain. The loser must wait for
+    /// the winner's restore to commit, not skip past it.
+    #[test]
+    fn a_second_installer_waits_for_the_first_restore_to_commit() {
+        static STATE: GlobalHostIptables = GlobalHostIptables::new();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        // `Sender`/`Receiver` are `Send` but not `Sync`, and the scoped threads
+        // borrow them.
+        let entered_tx = Mutex::new(entered_tx);
+        let release_rx = Mutex::new(release_rx);
+        let applies = AtomicUsize::new(0);
+        let loser_returned = AtomicBool::new(false);
+
+        std::thread::scope(|scope| {
+            let winner = scope.spawn(|| {
+                STATE.install_once(|| {
+                    applies.fetch_add(1, Ordering::SeqCst);
+                    entered_tx
+                        .lock()
+                        .unwrap()
+                        .send(())
+                        .expect("winner announces it is applying");
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv()
+                        .expect("winner waits to be released");
+                    Ok(())
+                })
+            });
+
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the winner should reach its apply");
+
+            let loser = scope.spawn(|| {
+                let result = STATE.install_once(|| {
+                    applies.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
+                loser_returned.store(true, Ordering::SeqCst);
+                result
+            });
+
+            std::thread::sleep(Duration::from_millis(100));
+            // Observed before releasing the winner: asserting here would leave
+            // the winner blocked inside its apply and the scope would wait for
+            // it forever, turning a failure into a hang.
+            let returned_early = loser_returned.load(Ordering::SeqCst);
+
+            release_tx.send(()).expect("release the winner");
+            winner.join().expect("winner thread").expect("winner apply");
+            loser.join().expect("loser thread").expect("loser apply");
+
+            assert!(
+                !returned_early,
+                "the loser returned while the host rules were still being written"
+            );
+        });
+
+        assert_eq!(
+            applies.load(Ordering::SeqCst),
+            1,
+            "the rules should be applied exactly once per process"
+        );
+        assert!(STATE.is_installed());
+    }
+
+    /// The same ordering, at the static every slot reads. The helper test above
+    /// proves `install_once`'s own logic; this one proves the install the
+    /// manager actually performs publishes through it, rather than raising the
+    /// flag around it.
+    #[test]
+    fn the_global_rules_are_published_only_after_they_commit() {
+        static PROBE_RAN: AtomicBool = AtomicBool::new(false);
+        static FLAG_SEEN_UP: AtomicBool = AtomicBool::new(false);
+
+        fn probe(_host_interaction_cidr: Ipv4Network) -> Result<()> {
+            FLAG_SEEN_UP.store(HOST_IPTABLES.is_installed(), Ordering::SeqCst);
+            PROBE_RAN.store(true, Ordering::SeqCst);
+            // Failing leaves the static exactly as this test found it.
+            Err(anyhow!("probe restore"))
+        }
+
+        // An earlier successful install in this process would short-circuit
+        // before the probe and make the assertions vacuous.
+        let was_installed = HOST_IPTABLES.take_installed();
+        let cidr = NetworkAddressPlan::default().host_interaction_cidr();
+
+        let result = install_host_iptables(&HOST_IPTABLES, cidr, probe);
+
+        if was_installed {
+            let _ = install_host_iptables(&HOST_IPTABLES, cidr, |_| Ok(()));
+        }
+        assert!(result.is_err(), "the probe restore should have failed");
+        assert!(
+            PROBE_RAN.load(Ordering::SeqCst),
+            "the install returned without applying anything"
+        );
+        assert!(
+            !FLAG_SEEN_UP.load(Ordering::SeqCst),
+            "the rules were published while the restore was still being written"
+        );
+    }
+
+    /// The same invariant, driven through the method the node actually calls.
+    ///
+    /// `the_global_rules_are_published_only_after_they_commit` exercises
+    /// `install_host_iptables`, one frame below `install_global_host_iptables`,
+    /// so a version of the latter that publishes first and applies afterwards
+    /// is invisible to it. Asserting on the static after a failed install is
+    /// enough to see that: a publish-before-commit leaves the flag up even
+    /// though nothing was written to the host.
+    #[test]
+    fn a_failed_global_install_leaves_nothing_published() {
+        fn refuse(_host_interaction_cidr: Ipv4Network) -> Result<()> {
+            Err(anyhow!("restore refused"))
+        }
+
+        // An earlier success in this process would short-circuit the install
+        // and make the assertion vacuous.
+        let was_installed = HOST_IPTABLES.take_installed();
+        let cidr = NetworkAddressPlan::default().host_interaction_cidr();
+
+        let result = install_host_iptables(&HOST_IPTABLES, cidr, refuse);
+
+        assert!(
+            result.is_err(),
+            "the probe refused, so the install must fail"
+        );
+        assert!(
+            !HOST_IPTABLES.is_installed(),
+            "a failed restore must leave the global rules unpublished; a flag set \
+             before the apply would claim rules the host never received"
+        );
+
+        if was_installed {
+            let _ = install_host_iptables(&HOST_IPTABLES, cidr, |_| Ok(()));
+        }
+    }
+
+    /// A failed restore must leave the rules unpublished: they are the
+    /// precondition for every slot, so the next caller has to retry rather
+    /// than inherit a claim that nothing honored.
+    #[test]
+    fn a_failed_install_stays_unpublished_and_is_retried() {
+        static STATE: GlobalHostIptables = GlobalHostIptables::new();
+
+        let failed = STATE.install_once(|| Err(anyhow!("iptables-restore failed")));
+        assert!(failed.is_err());
+        assert!(!STATE.is_installed());
+
+        STATE
+            .install_once(|| Ok(()))
+            .expect("the retry should apply");
+        assert!(STATE.is_installed());
+    }
+
+    /// A refill that keeps failing used to re-enter with no sleep at all: the
+    /// worker recomputes its action, still finds the pool below target, and
+    /// runs the whole failing batch again. The pause has to grow, and it has
+    /// to be bounded.
+    #[test]
+    fn a_failing_fill_backs_off_exponentially_between_bounds() {
+        let gate = FillGate::new();
+        assert_eq!(gate.blocked_for(0), None, "a fresh gate allows a fill");
+
+        gate.record_failure(0);
+        assert_eq!(gate.blocked_for(0), Some(FILL_BACKOFF_MIN));
+        assert_eq!(gate.blocked_for(49), Some(Duration::from_millis(1)));
+        assert_eq!(gate.blocked_for(50), None, "the pause must end");
+
+        gate.record_failure(50);
+        assert_eq!(gate.blocked_for(50), Some(Duration::from_millis(100)));
+
+        for failure in 0..20 {
+            gate.record_failure(failure * 10_000);
+        }
+        assert_eq!(
+            gate.blocked_for(190_000),
+            Some(FILL_BACKOFF_MAX),
+            "the backoff must stay bounded"
+        );
+    }
+
+    #[test]
+    fn a_successful_fill_clears_the_backoff() {
+        let gate = FillGate::new();
+        gate.record_failure(0);
+        assert!(gate.blocked_for(0).is_some());
+
+        gate.record_success();
+        assert_eq!(gate.blocked_for(0), None);
+    }
+
+    /// Exhaustion is not a slow failure, it is a fixed one: no amount of
+    /// waiting produces a slot index that is not there. Only a returned slot
+    /// clears it.
+    #[test]
+    fn exhaustion_blocks_refill_until_a_slot_comes_back() {
+        let gate = FillGate::new();
+        gate.note_slots_exhausted();
+        assert!(gate.blocked_for(0).is_some());
+        assert!(
+            gate.blocked_for(u64::MAX).is_some(),
+            "time alone must not clear exhaustion"
+        );
+
+        gate.note_slot_returned();
+        assert_eq!(gate.blocked_for(0), None);
+    }
+
+    /// The latch has to be set and cleared by the real allocation path, not
+    /// only by its own accessors.
+    #[test]
+    fn running_out_of_slot_indices_latches_the_gate_until_one_is_released() {
+        let manager = NetworkManager::new(false, 0, 0);
+        let mut taken = Vec::new();
+        while let Some(idx) = manager.take_next_slot_bit() {
+            taken.push(idx);
+        }
+        // How many were handed out is not the property, and it is not fixed:
+        // construction reserves slot 0 and every `veth-N` already on the host,
+        // which on a shared machine is whatever else is running there.
+        assert!(
+            !taken.is_empty(),
+            "the manager should have had indices to hand out"
+        );
+
+        assert!(
+            manager.fill_gate.blocked_for(u64::MAX).is_some(),
+            "exhaustion should have latched the refill gate"
+        );
+
+        let released = taken.pop().expect("at least one slot was taken");
+        manager.free_slot_bit(released);
+        assert_eq!(
+            manager.fill_gate.blocked_for(0),
+            None,
+            "a returned slot should reopen the gate"
+        );
+    }
+
+    /// The backoff throttles nothing unless the cycle that refills consults it.
+    /// Exhaustion is the plainest case: no amount of retrying produces a slot
+    /// index that is not there, so the cycle must not attempt a fill at all —
+    /// and an attempt, whether it succeeds or fails, counts itself.
+    #[test]
+    fn an_exhausted_gate_stops_the_cycle_before_it_attempts_a_fill() {
+        let spy = MetricSpy::default();
+        let counters = Arc::clone(&spy.counters);
+        let manager = manager_with_capacity(1);
+        manager.fill_gate.note_slots_exhausted();
+
+        metrics::with_local_recorder(&spy, || {
+            manager
+                .run_pool_maintenance_cycle()
+                .expect("a declined cycle is not an error")
+        });
+
+        assert_eq!(
+            counters
+                .lock()
+                .unwrap()
+                .get("agentenv_pool_fill_total")
+                .copied(),
+            None,
+            "the cycle attempted a refill while the slot space was exhausted"
+        );
+    }
+
+    /// A slot that will not clean up must not abandon the slots built beside
+    /// it: they hold bitmap bits and kernel devices, and the cycle used to
+    /// return on the first failure.
+    #[test]
+    fn cleanup_failures_are_aggregated_rather_than_returned_one_at_a_time() {
+        assert!(slot_cleanup_result(Vec::new()).is_ok());
+
+        let err = slot_cleanup_result(vec!["slot 4: busy".to_string(), "slot 9: busy".to_string()])
+            .expect_err("failures should surface");
+        let message = err.to_string();
+        assert!(message.contains("slot 4"), "unexpected error: {message}");
+        assert!(message.contains("slot 9"), "unexpected error: {message}");
+    }
+
+    /// `Drop` cannot await, so it hands the release off — but it has to hand it
+    /// to the pool shutdown drains. A bare `std::thread::spawn` is untracked:
+    /// between the handoff and its completion the slot is in neither the warm
+    /// pool nor the bitmap, so a shutdown that raced it would leave the veth
+    /// and the namespace mount behind, and the next boot would reserve that
+    /// index forever.
+    ///
+    /// `release_detached` is the only path to that handoff, and no unit test
+    /// reaches its one production caller (`FirecrackerSandbox::drop`), so the
+    /// count moves by exactly one.
+    #[test]
+    fn a_detached_release_is_handed_to_the_drained_pool() {
+        // `&'static self`, as the sandbox drop path holds it.
+        let manager: &'static NetworkManager = Box::leak(Box::new(manager_with_capacity(1)));
+        let slot = manager.allocate_test_slot().expect("a slot to release");
+        let handed_off = BACKGROUND_RELEASES.handed_off();
+
+        manager.release_detached(slot);
+
+        assert_eq!(
+            BACKGROUND_RELEASES.handed_off(),
+            handed_off + 1,
+            "the release was detached without being tracked"
+        );
+        assert!(
+            BACKGROUND_RELEASES.drain(Duration::from_secs(5)),
+            "the drain timed out waiting for a detached release"
+        );
+    }
+
+    /// And shutdown has to wait for what was handed off, at the static the
+    /// handoff goes to.
+    #[test]
+    fn shutdown_waits_for_a_detached_release_to_finish() {
+        let manager = manager_with_capacity(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let task_finished = Arc::clone(&finished);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _guard = runtime.enter();
+        BACKGROUND_RELEASES.spawn(move || {
+            release_rx.recv().expect("the release waits to be let go");
+            task_finished.store(true, Ordering::SeqCst);
+        });
+
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let _ = release_tx.send(());
+        });
+
+        manager.shutdown().expect("shutdown");
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "shutdown returned while a detached release was still running"
+        );
     }
 }

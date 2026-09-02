@@ -97,6 +97,164 @@ impl UnixSocketClient {
     }
 }
 
+/// A recording stand-in for the Firecracker API socket.
+///
+/// Firecracker's control surface is a plain HTTP server on a Unix socket, so
+/// everything the sandbox does to a microVM before the guest is involved can be
+/// exercised without a hypervisor: the request order, the JSON bodies, and the
+/// behaviour when a call fails or never answers.
+#[cfg(test)]
+pub(super) mod fake {
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use anyhow::Result;
+    use http_body_util::{BodyExt, Full};
+    use hyper::body::{Bytes, Incoming};
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response, StatusCode};
+    use hyper_util::rt::TokioIo;
+    use tokio::net::UnixListener;
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct RecordedRequest {
+        pub method: String,
+        pub path: String,
+        pub body: Vec<u8>,
+    }
+
+    /// What the fake answers for one request.
+    pub(crate) struct FakeReply {
+        pub status: StatusCode,
+        pub body: Vec<u8>,
+    }
+
+    impl FakeReply {
+        pub fn no_content() -> Self {
+            Self {
+                status: StatusCode::NO_CONTENT,
+                body: Vec::new(),
+            }
+        }
+
+        pub fn json(value: serde_json::Value) -> Self {
+            Self {
+                status: StatusCode::OK,
+                body: value.to_string().into_bytes(),
+            }
+        }
+
+        pub fn bad_request(message: &str) -> Self {
+            Self {
+                status: StatusCode::BAD_REQUEST,
+                body: message.as_bytes().to_vec(),
+            }
+        }
+    }
+
+    pub(crate) struct FakeFirecracker {
+        requests: Arc<Mutex<Vec<RecordedRequest>>>,
+        accept_task: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakeFirecracker {
+        /// Serve `socket_path` until dropped, answering each request with
+        /// `responder(method, path)`.
+        pub fn spawn<F>(socket_path: &Path, responder: F) -> Result<Self>
+        where
+            F: Fn(&str, &str) -> FakeReply + Send + Sync + 'static,
+        {
+            let listener = UnixListener::bind(socket_path)?;
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let responder = Arc::new(responder);
+
+            let accept_requests = Arc::clone(&requests);
+            let accept_task = tokio::spawn(async move {
+                loop {
+                    let Ok((stream, _)) = listener.accept().await else {
+                        return;
+                    };
+                    let requests = Arc::clone(&accept_requests);
+                    let responder = Arc::clone(&responder);
+                    tokio::spawn(async move {
+                        let _ = http1::Builder::new()
+                            .serve_connection(
+                                TokioIo::new(stream),
+                                service_fn(move |req: Request<Incoming>| {
+                                    let requests = Arc::clone(&requests);
+                                    let responder = Arc::clone(&responder);
+                                    async move {
+                                        let method = req.method().to_string();
+                                        let path = req.uri().path().to_string();
+                                        let body = req
+                                            .collect()
+                                            .await
+                                            .map(|collected| collected.to_bytes().to_vec())
+                                            .unwrap_or_default();
+                                        let reply = responder(&method, &path);
+                                        requests
+                                            .lock()
+                                            .expect("fake firecracker request log poisoned")
+                                            .push(RecordedRequest { method, path, body });
+                                        Ok::<_, std::convert::Infallible>(
+                                            Response::builder()
+                                                .status(reply.status)
+                                                .header(
+                                                    hyper::header::CONTENT_TYPE,
+                                                    "application/json",
+                                                )
+                                                .body(Full::new(Bytes::from(reply.body)))
+                                                .expect("build fake response"),
+                                        )
+                                    }
+                                }),
+                            )
+                            .await;
+                    });
+                }
+            });
+
+            Ok(Self {
+                requests,
+                accept_task,
+            })
+        }
+
+        pub fn requests(&self) -> Vec<RecordedRequest> {
+            self.requests
+                .lock()
+                .expect("fake firecracker request log poisoned")
+                .clone()
+        }
+
+        /// Request paths in the order they arrived, with consecutive repeats of
+        /// the same path collapsed so a poll loop does not swamp the sequence.
+        pub fn path_sequence(&self) -> Vec<String> {
+            let mut sequence: Vec<String> = Vec::new();
+            for request in self.requests() {
+                if sequence.last() != Some(&request.path) {
+                    sequence.push(request.path);
+                }
+            }
+            sequence
+        }
+
+        pub fn body_of(&self, path: &str) -> Option<serde_json::Value> {
+            self.requests()
+                .into_iter()
+                .find(|request| request.path == path)
+                .map(|request| serde_json::from_slice(&request.body).expect("fake request body"))
+        }
+    }
+
+    impl Drop for FakeFirecracker {
+        fn drop(&mut self) {
+            self.accept_task.abort();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

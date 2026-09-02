@@ -372,6 +372,7 @@ mod tests {
             root: root.join("repository"),
             cache_root: Some(root.join("runtime-cache")),
             runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
+            lock_strategy: Default::default(),
         })
         .expect("posix backend");
         let (repository, runtime_resolver) = backend.into_parts();
@@ -469,6 +470,7 @@ mod tests {
             root: tempdir.path().join("repository"),
             cache_root: Some(tempdir.path().join("runtime-cache")),
             runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
+            lock_strategy: Default::default(),
         })
         .expect("posix backend");
         let (repository, runtime_resolver) = backend.into_parts();

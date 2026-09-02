@@ -32,6 +32,7 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_VIRTUALIZATION_MODE` | `kvm` | Select the node virtualization mode. Leave unset for normal installations; set to `pvm` only when following the [PVM Deployment](../deployment/pvm.md) guide. |
 | `AENV_SNAPSHOT_LOCAL_CACHE_PATH` | `$AENV_HOME/snapshot-local-cache` | Override the snapshot manager's node-local artifact/cache root |
 | `AENV_SNAPSHOT_STORE` | `$AENV_HOME/snapshot-store` | Override the posix_fs snapshot repository root directory |
+| `AENV_SNAPSHOT_STORE_LOCK_STRATEGY` | `flock` | How the posix_fs catalog takes its alias and record locks. `flock` is kernel-enforced and released on process death; `create_new` is for filesystems that do not honour `flock` between every writer sharing one repository, and is strictly weaker. |
 | `AENV_UBLK_DAEMON_BINARY_PATH` | `$AENV_HOME/ublk/uvm-ublk-daemon` | Override path to the `uvm-ublk-daemon` binary |
 | `AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR` | `0.0.0.0:9103` | Override ublk daemon Prometheus metrics listen address; empty string disables it |
 | `AENV_FORCE_SYSCTL_TUNING` | unset | Set to `1` to force sysctl tuning in a privileged container with writable host sysctls. Normally skipped automatically inside containers. |
@@ -89,7 +90,7 @@ These variables apply to both the gateway and scheduler processes.
 | `AENV_API_KEY` | unset | Shared single-tenant API key. The gateway uses the environment value when set, otherwise it reads `/run/secrets/api-key`. |
 | `GATEWAY_HTTP_LISTEN_ADDR` | `:8080` | HTTP listen address |
 | `GATEWAY_METRICS_LISTEN_ADDR` | `:9102` | Prometheus metrics listen address |
-| `GATEWAY_SCHEDULER_ADDR` | `127.0.0.1:9090` | Scheduler gRPC address for routing and node lookup |
+| `GATEWAY_SCHEDULER_ADDR` | `127.0.0.1:9090` | Scheduler gRPC address for routing and node lookup. One address or a comma-separated list; RPCs are balanced round-robin over every address the target resolves to, so a headless service name spreads them over the scheduler replicas rather than pinning one. |
 | `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR` | unset | Optional secondary scheduler gRPC address used only for sandbox data-plane `LookupNode` queries. When set, creation and control-plane calls still go to `GATEWAY_SCHEDULER_ADDR`. |
 | `GATEWAY_REQUEST_TIMEOUT` | `30s` | Override the gateway's HTTP request timeout (for example, `1m30s`) |
 | `GATEWAY_SANDBOX_PROXY_DOMAINS` | from config | Comma-separated DNS domains that enable gateway host-based sandbox proxy URLs like `{port}-{sandboxID}.{domain}`. Empty or unset keeps `gateway.sandbox_proxy_domains`. |
@@ -110,6 +111,10 @@ These variables apply to both the gateway and scheduler processes.
 | `SCHEDULER_AUTH_TOKEN_FILE` | unset | Path to a file holding the token instead of `SCHEDULER_AUTH_TOKEN`. Must exist and be non-empty when set; setting both is refused. |
 | `SCHEDULER_RESERVATIONS_ENABLED` | `false` | Let node-reported sandbox events and the scheduler's own placements adjust each node's last heartbeat between heartbeats, so placements inside one interval see each other. Advisory; the heartbeat always wins. |
 | `SCHEDULER_MAX_RESERVATION_DELTA` | `512` | Clamp on how far the reservation ledger may move one node's sandbox count from its last heartbeat, in either direction. |
+| `SCHEDULER_MODE` | `primary` | How this scheduler takes part in a cluster: `primary` (single scheduler, the only mode that may run without `scheduler.redis_addr`), `replica` (one of N behind one address; refuses to start without a shared binding store), or `query-only` (serves `LookupNode` alone). The `--mode` flag wins over this; `--query-only` is a deprecated alias. |
+| `SCHEDULER_NODE_STREAM_ENABLED` | on for `replica`, off otherwise | Replicate node liveness and capacity between schedulers over Redis Streams, so each replica knows the nodes whose sticky connections landed on another. `false` is the rollback: each scheduler then knows only the nodes that heartbeat to it. |
+| `SCHEDULER_NODE_STREAM_WARMUP_TIMEOUT` | `15s` | How long a starting replica reports `NOT_SERVING` while it replays the retained node state before serving anyway. |
+| `SCHEDULER_STORE_PROBE_INTERVAL` | `2s` | How often a scheduler asks its binding store whether it is reachable. Three consecutive failures report `NOT_SERVING`, which is what takes a Redis-partitioned replica out of a gateway's round-robin rotation. |
 | `SCHEDULER_REDIS_ADDR` | unset | Redis address for persistent sandbox-to-node bindings (for example, `redis:6379`). Unset = in-memory bindings, lost on scheduler restart. |
 | `SCHEDULER_BINDING_TTL` | `30s` | How long a sandbox-to-node binding is kept without a confirming heartbeat. Accepts Go duration strings (for example, `1m`). `scheduler.report_ttl` (config only; unset = the smaller of `30s` and this) must not exceed it. |
 | `SCHEDULER_RECONCILE_GRACE` | smaller of `10s` and half `SCHEDULER_BINDING_TTL` | How recently a binding must have been written for a heartbeat reconcile to leave it alone when the node's roster omits it. Must be shorter than the binding TTL. |

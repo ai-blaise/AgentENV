@@ -17,7 +17,7 @@ type NodeRegistry interface {
 	Snapshot(allowLingering bool) []Node
 	Contains(node Node) bool
 	Resolve(nodeID string) (Node, bool)
-	Heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, string, error)
+	Heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, HeartbeatAck, error)
 	ListObserved(clusterID string, now time.Time) []*schedulerv1.ObservedNode
 	ListP2pPeers(clusterID string, backend string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
 	FilterP2pPeers(clusterID string, backend string, nodeIDs []string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
@@ -62,6 +62,29 @@ var (
 // string, and TestUnknownNodeRejectionCarriesTheWireMessage pins it.
 const NodeNotInRegistryMessage = "node is not in scheduler node list"
 
+// HeartbeatAck is what the registry decided the node should be told back.
+//
+// It travels as a struct rather than as more return values because both fields
+// are answers to the same question — what does this node still need from the
+// fleet-wide CPU intersection — and both have to be read under the lock that
+// applied the heartbeat.
+type HeartbeatAck struct {
+	// CPUConfigJSON is the intersection of every node's CPU configuration in
+	// the cluster, once every node has reported one. Empty until then.
+	CPUConfigJSON string
+	// RequestCPUConfig asks the node to send its own CPU configuration on its
+	// next heartbeat.
+	//
+	// The node sends it once per process, so a scheduler that restarts after
+	// that never sees it again and can never compute the intersection: the
+	// carry-forward below has nothing to carry, allConfigsReadyLocked never
+	// returns true, and sandboxes silently start booting with node-local CPU
+	// features. Asking is what closes that, and asking only when the
+	// configuration is missing is what keeps a tens-of-kilobyte payload off the
+	// steady-state heartbeat.
+	RequestCPUConfig bool
+}
+
 type observedNodeRecord struct {
 	node        *schedulerv1.ObservedNode
 	p2pEndpoint *schedulerv1.P2PEndpoint
@@ -70,7 +93,22 @@ type observedNodeRecord struct {
 	// sent. The view stamps an unstamped snapshot with the scheduler's clock
 	// for its readers; ordering reports against that would compare two clocks.
 	reportedAtMs int64
+	// source says how this replica came by the record. It is reported as a
+	// gauge and nothing reads it for a decision: on a converged fleet of N
+	// replicas each one holds roughly 1/N of the fleet from its own heartbeat
+	// RPCs and the rest from the stream, and that split is the only direct
+	// evidence that replication is working.
+	source observedSource
 }
+
+// observedSource distinguishes a record this replica was told directly from one
+// another replica passed on.
+type observedSource string
+
+const (
+	observedSourceRPC    observedSource = "rpc"
+	observedSourceStream observedSource = "stream"
+)
 
 type AtomicNodeRegistry struct {
 	mu           sync.RWMutex
@@ -231,44 +269,83 @@ func (r *AtomicNodeRegistry) Set(active []Node, lingering []Node) {
 	}
 }
 
-func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, string, error) {
+func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, HeartbeatAck, error) {
 	nowMs := now.UTC().UnixMilli()
-
-	machineInfo := cloneMachineInfo(req.GetMachineInfo())
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	node, ok := r.nodesByID[req.GetNodeId()]
 	if !ok {
-		return Node{}, "", ErrNodeNotInRegistry
+		return Node{}, HeartbeatAck{}, ErrNodeNotInRegistry
 	}
 
-	prevCPU, existed := "", false
 	incoming := Incarnation(strings.TrimSpace(req.GetServiceInstanceId()))
-	if prev, ok := r.observed[req.GetNodeId()]; ok {
-		existed = true
-		// A node process that has already been replaced must not be able to
-		// overwrite the live one's state. Incarnations are time-ordered UUIDv7
-		// values minted per process start, so a strictly older one is a report
-		// from a dead process — most often an RPC delayed behind a restart.
-		//
-		// Equal or unknown incarnations pass: a node that does not report one
-		// must not be locked out, and re-reporting the same one is the normal
-		// case. Within the same incarnation the reports themselves are then
-		// ordered, so the normal case cannot run backwards either.
-		current := Incarnation(strings.TrimSpace(prev.node.GetServiceInstanceId()))
-		if current.Supersedes(incoming) {
-			return Node{}, "", ErrStaleIncarnation
+	prev, existed := r.observed[req.GetNodeId()]
+	if err := r.fenceLocked(req.GetNodeId(), incoming, prev, existed); err != nil {
+		return Node{}, HeartbeatAck{}, err
+	}
+	if existed && Incarnation(strings.TrimSpace(prev.node.GetServiceInstanceId())) == incoming &&
+		r.reportPredatesApplied(prev, req.GetSnapshot(), nowMs) {
+		return Node{}, HeartbeatAck{}, ErrStaleReport
+	}
+
+	return node, r.storeReportLocked(req, node, prev, existed, nowMs, observedSourceRPC), nil
+}
+
+// fenceLocked refuses a report from a node process that has been replaced.
+//
+// Incarnations are time-ordered UUIDv7 values minted per process start, so a
+// strictly older one is a report from a dead process — most often an RPC
+// delayed behind a restart. Equal or unknown incarnations pass: a node that
+// does not report one must not be locked out, and re-reporting the same one is
+// the normal case. A node that has unregistered leaves a tombstone, which
+// fences even its own late reports.
+func (r *AtomicNodeRegistry) fenceLocked(nodeID string, incoming Incarnation, prev observedNodeRecord, existed bool) error {
+	if existed {
+		if Incarnation(strings.TrimSpace(prev.node.GetServiceInstanceId())).Supersedes(incoming) {
+			return ErrStaleIncarnation
 		}
-		if current == incoming && r.reportPredatesApplied(prev, req.GetSnapshot(), nowMs) {
-			return Node{}, "", ErrStaleReport
-		}
+		return nil
+	}
+	if tombstone, ok := r.departed[nodeID]; ok && fencedByDeparture(tombstone, incoming) {
+		return ErrStaleIncarnation
+	}
+	return nil
+}
+
+// storeReportLocked writes one node report into the observed map and answers
+// what the node should be told back.
+//
+// Both the heartbeat RPC and a report replicated from another scheduler replica
+// land here, and everything they share has to stay shared: the CPU-config
+// carry-forward, the intersection invalidation, and the snapshot defaults. A
+// replica that skipped any of them would compute a different intersection from
+// the one its peers computed over the same fleet, which is the failure the
+// intersection exists to prevent. What differs between the two is the freshness
+// stamp — the RPC uses this replica's clock, the stream applies the stamp of the
+// replica that took the call — and that is passed in.
+func (r *AtomicNodeRegistry) storeReportLocked(
+	req *schedulerv1.HeartbeatRequest,
+	node Node,
+	prev observedNodeRecord,
+	existed bool,
+	seenMs int64,
+	source observedSource,
+) HeartbeatAck {
+	machineInfo := cloneMachineInfo(req.GetMachineInfo())
+	prevCPU := ""
+	if existed {
 		prevCPU = prev.node.GetMachineInfo().GetCpuConfigJson()
-		if machineInfo != nil && machineInfo.CpuConfigJson == "" {
+		switch {
+		case machineInfo == nil:
+			// A report that describes the machine not at all is not a report
+			// that the machine has changed. Nodes always send machine info;
+			// replicated reports elide it, because the CPU configuration inside
+			// it is tens of kilobytes and almost never changes.
+			machineInfo = cloneMachineInfo(prev.node.GetMachineInfo())
+		case machineInfo.CpuConfigJson == "":
 			machineInfo.CpuConfigJson = prevCPU
 		}
-	} else if tombstone, ok := r.departed[req.GetNodeId()]; ok && fencedByDeparture(tombstone, incoming) {
-		return Node{}, "", ErrStaleIncarnation
 	}
 
 	record := observedNodeRecord{
@@ -280,15 +357,16 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 			Version:           req.GetVersion(),
 			Commit:            req.GetCommit(),
 			MachineInfo:       machineInfo,
-			LastSeenUnixMs:    nowMs,
+			LastSeenUnixMs:    seenMs,
 			Snapshot:          cloneSnapshot(req.GetSnapshot()),
 		},
 		p2pEndpoint:  cloneP2PEndpoint(req.GetP2PEndpoint()),
 		reportTTL:    r.observedTTL,
 		reportedAtMs: req.GetSnapshot().GetReportedAtUnixMs(),
+		source:       source,
 	}
 	if record.node.Snapshot.GetReportedAtUnixMs() == 0 {
-		record.node.Snapshot.ReportedAtUnixMs = nowMs
+		record.node.Snapshot.ReportedAtUnixMs = seenMs
 	}
 	if record.node.Snapshot.GetStatus() == schedulerv1.NodeStatus_NODE_STATUS_UNSPECIFIED {
 		record.node.Snapshot.Status = schedulerv1.NodeStatus_NODE_STATUS_CONNECTING
@@ -315,13 +393,14 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 	// it once per node per scheduler process left a restarted scheduler unable
 	// to deliver it at all, and new sandboxes then booted with node-local CPU
 	// features. intersectionSent survives only to suppress repeat logging.
+	ack := HeartbeatAck{RequestCPUConfig: record.node.GetMachineInfo().GetCpuConfigJson() == ""}
 	if intersection, ok := r.cpuIntersection[clusterID]; ok {
 		if !r.intersectionSent[req.GetNodeId()] {
 			r.intersectionSent[req.GetNodeId()] = true
 		}
-		return node, intersection, nil
+		ack.CPUConfigJSON = intersection
 	}
-	return node, "", nil
+	return ack
 }
 
 // reportPredatesApplied reports whether a heartbeat from the live process was

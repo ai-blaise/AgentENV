@@ -296,7 +296,7 @@ func heartbeatWithConfig(t *testing.T, registry *AtomicNodeRegistry, nodeID, clu
 	if cpuJSON != "" {
 		mi = &schedulerv1.MachineInfo{CpuConfigJson: cpuJSON}
 	}
-	_, cpuConfigJSON, err := registry.Heartbeat(
+	_, ack, err := registry.Heartbeat(
 		&schedulerv1.HeartbeatRequest{
 			NodeId:            nodeID,
 			ClusterId:         clusterID,
@@ -308,7 +308,7 @@ func heartbeatWithConfig(t *testing.T, registry *AtomicNodeRegistry, nodeID, clu
 	if err != nil {
 		t.Fatalf("heartbeat: %v", err)
 	}
-	return cpuConfigJSON
+	return ack.CPUConfigJSON
 }
 
 func TestHeartbeatReturnsCpuIntersectionForSingleNode(t *testing.T) {

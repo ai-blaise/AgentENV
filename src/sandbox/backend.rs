@@ -127,6 +127,103 @@ impl RuntimeArtifactSet {
 pub struct SandboxRuntimeInfo {
     pub rootfs_virtual_size: Option<u64>,
     pub runtime_artifacts: RuntimeArtifactSet,
+    pub mem_control: MemoryControlCapability,
+}
+
+/// Which memory-control devices a *running* sandbox actually has.
+///
+/// Derived by probing the live VM, never by reading the config it was launched
+/// with. The two do not agree: the balloon and virtio-mem devices are restored
+/// from `vm_state.bin` on resume and are deliberately not re-configured, so a
+/// sandbox captured before a device existed comes back without it however the
+/// resuming node is configured. All-false is both the `Default` and the
+/// fail-safe: every consumer treats a missing device as a permanent opt-out
+/// and must keep working without it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryControlCapability {
+    /// A virtio-balloon device is attached.
+    pub balloon: bool,
+    /// Guest statistics were armed before boot. They cannot be armed later.
+    pub balloon_stats: bool,
+    /// The free-page-hinting feature bit was set before boot.
+    pub free_page_hinting: bool,
+    /// A virtio-mem device is attached, so the guest RAM ceiling is movable.
+    pub hotplug: bool,
+}
+
+impl MemoryControlCapability {
+    /// Whether anything at all can be read or actuated for this sandbox.
+    pub fn is_inert(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// One sample of a sandbox's memory position, guest side and device side.
+///
+/// Byte-valued fields come from the guest's own accounting, which is the only
+/// source that does not double-count: sandboxes launched from one template
+/// share a single memory ublk device, so a host-side per-process RSS counts the
+/// same physical page once for every sandbox that faulted it in.
+///
+/// The sample is as fresh as the guest's last push, i.e. up to one
+/// `stats_polling_interval_s` old, and the first sample after a resume may be
+/// older than that.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SandboxMemoryTelemetry {
+    /// Guest estimate of memory available for new work without swapping.
+    pub available_bytes: Option<u64>,
+    /// Guest total usable memory, i.e. the current RAM ceiling.
+    pub total_bytes: Option<u64>,
+    /// Reclaimable page cache. Counted inside `available_bytes`.
+    pub disk_caches_bytes: Option<u64>,
+    /// Cumulative guest OOM-killer invocations.
+    pub oom_kills: Option<u64>,
+    /// Cumulative allocations that fell into the slow path for want of a page.
+    pub alloc_stalls: Option<u64>,
+    /// Current virtio-mem plugged size, when the device is present.
+    pub plugged_mib: Option<u32>,
+    /// Current virtio-mem requested size, when the device is present.
+    pub requested_mib: Option<u32>,
+}
+
+/// The guest-side position a control policy can actually act on.
+///
+/// Only constructible from a sample in which the guest reported both figures,
+/// so a policy holding one of these is never reasoning about numbers the guest
+/// never sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestMemoryPosition {
+    /// Share of the guest's total memory it reports as available, 0..=100.
+    pub available_percent: u64,
+    /// The guest's total usable memory, rounded up.
+    pub total_mib: u32,
+}
+
+impl SandboxMemoryTelemetry {
+    /// The guest's position, or `None` when this sample cannot describe one.
+    ///
+    /// Every field is optional because every field is: the balloon statistics
+    /// a guest pushes are gated on its own kernel, so a VM whose rootfs has a
+    /// virtio_balloon driver that never reports `S_MEMTOT` pushes a sample
+    /// with the total absent for its whole life. Absent is not zero and not
+    /// full — reading it as either invents a pressure signal the guest never
+    /// sent — so a sample that cannot answer says so.
+    pub fn guest_position(&self) -> Option<GuestMemoryPosition> {
+        let total_bytes = self.total_bytes.filter(|total| *total > 0)?;
+        Some(GuestMemoryPosition {
+            available_percent: self.available_bytes?.saturating_mul(100) / total_bytes,
+            total_mib: crate::types::bytes_to_mib_ceil(total_bytes),
+        })
+    }
+
+    /// Whether the guest reports neither of the allocation-distress counters.
+    ///
+    /// Both are gated on the guest kernel version, so a guest that reports
+    /// neither can only ever be judged on its available ratio: the "grow
+    /// within one tick of an allocation stall" arm can never fire for it.
+    pub fn is_blind_to_distress(&self) -> bool {
+        self.oom_kills.is_none() && self.alloc_stalls.is_none()
+    }
 }
 
 /// Opaque captured snapshot artifacts produced from a running sandbox.
@@ -256,6 +353,22 @@ pub trait SandboxBackend: Send + 'static {
 
     /// Update the sandbox network policy at runtime.
     async fn update_network_policy(&mut self, policy: Option<SandboxNetworkPolicy>) -> Result<()>;
+
+    /// Sample this sandbox's memory position.
+    ///
+    /// `Ok(None)` means the backend has no device that can answer — no
+    /// balloon, statistics never armed, or the VM is not up — and is a
+    /// permanent, unexceptional opt-out rather than a failure. `Err` is
+    /// reserved for a device that should have answered and did not.
+    async fn memory_telemetry(&self) -> Result<Option<SandboxMemoryTelemetry>>;
+
+    /// Move this sandbox's guest RAM ceiling to `mib` of hot-pluggable memory.
+    ///
+    /// Only meaningful when [`MemoryControlCapability::hotplug`] is set;
+    /// callers must check first, because a backend with no virtio-mem device
+    /// has no way to honour the request and says so rather than silently
+    /// succeeding.
+    async fn set_memory_plug_target(&mut self, mib: u32) -> Result<()>;
 
     /// Update the custom extension params held by the sandbox runtime.
     ///

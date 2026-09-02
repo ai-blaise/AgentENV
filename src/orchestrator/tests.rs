@@ -17,7 +17,7 @@ use super::super::persistence::{
 };
 use super::super::types::SandboxLaunchSource;
 use super::*;
-use crate::cfg::ResolvedImageCacheConfig;
+use crate::cfg::{MemoryControlConfig, ResolvedImageCacheConfig};
 use crate::image::cache::test_support::{
     test_local_image_services_from_service, ImageCacheService, RecordingRuntimeImageRefs,
 };
@@ -28,8 +28,9 @@ use crate::sandbox::mock::{
     MockAction, MockBackendFactory, MockBehavior, MockOperation, MockSandboxBackend, MockSnapshot,
 };
 use crate::sandbox::{
-    BaseSandboxNetworkPolicy, PausedSandboxState, RuntimeArtifactSet, SandboxLaunchConfig,
-    SandboxNetworkEgressPolicy, SandboxNetworkPolicy, SandboxRuntimeInfo,
+    BaseSandboxNetworkPolicy, MemoryControlCapability, PausedSandboxState, RuntimeArtifactSet,
+    SandboxLaunchConfig, SandboxMemoryTelemetry, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
+    SandboxRuntimeInfo,
 };
 use crate::snapshot::RunnableSnapshot;
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
@@ -5220,6 +5221,12 @@ impl crate::orchestrator::MobilityHooks for RecordingMobility {
             .unwrap()
             .push(format!("record_committed:{sandbox_id}:{snapshot_id}"));
     }
+
+    async fn committed_snapshot(&self, _sandbox_id: &SandboxId) -> Option<String> {
+        // This double records calls instead of keeping records, so it has
+        // nothing committed to report.
+        None
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5361,6 +5368,146 @@ async fn mobility_returns_the_claim_when_a_resume_fails() -> Result<()> {
             .contains(&format!("release_local_claim:{sandbox_id}")),
         "a failed resume must give the claim back, got {:?}",
         mobility.calls()
+    );
+    Ok(())
+}
+
+// ── Memory control loop wiring ───────────────────────────────────────────────
+
+fn stats_and_hotplug_capable() -> SandboxRuntimeInfo {
+    SandboxRuntimeInfo {
+        mem_control: MemoryControlCapability {
+            balloon: true,
+            balloon_stats: true,
+            free_page_hinting: false,
+            hotplug: true,
+        },
+        ..Default::default()
+    }
+}
+
+/// A guest sitting at ~1.5% available on a 1 GiB total, 512 MiB of which is
+/// hot-plugged: well under the 10% grow threshold and with room under a
+/// 2048 MiB ceiling for exactly one step.
+fn starved_guest_sample() -> SandboxMemoryTelemetry {
+    SandboxMemoryTelemetry {
+        available_bytes: Some(16 * 1024 * 1024),
+        total_bytes: Some(1024 * 1024 * 1024),
+        disk_caches_bytes: Some(0),
+        oom_kills: Some(0),
+        alloc_stalls: Some(0),
+        plugged_mib: Some(512),
+        requested_mib: Some(512),
+    }
+}
+
+fn memory_control_config(enabled: bool) -> MemoryControlConfig {
+    MemoryControlConfig {
+        enabled,
+        interval_secs: 1,
+        grow_available_percent: 10,
+        shrink_available_percent: 40,
+        shrink_hysteresis_passes: 3,
+        max_step_mib: 512,
+        // The node guard reads real host metrics, and this test is about the
+        // wiring rather than the guard: 100% is a watermark the build host
+        // cannot be over.
+        node_memory_high_percent: 100,
+    }
+}
+
+async fn sandbox_for_memory_control(behavior: &Arc<MockBehavior>) -> Result<Arc<TestOrchestrator>> {
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(behavior)))
+            .await;
+    orchestrator
+        .create_sandbox(CreateSandboxRequest {
+            source: SandboxLaunchSource::Image {
+                image_ref: "ubuntu:24.04".to_string(),
+                overlaybd_config_path: PathBuf::from("/tmp/ubuntu-image.json"),
+                context: Default::default(),
+                resources: Some(SandboxResources {
+                    cpu_count: 2,
+                    memory_mib: 2048,
+                    disk_size_mib: 1024,
+                }),
+                extra_drives: Vec::new(),
+                extra_boot_args: None,
+                image_configs: Box::new(ImageConfigs::new()),
+            },
+            timeout: Some(Duration::from_secs(60)),
+            timeout_action: SandboxTimeoutAction::Pause,
+            user_metadata: None,
+            env_vars: None,
+            network_policy: SandboxNetworkPolicy::default(),
+            custom_extension_params: None,
+            auto_resume: false,
+            secure: false,
+        })
+        .await?;
+    Ok(orchestrator)
+}
+
+/// Wait for the mock backend to be asked for a plug target, or give up.
+async fn await_plug_targets(behavior: &Arc<MockBehavior>, deadline: Duration) -> Vec<u32> {
+    let started = tokio::time::Instant::now();
+    loop {
+        let targets = behavior.plug_targets();
+        if !targets.is_empty() || started.elapsed() >= deadline {
+            return targets;
+        }
+        sleep(STATE_POLL_INTERVAL).await;
+    }
+}
+
+/// The whole §3 loop, from the switch to the wire. Every policy test in
+/// `metrics.rs` runs the pass directly, so none of them would notice the task
+/// never being started, the roster never being read, or the handle lookup
+/// never finding the sandbox it just created.
+#[tokio::test]
+async fn an_enabled_memory_control_loop_moves_a_starved_guest() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_runtime_info(stats_and_hotplug_capable());
+    behavior.set_memory_telemetry(vec![Some(starved_guest_sample())]);
+    let orchestrator = sandbox_for_memory_control(&behavior).await?;
+
+    Orchestrator::start_memory_control_task(
+        Arc::clone(&orchestrator),
+        memory_control_config(true),
+        orchestrator.shutdown_tx.subscribe(),
+    );
+
+    let targets = await_plug_targets(&behavior, Duration::from_secs(10)).await;
+    assert_eq!(
+        targets.first().copied(),
+        Some(1024),
+        "the loop must grow the guest by one step, got {targets:?}"
+    );
+    Ok(())
+}
+
+/// The switch is the whole opt-in: a node that has not asked for the loop must
+/// never have its guests' memory moved.
+#[tokio::test]
+async fn a_disabled_memory_control_loop_never_touches_a_guest() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_runtime_info(stats_and_hotplug_capable());
+    behavior.set_memory_telemetry(vec![Some(starved_guest_sample())]);
+    let orchestrator = sandbox_for_memory_control(&behavior).await?;
+
+    Orchestrator::start_memory_control_task(
+        Arc::clone(&orchestrator),
+        memory_control_config(false),
+        orchestrator.shutdown_tx.subscribe(),
+    );
+
+    let targets = await_plug_targets(&behavior, Duration::from_secs(2)).await;
+    assert_eq!(
+        targets,
+        Vec::<u32>::new(),
+        "a disabled loop must not reach the backend"
     );
     Ok(())
 }

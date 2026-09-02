@@ -56,7 +56,8 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	mutants coverage \
 	test test-unit test-integration prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
 	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all \
-	bench bench-snapshot bench-ublk bench-orchestrator-store \
+	bench bench-snapshot bench-snapshot-mock bench-ublk bench-orchestrator-store \
+	load-burst \
 	ci-deps ci-deps-protoc \
 	firecracker-client envd-http-client agentenv-server custom-extension-client start-server start-server-release \
 	services gateway scheduler \
@@ -115,11 +116,13 @@ coverage:
 test: test-agent test-envd test-ublk
 
 test-unit:
-	$(CARGO) test -p agentenv -p envd -p linux-cap --lib
+	$(CARGO) test -p agentenv -p agentenv-observability -p envd -p linux-cap --lib
+	$(CARGO) test -p agentenv-loadgen
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv --lib -- --ignored
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p uvm-ublk -p uvm-ublk-daemon --lib
 	bash scripts/tests/verify-capability-runner.sh
 	bash scripts/tests/verify-install-service.sh
+	bash scripts/tests/verify-prestop-drain.sh
 
 test-integration: test-agent-integration test-envd test-ublk
 
@@ -173,6 +176,48 @@ bench-ublk:
 
 bench-orchestrator-store:
 	$(CARGO) bench -p agentenv-benchmarks --bench orchestrator_store
+
+# The snapshot-path benchmarks that need no hypervisor. They drive the
+# orchestrator against the mock sandbox backend, so what they report is the
+# control plane's per-capture and per-fork-child cost — not guest pause or
+# restore, which a mock sandbox does not have.
+#
+# Even with a mock backend the orchestrator writes a managed access-token seed
+# under [home_path], which ships as /var/lib/aenv and is not writable by an
+# unprivileged user. BENCH_MOCK_STATE keeps that state somewhere the target can
+# create from a clean checkout; point it elsewhere to keep it.
+#
+# Both benchmarks are named on the command line, so the run exits non-zero if
+# either produces no number rather than printing a skip line and exiting 0.
+BENCH_MOCK_STATE ?= $(CURDIR)/target/bench-mock-state
+bench-snapshot-mock:
+	mkdir -p $(BENCH_MOCK_STATE)/home $(BENCH_MOCK_STATE)/run
+	AENV_SANDBOX_BACKEND=mock \
+	AENV_HOME_PATH=$(BENCH_MOCK_STATE)/home \
+	AENV_RUNTIME_PATH=$(BENCH_MOCK_STATE)/run \
+	$(CARGO) bench -p agentenv-benchmarks --bench snapshot -- \
+		repeated_capture_latency fork_fanout
+
+# Burst-create load against a node or a gateway. N sandboxes, CONCURRENCY in
+# flight, MODE closed (hold the concurrency) or open (hold the arrival RATE,
+# shedding what does not fit). AENV_URL, AENV_API_KEY and AENV_TEMPLATE_ID come
+# from the same environment the e2e suites read.
+#
+# Against a node started with [machine].backend = "mock" this drives the whole
+# control plane on a host with no hypervisor. Numbers from such a run measure
+# the control plane, not sandbox start-up; label them accordingly.
+#
+# IMAGE= switches to POST /sandboxes-cold, which is the only create a
+# mock-backend node can serve: its snapshot repository holds no templates.
+N ?= 100
+CONCURRENCY ?= 16
+MODE ?= closed
+RATE ?= 10
+IMAGE ?=
+load-burst:
+	$(CARGO) run --release -p agentenv-loadgen --bin aenv-loadgen -- \
+		--requests $(N) --concurrency $(CONCURRENCY) --mode $(MODE) --rate $(RATE) \
+		$(if $(IMAGE),--image $(IMAGE),)
 
 OCI_IMAGE ?=
 bench-oci-conversion:

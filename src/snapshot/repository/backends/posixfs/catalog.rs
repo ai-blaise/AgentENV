@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -19,8 +19,99 @@ use crate::snapshot::{
 };
 const FILE_LOCK_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
 
+/// How old a `create_new` lock file must be before the fallback strategy will
+/// steal it. Only reachable when the file was already this old at the first
+/// attempt: a contender gives up after FILE_LOCK_TIMEOUT, which is shorter, so
+/// it can never age a live holder's lock into the steal branch itself.
+const CREATE_NEW_STALE_AGE: Duration = Duration::from_secs(60);
+
+/// How the catalog takes its alias and record locks.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PosixFsLockStrategy {
+    /// `flock(LOCK_EX | LOCK_NB)`. The kernel owns the lock and releases it
+    /// when the descriptor closes, including on process death, so there is no
+    /// staleness to judge and nothing to steal.
+    #[default]
+    Flock,
+    /// `create_new` plus an ownership token, for filesystems where `flock` is
+    /// not honoured across the writers that share the repository — some NFS
+    /// and FUSE mounts. It is strictly weaker: a holder that dies leaves its
+    /// lock behind until it ages out, and everything waiting on it waits that
+    /// long. Choose it only when `flock` does not work.
+    CreateNew,
+}
+
+impl std::fmt::Display for PosixFsLockStrategy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Flock => "flock",
+            Self::CreateNew => "create_new",
+        })
+    }
+}
+
+impl std::str::FromStr for PosixFsLockStrategy {
+    type Err = String;
+
+    fn from_str(raw: &str) -> std::result::Result<Self, Self::Err> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "flock" => Ok(Self::Flock),
+            "create_new" => Ok(Self::CreateNew),
+            other => Err(format!(
+                "unsupported posix_fs lock strategy {other:?}; expected \"flock\" or \"create_new\""
+            )),
+        }
+    }
+}
+
 pub struct PosixFsCatalogStore {
     root: PathBuf,
+    lock_strategy: PosixFsLockStrategy,
+    lock_timeout: Option<Duration>,
+}
+
+/// Identifies one acquisition well enough that a second one cannot be mistaken
+/// for it.
+///
+/// The pid alone cannot: pids are recycled, and on a shared filesystem two
+/// hosts hand out the same numbers, so a stale lock from one host reads as
+/// alive on another. The boot id scopes the pid to one running kernel, and the
+/// uuid distinguishes two acquisitions by the same process — which is what
+/// makes "is this still my lock?" answerable at drop time.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+struct LockToken {
+    pid: u32,
+    boot_id: String,
+    uuid: String,
+}
+
+impl LockToken {
+    fn new() -> Self {
+        Self {
+            pid: std::process::id(),
+            boot_id: boot_id(),
+            uuid: uuid::Uuid::now_v7().to_string(),
+        }
+    }
+}
+
+/// This kernel's boot identifier, or a per-process substitute.
+///
+/// The substitute is deliberately per-process rather than a constant: if the
+/// boot id cannot be read, two processes must not be able to produce equal
+/// tokens, because an equal token is what lets a guard delete a lock.
+fn boot_id() -> String {
+    static BOOT_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BOOT_ID
+        .get_or_init(|| {
+            fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .map(|value| value.trim().to_string())
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| format!("no-boot-id-{}", uuid::Uuid::now_v7()))
+        })
+        .clone()
 }
 
 #[derive(Debug)]
@@ -41,14 +132,64 @@ pub(crate) struct PublishSession {
 /// writers. The files are empty, bounded by the number of aliases and records,
 /// and reused on every acquire.
 #[derive(Debug)]
-struct PosixFileLockGuard {
-    _lock: Flock<fs::File>,
+enum PosixFileLockGuard {
+    /// The kernel holds the lock; the descriptor is never read, and dropping
+    /// it is what releases the lock.
+    Flock(#[allow(dead_code)] Box<Flock<fs::File>>),
+    /// The lock is the existence of a file, so releasing it means removing
+    /// that file — but only while it still carries this guard's token. A
+    /// guard whose lock was stolen must not delete the thief's file: that
+    /// admits a third writer, and the failure compounds instead of settling.
+    Token { path: PathBuf, token: LockToken },
+}
+
+impl Drop for PosixFileLockGuard {
+    fn drop(&mut self) {
+        let Self::Token { path, token } = self else {
+            return;
+        };
+        match read_lock_token(path) {
+            Some(current) if current == *token => {
+                let _ = fs::remove_file(path);
+            }
+            // Either the lock is somebody else's now, or it is already gone.
+            // Both mean this guard has nothing left to release.
+            _ => {}
+        }
+    }
+}
+
+/// Reads the token a lock file carries, or `None` when it has none to read.
+///
+/// An unreadable or malformed file is treated as tokenless rather than as an
+/// error: it can only have been written by an older build or a torn write, and
+/// in both cases the answer to "is this mine?" is no.
+fn read_lock_token(path: &Path) -> Option<LockToken> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 impl PosixFsCatalogStore {
     /// Creates a catalog store rooted at the repository's durable POSIX directory.
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self::with_lock_strategy(root, PosixFsLockStrategy::default())
+    }
+
+    /// Creates a catalog store that takes its locks the given way.
+    pub fn with_lock_strategy(root: PathBuf, lock_strategy: PosixFsLockStrategy) -> Self {
+        Self {
+            root,
+            lock_strategy,
+            lock_timeout: FILE_LOCK_TIMEOUT,
+        }
+    }
+
+    /// Shortens the acquisition timeout so a test that deliberately contends
+    /// does not spend ten seconds proving it.
+    #[cfg(test)]
+    fn with_lock_timeout(mut self, timeout: Duration) -> Self {
+        self.lock_timeout = Some(timeout);
+        self
     }
 
     fn layout(&self, snapshot_id: &SnapshotId) -> PosixFsSnapshotArtifactLayout {
@@ -492,46 +633,183 @@ impl PosixFsCatalogStore {
             })?;
         }
 
-        let deadline = FILE_LOCK_TIMEOUT.map(|timeout| Instant::now() + timeout);
+        let deadline = self.lock_timeout.map(|timeout| Instant::now() + timeout);
         loop {
-            let file = fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(&lock_path)
-                .map_err(|error| {
-                    RepositoryError::backend(
-                        format!("open {label} lock '{}'", lock_path.display()),
-                        error,
-                    )
-                })?;
-
-            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-                Ok(mut lock) => {
-                    // Contents are diagnostic only; ownership is the flock.
-                    let _ = lock
-                        .set_len(0)
-                        .and_then(|()| lock.write_all(contents.as_bytes()));
-                    let _ = lock.flush();
-                    return Ok(PosixFileLockGuard { _lock: lock });
-                }
-                Err((_, Errno::EWOULDBLOCK | Errno::EINTR)) => {
-                    if let Some(deadline) = deadline {
-                        if Instant::now() < deadline {
-                            thread::sleep(Duration::from_millis(25));
-                            continue;
-                        }
-                    }
-                    return on_locked();
-                }
-                Err((_, errno)) => {
-                    return Err(RepositoryError::backend(
-                        format!("lock {label} lock '{}'", lock_path.display()),
-                        std::io::Error::from(errno),
-                    ));
+            let acquired = match self.lock_strategy {
+                PosixFsLockStrategy::Flock => Self::try_flock(&lock_path, &contents, label)?,
+                PosixFsLockStrategy::CreateNew => Self::try_create_new(&lock_path, label)?,
+            };
+            if let Some(guard) = acquired {
+                return Ok(guard);
+            }
+            if let Some(deadline) = deadline {
+                if Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(25));
+                    continue;
                 }
             }
+            return on_locked();
         }
+    }
+
+    /// One `flock` attempt. `Ok(None)` means somebody else holds it.
+    fn try_flock(
+        lock_path: &Path,
+        contents: &str,
+        label: &'static str,
+    ) -> RepositoryResult<Option<PosixFileLockGuard>> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(lock_path)
+            .map_err(|error| {
+                RepositoryError::backend(
+                    format!("open {label} lock '{}'", lock_path.display()),
+                    error,
+                )
+            })?;
+
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(mut lock) => {
+                // Contents are diagnostic only; ownership is the flock.
+                let _ = lock
+                    .set_len(0)
+                    .and_then(|()| lock.write_all(contents.as_bytes()));
+                let _ = lock.flush();
+                Ok(Some(PosixFileLockGuard::Flock(Box::new(lock))))
+            }
+            Err((_, Errno::EWOULDBLOCK | Errno::EINTR)) => Ok(None),
+            Err((_, errno)) => Err(RepositoryError::backend(
+                format!("lock {label} lock '{}'", lock_path.display()),
+                std::io::Error::from(errno),
+            )),
+        }
+    }
+
+    /// One `create_new` attempt, stealing the lock if it is old enough to have
+    /// been abandoned. `Ok(None)` means somebody else holds it.
+    fn try_create_new(
+        lock_path: &Path,
+        label: &'static str,
+    ) -> RepositoryResult<Option<PosixFileLockGuard>> {
+        let token = LockToken::new();
+        match Self::install_lock(lock_path, &token) {
+            Ok(()) => {
+                return Ok(Some(PosixFileLockGuard::Token {
+                    path: lock_path.to_path_buf(),
+                    token,
+                }))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(RepositoryError::backend(
+                    format!("create {label} lock '{}'", lock_path.display()),
+                    error,
+                ))
+            }
+        }
+
+        let Some(stale) = Self::stale_lock_token(lock_path) else {
+            return Ok(None);
+        };
+        if !Self::win_steal_claim(lock_path, &stale) {
+            return Ok(None);
+        }
+
+        // The claim is keyed on the token that was observed to be stale, so
+        // exactly one contender can be here for that token. Re-read before
+        // removing anything: a steal that already completed replaced the file,
+        // and unlinking the winner's fresh lock would put two writers inside.
+        let result = if read_lock_token(lock_path).as_ref() == Some(&stale) {
+            let _ = fs::remove_file(lock_path);
+            match Self::install_lock(lock_path, &token) {
+                Ok(()) => Some(PosixFileLockGuard::Token {
+                    path: lock_path.to_path_buf(),
+                    token,
+                }),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+
+        // Released only after the new lock is installed, so a contender that
+        // then wins this claim re-reads a token that has already changed.
+        let _ = fs::remove_file(Self::steal_claim_path(lock_path, &stale));
+        Ok(result)
+    }
+
+    /// Writes `token` into a lock file that must not already exist.
+    fn install_lock(lock_path: &Path, token: &LockToken) -> std::io::Result<()> {
+        let encoded = serde_json::to_vec(token).map_err(std::io::Error::other)?;
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(lock_path)?;
+        file.write_all(&encoded)?;
+        file.flush()
+    }
+
+    /// The token of a lock old enough to be treated as abandoned.
+    ///
+    /// The age and the token are taken from one open descriptor, so both
+    /// describe the same inode. Statting the path and then reading it back
+    /// describes two different files whenever the lock is stolen in between:
+    /// a contender times the abandoned lock's mtime, the thief unlinks it and
+    /// installs a fresh one, and the contender reads the *thief's* token as
+    /// the one it just proved stale — then claims it and steals a lock that is
+    /// microseconds old. Two holders, from an inode that was never abandoned.
+    /// `a_stale_create_new_lock_admits_one_contender_at_a_time` reproduces it
+    /// in 8 rounds out of 40 against the two-syscall version.
+    ///
+    /// Age comes from the mtime, which is written once at creation and never
+    /// refreshed, so it measures how long ago the lock was taken rather than
+    /// how long it has been idle. That is only safe because the acquisition
+    /// timeout is far shorter than the stale age: a contender gives up long
+    /// before it could age a live holder into this branch.
+    fn stale_lock_token(lock_path: &Path) -> Option<LockToken> {
+        let mut file = fs::File::open(lock_path).ok()?;
+        let modified = file.metadata().ok()?.modified().ok()?;
+        if SystemTime::now().duration_since(modified).ok()? < CREATE_NEW_STALE_AGE {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).ok()?;
+        // Malformed is tokenless, as in `read_lock_token`: a torn or older
+        // write cannot answer "whose lock is this?", so it is not stealable
+        // through the token-keyed claim.
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Where the right to steal the lock held by `stale` is claimed.
+    fn steal_claim_path(lock_path: &Path, stale: &LockToken) -> PathBuf {
+        let mut name = lock_path.as_os_str().to_os_string();
+        name.push(format!(".steal.{}", stale.uuid));
+        PathBuf::from(name)
+    }
+
+    /// Claims the right to steal one particular stale lock.
+    ///
+    /// `create_new` on a name derived from the observed token is what makes the
+    /// steal exclusive. Deleting the stale file and re-creating it cannot be:
+    /// two contenders would both delete, both create, and both proceed — which
+    /// is the defect this strategy exists to have fixed.
+    ///
+    /// The known cost: a contender that dies between winning the claim and
+    /// installing its lock leaves the claim file behind, and since the claim is
+    /// keyed on the observed token, that stale lock can then never be stolen.
+    /// Ageing the claim out is not a fix — two contenders would both find it
+    /// expired, both remove it, both re-create it, and both steal the same
+    /// lock, which is exactly the race above. Recovering that state means
+    /// deleting the two files, and it is one more reason `flock` is the
+    /// shipped default and this strategy is for filesystems that cannot.
+    fn win_steal_claim(lock_path: &Path, stale: &LockToken) -> bool {
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(Self::steal_claim_path(lock_path, stale))
+            .is_ok()
     }
 
     fn acquire_alias_lock(&self, alias: &SnapshotAlias) -> RepositoryResult<PosixFileLockGuard> {
@@ -715,10 +993,12 @@ mod tests {
     use tempfile::TempDir;
 
     use super::super::layout::PosixFsSnapshotArtifactLayout;
-    use super::PosixFsCatalogStore;
+    use super::{fs, thread, Duration};
+    use super::{read_lock_token, PosixFileLockGuard, PosixFsCatalogStore, PosixFsLockStrategy};
     use crate::snapshot::{
-        CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotPublishMetadata,
-        SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind, TemplateBuildStatus,
+        CommittedSnapshot, RepositoryError, SnapshotAlias, SnapshotId, SnapshotListFilter,
+        SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSourceKind,
+        TemplateBuildStatus,
     };
 
     #[test]
@@ -1090,6 +1370,309 @@ mod tests {
         assert!(
             acquired.load(Ordering::SeqCst) > 0,
             "no contender ever acquired the lock"
+        );
+    }
+
+    /// Publishing an alias is a compare-and-set across two files, so it needs
+    /// the lock to be a mutex and not a hint.
+    ///
+    /// Eight publishers, one alias: exactly one must win and the other seven
+    /// must be told there is a conflict. Two publishers inside the critical
+    /// section both read "no alias yet" and both write, and the loser's record
+    /// then claims an alias pointing at the winner's snapshot.
+    fn concurrent_alias_publish_yields_one_record(strategy: PosixFsLockStrategy) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let root = TempDir::new().expect("tempdir should exist");
+        let store = Arc::new(PosixFsCatalogStore::with_lock_strategy(
+            root.path().to_path_buf(),
+            strategy,
+        ));
+        let alias = SnapshotAlias::parse("contended-publish").expect("alias");
+        let published = Arc::new(AtomicUsize::new(0));
+        let conflicted = Arc::new(AtomicUsize::new(0));
+        let other = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let store = Arc::clone(&store);
+                let alias = alias.clone();
+                let published = Arc::clone(&published);
+                let conflicted = Arc::clone(&conflicted);
+                let other = Arc::clone(&other);
+                scope.spawn(move || {
+                    let snapshot_id = SnapshotId::generate();
+                    let session = store
+                        .begin_publish(&snapshot_id)
+                        .expect("begin should work");
+                    let result = store.commit_publish(
+                        &session,
+                        SnapshotPublishMetadata {
+                            id: snapshot_id,
+                            alias: Some(alias),
+                            source: SnapshotPublishSource::Template,
+                            ..SnapshotPublishMetadata::mock()
+                        },
+                        CommittedSnapshot::mock(),
+                    );
+                    match result {
+                        Ok(_) => published.fetch_add(1, Ordering::SeqCst),
+                        Err(RepositoryError::AliasConflict { .. }) => {
+                            conflicted.fetch_add(1, Ordering::SeqCst)
+                        }
+                        Err(_) => other.fetch_add(1, Ordering::SeqCst),
+                    };
+                });
+            }
+        });
+
+        assert_eq!(
+            other.load(Ordering::SeqCst),
+            0,
+            "a publisher failed for a reason other than the alias conflict"
+        );
+        assert_eq!(
+            published.load(Ordering::SeqCst),
+            1,
+            "{strategy}: exactly one publisher may take the alias"
+        );
+        assert_eq!(
+            conflicted.load(Ordering::SeqCst),
+            7,
+            "{strategy}: every other publisher must be told the alias is taken"
+        );
+
+        let resolved = store
+            .get(alias.as_ref())
+            .expect("alias lookup should work")
+            .expect("the alias should resolve");
+        assert_eq!(
+            resolved.alias.as_ref(),
+            Some(&alias),
+            "{strategy}: the alias must resolve to the record that claimed it"
+        );
+    }
+
+    #[test]
+    fn concurrent_alias_publish_yields_one_record_under_flock() {
+        concurrent_alias_publish_yields_one_record(PosixFsLockStrategy::Flock);
+    }
+
+    #[test]
+    fn concurrent_alias_publish_yields_one_record_under_create_new() {
+        concurrent_alias_publish_yields_one_record(PosixFsLockStrategy::CreateNew);
+    }
+
+    /// Backdates a lock file past the age at which the fallback treats it as
+    /// abandoned.
+    fn age_lock_file(path: &std::path::Path) {
+        let aged =
+            std::time::SystemTime::now() - (super::CREATE_NEW_STALE_AGE + Duration::from_secs(1));
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("lock file should be open-able");
+        file.set_times(fs::FileTimes::new().set_modified(aged))
+            .expect("lock file mtime should be settable");
+    }
+
+    /// The fallback's lock is a mutex even when the file it finds is stale.
+    ///
+    /// A stale lock is exactly where the previous implementation broke: every
+    /// contender saw an abandoned file, every one deleted it, and every one
+    /// created its own, so all of them proceeded together. Deleting and
+    /// re-creating cannot be the steal; claiming the right to steal one
+    /// observed token has to be.
+    ///
+    /// The contenders are released from a barrier, and the round is repeated.
+    /// A version that only spawned threads in a loop was a lottery rather than
+    /// a pin: thread creation costs more than the steal does, so the first
+    /// thief had installed a fresh lock before the second contender looked at
+    /// the file, the race never opened, and the naive delete-then-create steal
+    /// passed it in 19 runs out of 25. With the barrier that steal loses rounds
+    /// every time.
+    #[test]
+    fn a_stale_create_new_lock_admits_one_contender_at_a_time() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        /// Enough contenders that the window between one thief's re-read and
+        /// its install is covered by somebody.
+        const CONTENDERS: usize = 16;
+        /// Rounds. One round is one abandoned lock and one stampede at it.
+        const ROUNDS: usize = 40;
+
+        let root = TempDir::new().expect("tempdir should exist");
+        let store = Arc::new(
+            PosixFsCatalogStore::with_lock_strategy(
+                root.path().to_path_buf(),
+                PosixFsLockStrategy::CreateNew,
+            )
+            // Short, so the contenders that lose a round give it up rather
+            // than holding the test open for the full retry ladder.
+            .with_lock_timeout(Duration::from_millis(80)),
+        );
+
+        let mut overlap_rounds = 0;
+        for round in 0..ROUNDS {
+            // A fresh alias per round: one abandoned lock, stolen once.
+            let alias = SnapshotAlias::parse(&format!("stale-alias-{round}")).expect("alias");
+            let lock_path = PosixFsSnapshotArtifactLayout::alias_lock_path(root.path(), &alias);
+
+            // A lock left behind by a process that is gone.
+            std::mem::forget(store.acquire_alias_lock(&alias).expect("seed the lock"));
+            age_lock_file(&lock_path);
+
+            let start = Arc::new(Barrier::new(CONTENDERS));
+            let inside = Arc::new(AtomicUsize::new(0));
+            let overlaps = Arc::new(AtomicUsize::new(0));
+            let acquired = Arc::new(AtomicUsize::new(0));
+
+            std::thread::scope(|scope| {
+                for _ in 0..CONTENDERS {
+                    let store = Arc::clone(&store);
+                    let alias = alias.clone();
+                    let start = Arc::clone(&start);
+                    let inside = Arc::clone(&inside);
+                    let overlaps = Arc::clone(&overlaps);
+                    let acquired = Arc::clone(&acquired);
+                    scope.spawn(move || {
+                        // Every contender looks at the same abandoned lock at
+                        // the same moment. This is the whole point: the steal
+                        // has to be exclusive under simultaneity, not under
+                        // the accident of thread-spawn order.
+                        start.wait();
+                        let Ok(guard) = store.acquire_alias_lock(&alias) else {
+                            return;
+                        };
+                        acquired.fetch_add(1, Ordering::SeqCst);
+                        if inside.fetch_add(1, Ordering::SeqCst) != 0 {
+                            overlaps.fetch_add(1, Ordering::SeqCst);
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                        inside.fetch_sub(1, Ordering::SeqCst);
+                        drop(guard);
+                    });
+                }
+            });
+
+            if overlaps.load(Ordering::SeqCst) > 0 {
+                overlap_rounds += 1;
+            }
+            assert!(
+                acquired.load(Ordering::SeqCst) > 0,
+                "round {round}: nobody managed to steal an abandoned lock"
+            );
+        }
+
+        assert_eq!(
+            overlap_rounds, 0,
+            "two contenders held the same stolen lock in {overlap_rounds}/{ROUNDS} rounds"
+        );
+    }
+
+    /// An abandoned lock has to be recoverable, or one crashed process wedges
+    /// an alias for the life of the deployment.
+    #[test]
+    fn an_abandoned_create_new_lock_is_stolen() {
+        let root = TempDir::new().expect("tempdir should exist");
+        let store = PosixFsCatalogStore::with_lock_strategy(
+            root.path().to_path_buf(),
+            PosixFsLockStrategy::CreateNew,
+        )
+        .with_lock_timeout(Duration::from_millis(200));
+        let alias = SnapshotAlias::parse("abandoned-alias").expect("alias");
+        let lock_path = PosixFsSnapshotArtifactLayout::alias_lock_path(root.path(), &alias);
+
+        // A lock whose holder is gone: the guard is leaked so nothing releases it.
+        std::mem::forget(store.acquire_alias_lock(&alias).expect("seed the lock"));
+        assert!(
+            store.acquire_alias_lock(&alias).is_err(),
+            "a lock that is not yet stale must not be stealable"
+        );
+
+        age_lock_file(&lock_path);
+        store
+            .acquire_alias_lock(&alias)
+            .expect("an abandoned lock should be recoverable once it is stale");
+    }
+
+    /// Exactly one contender may take over one abandoned lock.
+    ///
+    /// The steal cannot be "delete it and create your own": two contenders that
+    /// both saw the same abandoned file would both delete, both create, and
+    /// both proceed — and the second delete removes the first's fresh lock.
+    /// Claiming the right to steal one *observed token* is what makes it
+    /// exclusive, and this is that claim.
+    #[test]
+    fn only_one_contender_may_claim_one_abandoned_lock() {
+        let root = TempDir::new().expect("tempdir should exist");
+        let store = PosixFsCatalogStore::with_lock_strategy(
+            root.path().to_path_buf(),
+            PosixFsLockStrategy::CreateNew,
+        );
+        let alias = SnapshotAlias::parse("claimed-alias").expect("alias");
+        let lock_path = PosixFsSnapshotArtifactLayout::alias_lock_path(root.path(), &alias);
+
+        std::mem::forget(store.acquire_alias_lock(&alias).expect("seed the lock"));
+        age_lock_file(&lock_path);
+        let stale = super::PosixFsCatalogStore::stale_lock_token(&lock_path)
+            .expect("the aged lock should read as abandoned");
+
+        assert!(
+            PosixFsCatalogStore::win_steal_claim(&lock_path, &stale),
+            "the first contender must be able to claim an abandoned lock"
+        );
+        assert!(
+            !PosixFsCatalogStore::win_steal_claim(&lock_path, &stale),
+            "a second contender claimed the same abandoned lock"
+        );
+    }
+
+    /// A guard whose lock was stolen must not delete the thief's file.
+    ///
+    /// The previous guard unlinked unconditionally, so the original holder
+    /// finishing its critical section removed the new owner's lock and let a
+    /// third writer in behind it. Once that starts it does not settle.
+    #[test]
+    fn a_guard_does_not_remove_a_lock_it_no_longer_owns() {
+        let root = TempDir::new().expect("tempdir should exist");
+        let store = PosixFsCatalogStore::with_lock_strategy(
+            root.path().to_path_buf(),
+            PosixFsLockStrategy::CreateNew,
+        )
+        .with_lock_timeout(Duration::from_millis(200));
+        let alias = SnapshotAlias::parse("stolen-alias").expect("alias");
+        let lock_path = PosixFsSnapshotArtifactLayout::alias_lock_path(root.path(), &alias);
+
+        let first = store.acquire_alias_lock(&alias).expect("first acquire");
+        age_lock_file(&lock_path);
+
+        let second = store
+            .acquire_alias_lock(&alias)
+            .expect("the stale lock is stealable");
+        let PosixFileLockGuard::Token { token: thief, .. } = &second else {
+            panic!("the create_new strategy must produce a token guard");
+        };
+        let thief = thief.clone();
+
+        drop(first);
+
+        assert!(
+            lock_path.exists(),
+            "the original holder deleted the thief's lock file"
+        );
+        assert_eq!(
+            read_lock_token(&lock_path).as_ref(),
+            Some(&thief),
+            "the lock file no longer carries the current owner's token"
+        );
+
+        drop(second);
+        assert!(
+            !lock_path.exists(),
+            "the owner's own drop should release the lock"
         );
     }
 }

@@ -165,8 +165,33 @@ func parseRedisAddress(addr string) ([]string, *redis.Options, error) {
 }
 
 func (s *RedisBindingStore) connect(addrs []string, opts *redis.Options) (redis.UniversalClient, error) {
-	single := redis.NewClient(singleOptions(addrs[0], opts))
-	ctx, cancel := s.context()
+	return connectRedis(addrs, opts, s.operationTimeout, 0)
+}
+
+// connectRedis dials seeds and speaks whichever protocol the server is running.
+//
+// Whether this is a cluster is asked of the server rather than inferred from
+// the address: a single-seed cluster is ordinary, and a client that guessed
+// "one address means one instance" would fail on the first MOVED it received,
+// at some arbitrary later moment rather than at startup.
+//
+// poolSize overrides the client's connection pool, for a caller that holds
+// connections open indefinitely — blocking reads — and would otherwise starve
+// everything sharing the pool.
+func connectRedis(addrs []string, opts *redis.Options, timeout time.Duration, poolSize int) (redis.UniversalClient, error) {
+	if timeout <= 0 {
+		timeout = defaultRedisOperationTimeout
+	}
+	withTimeout := func() (context.Context, context.CancelFunc) {
+		return context.WithTimeout(context.Background(), timeout)
+	}
+
+	singleOpts := singleOptions(addrs[0], opts)
+	if poolSize > 0 {
+		singleOpts.PoolSize = poolSize
+	}
+	single := redis.NewClient(singleOpts)
+	ctx, cancel := withTimeout()
 	defer cancel()
 
 	// `INFO cluster`, not `CLUSTER INFO`: only the former reports whether
@@ -175,8 +200,12 @@ func (s *RedisBindingStore) connect(addrs []string, opts *redis.Options) (redis.
 	info, err := single.Info(ctx, "cluster").Result()
 	if err == nil && strings.Contains(info, "cluster_enabled:1") {
 		_ = single.Close()
-		cluster := redis.NewClusterClient(clusterOptions(addrs, opts))
-		ctx, cancel := s.context()
+		clusterOpts := clusterOptions(addrs, opts)
+		if poolSize > 0 {
+			clusterOpts.PoolSize = poolSize
+		}
+		cluster := redis.NewClusterClient(clusterOpts)
+		ctx, cancel := withTimeout()
 		defer cancel()
 		if err := cluster.Ping(ctx).Err(); err != nil {
 			_ = cluster.Close()

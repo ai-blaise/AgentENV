@@ -31,7 +31,7 @@ pub use persistence::{
     SandboxPersistenceError, SandboxPersister,
 };
 pub use proxy::{ProxyLookupResult, ProxyTarget};
-pub use service::Orchestrator;
+pub use service::{DrainProgress, Orchestrator, PausedStatePublisher};
 pub use store::{
     InMemoryMetadataStore, MetadataStore, NewTimeout, SandboxListFilter, SandboxMetadata,
     SandboxTimeoutAction,

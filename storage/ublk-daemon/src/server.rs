@@ -177,7 +177,7 @@ impl PoolState {
         placeholder_dir: PathBuf,
     ) -> Self {
         Self {
-            idle: WarmPool::new(config.clone()),
+            idle: WarmPool::named(config.clone(), "block"),
             active_exclusive: DashMap::new(),
             active_shared: DashMap::new(),
             shared_by_dev_id: DashMap::new(),

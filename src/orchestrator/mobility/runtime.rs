@@ -80,6 +80,8 @@ pub trait MobilityHooks: Send + Sync {
         sandbox_id: &SandboxId,
         snapshot_id: &crate::snapshot::SnapshotId,
     );
+    /// The snapshot a paused sandbox's state was already committed under.
+    async fn committed_snapshot(&self, sandbox_id: &SandboxId) -> Option<String>;
     /// Counts records by state, for the node's metrics.
     async fn record_counts(&self) -> MobilityRecordCounts;
     /// Publishes those counts as gauges.
@@ -110,6 +112,10 @@ impl<S: MobilityStore + 'static> MobilityHooks for MobilityRuntime<S> {
         snapshot_id: &crate::snapshot::SnapshotId,
     ) {
         MobilityRuntime::record_committed(self, sandbox_id, snapshot_id).await
+    }
+
+    async fn committed_snapshot(&self, sandbox_id: &SandboxId) -> Option<String> {
+        MobilityRuntime::committed_snapshot(self, sandbox_id).await
     }
 
     async fn record_counts(&self) -> MobilityRecordCounts {
@@ -263,6 +269,28 @@ impl<S: MobilityStore> MobilityRuntime<S> {
             "published a paused sandbox but lost every race to record it as movable; it stays \
              unmovable until it is published again"
         );
+    }
+
+    /// The snapshot this sandbox's paused state was already committed under.
+    ///
+    /// `None` covers three cases a caller treats alike: no record, a record
+    /// written at pause time and not yet committed, and a store this node
+    /// cannot read. All three mean "nothing outside this node can restore it",
+    /// which is the answer that keeps a publisher publishing. Answering an
+    /// unreadable store as committed would instead skip the upload and leave a
+    /// paused sandbox reachable only from a node that is being taken away.
+    pub async fn committed_snapshot(&self, sandbox_id: &SandboxId) -> Option<String> {
+        match self.coordinator.store().get(sandbox_id).await {
+            Ok(record) => record.and_then(|record| record.snapshot_id),
+            Err(error) => {
+                warn!(
+                    %sandbox_id,
+                    error = %error,
+                    "mobility store unreadable; treating a paused sandbox as not yet published"
+                );
+                None
+            }
+        }
     }
 
     /// Parks tombstones that name this node for sandboxes it is not running.
