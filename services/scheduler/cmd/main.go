@@ -48,7 +48,26 @@ func main() {
 	store, closeStore := createBindingStore(logger, cfg)
 	defer closeStore()
 
-	g := grpc.NewServer(grpc.UnaryInterceptor(scheduler.MetricsUnaryInterceptor()))
+	authToken, err := scheduler.ResolveAuthToken(cfg.Scheduler.AuthToken, cfg.Scheduler.AuthTokenFile)
+	if err != nil {
+		logger.Fatal("resolve scheduler auth token failed", zap.Error(err))
+	}
+	if !scheduler.AuthEnabled(authToken) {
+		// Said once, at startup, and not again: an open listener is a
+		// deployment choice the operator should see made, not a condition to
+		// be reminded of on every RPC.
+		logger.Warn("scheduler gRPC authentication is disabled; every RPC is accepted",
+			zap.String("enable_with", "scheduler.auth_token, scheduler.auth_token_file or SCHEDULER_AUTH_TOKEN"),
+		)
+	}
+
+	// Metrics outermost so a refused RPC is still timed and labelled
+	// status=unauthenticated; the auth interceptor's own counter carries the
+	// reason.
+	g := grpc.NewServer(
+		grpc.ChainUnaryInterceptor(scheduler.MetricsUnaryInterceptor(), scheduler.AuthUnaryInterceptor(authToken)),
+		grpc.ChainStreamInterceptor(scheduler.AuthStreamInterceptor(authToken)),
+	)
 	if *queryOnly {
 		svc := scheduler.NewQueryOnlyService(logger, store)
 		schedulerv1.RegisterSchedulerServer(g, svc)
@@ -76,13 +95,18 @@ func main() {
 			// built with, so an operator raising binding_ttl changed the store
 			// and nothing else.
 			scheduler.WithBindingTTL(cfg.Scheduler.BindingTTL),
-			scheduler.WithArtifactStore(scheduler.NewInMemoryArtifactStore(
+			scheduler.WithArtifactStoreCapacity(
 				cfg.Scheduler.ArtifactStoreCapacity,
 				cfg.Scheduler.ArtifactLookupNodeLimit,
-			)),
+			),
 			scheduler.WithNodeResourceLimit(cfg.Scheduler.NodeResourceLimit),
 			scheduler.WithReportTTL(cfg.Scheduler.ReportTTL),
 			scheduler.WithHealthGate(cfg.Scheduler.HealthGateEnabled()),
+			scheduler.WithReservations(cfg.Scheduler.ReservationsEnabled, cfg.Scheduler.MaxReservationDelta),
+			// Mobility records follow the binding store: a deployment that put
+			// bindings in Redis so a restart or a second replica could see
+			// them needs paused-sandbox ownership there for the same reason.
+			scheduler.WithMobilityStore(scheduler.MobilityStoreFor(store)),
 		)
 		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
 		schedulerv1.RegisterSchedulerServer(g, svc)
@@ -101,7 +125,10 @@ func main() {
 		zap.String("addr", cfg.Scheduler.GRPCListenAddr),
 		zap.String("strategy", cfg.Scheduler.Strategy),
 		zap.String("binding_store", bindingStoreName(cfg)),
+		zap.String("mobility_store", bindingStoreName(cfg)),
 		zap.Bool("query_only", *queryOnly),
+		zap.Bool("auth_enabled", scheduler.AuthEnabled(authToken)),
+		zap.Bool("reservations_enabled", cfg.Scheduler.ReservationsEnabled),
 	)
 
 	metricsServer := &http.Server{

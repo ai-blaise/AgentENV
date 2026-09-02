@@ -377,3 +377,42 @@ func TestMobilityStoreSurvivesScriptFlush(t *testing.T) {
 }
 
 var _ = time.Second
+
+// The mobility store follows the binding store, so a deployment that put
+// bindings in Redis has its paused-sandbox records there too — and one that
+// did not is not made to depend on a Redis it does not run.
+func TestMobilityStoreFollowsTheBindingStore(t *testing.T) {
+	if _, ok := MobilityStoreFor(NewInMemoryBindingStore(time.Minute)).(*InMemoryMobilityStore); !ok {
+		t.Fatal("in-memory bindings must select the in-memory mobility store")
+	}
+	if _, ok := MobilityStoreFor(nil).(*InMemoryMobilityStore); !ok {
+		t.Fatal("no binding store must select the in-memory mobility store")
+	}
+
+	addr := startRedisServerForTest(t)
+	bindings, err := NewRedisBindingStore(addr, time.Minute)
+	if err != nil {
+		t.Fatalf("redis binding store: %v", err)
+	}
+	t.Cleanup(func() { _ = bindings.Close() })
+
+	selected, ok := MobilityStoreFor(bindings).(*RedisMobilityStore)
+	if !ok {
+		t.Fatalf("redis bindings selected %T, want the redis mobility store", MobilityStoreFor(bindings))
+	}
+
+	// Written through the selected store, visible through an independent
+	// client to the same server: the records are in Redis, not in this
+	// process.
+	ctx := context.Background()
+	record := mobilityRecord("sandbox-shared", "node-a", 1)
+	if applied, err := selected.Upsert(ctx, record); err != nil || !applied {
+		t.Fatalf("upsert through the selected store: applied=%v err=%v", applied, err)
+	}
+	other := redis.NewClient(&redis.Options{Addr: addr})
+	t.Cleanup(func() { _ = other.Close() })
+	got, found, err := NewRedisMobilityStore(other).Get(ctx, "sandbox-shared")
+	if err != nil || !found || got.Generation != record.Generation {
+		t.Fatalf("record not visible through another client: found=%v err=%v got=%+v", found, err, got)
+	}
+}

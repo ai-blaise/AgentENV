@@ -24,8 +24,9 @@ func TestDefaultSchedulerDiscoveryModeIsStatic(t *testing.T) {
 	if got := cfg.Scheduler.Discovery.Kubernetes.Scheme; got != "http" {
 		t.Fatalf("expected kubernetes discovery scheme http, got %q", got)
 	}
-	if got := cfg.Scheduler.ReportTTL; got != 30*time.Second {
-		t.Fatalf("expected scheduler report ttl 30s, got %s", got)
+	// The report TTL is derived from the binding TTL at load, not fixed here.
+	if got := cfg.Scheduler.ReportTTL; got != 0 {
+		t.Fatalf("expected scheduler report ttl unset before defaults apply, got %s", got)
 	}
 	if got := cfg.Scheduler.BindingTTL; got != 30*time.Second {
 		t.Fatalf("expected scheduler binding ttl 30s, got %s", got)
@@ -36,8 +37,30 @@ func TestDefaultSchedulerDiscoveryModeIsStatic(t *testing.T) {
 	if got := cfg.Scheduler.ArtifactStoreCapacity; got != defaultSchedulerArtifactStoreCapacity {
 		t.Fatalf("expected scheduler artifact store capacity %d, got %d", defaultSchedulerArtifactStoreCapacity, got)
 	}
-	if got := cfg.Scheduler.ArtifactLookupNodeLimit; got != 0 {
-		t.Fatalf("expected scheduler artifact lookup node limit 0, got %d", got)
+	if got := cfg.Scheduler.ArtifactLookupNodeLimit; got != defaultSchedulerArtifactLookupNodeLimit {
+		t.Fatalf("expected scheduler artifact lookup node limit %d, got %d", defaultSchedulerArtifactLookupNodeLimit, got)
+	}
+}
+
+// An unset report TTL follows a shorter binding TTL down rather than being
+// pinned at 30s, so a config that sets only binding_ttl keeps booting under the
+// report/binding ordering rule.
+func TestLoadDerivesTheReportTTLFromAShortBindingTTL(t *testing.T) {
+	for _, tc := range []struct {
+		bindingTTL string
+		want       time.Duration
+	}{
+		{bindingTTL: "10s", want: 10 * time.Second},
+		{bindingTTL: "30s", want: 30 * time.Second},
+		{bindingTTL: "2m", want: 30 * time.Second},
+	} {
+		cfg, err := Load(writeSchedulerConfig(t, fmt.Sprintf(`"binding_ttl": %q`, tc.bindingTTL)), "scheduler")
+		if err != nil {
+			t.Fatalf("binding_ttl %s: %v", tc.bindingTTL, err)
+		}
+		if cfg.Scheduler.ReportTTL != tc.want {
+			t.Fatalf("binding_ttl %s: report_ttl = %s, want %s", tc.bindingTTL, cfg.Scheduler.ReportTTL, tc.want)
+		}
 	}
 }
 
@@ -264,6 +287,7 @@ func TestLoadParsesSchedulerReportTTLDurationString(t *testing.T) {
 	content := `{
 		"scheduler": {
 			"report_ttl": "45s",
+			"binding_ttl": "60s",
 			"nodes": [
 				{"id": "node-a", "endpoint": "http://node-a:8000"}
 			]

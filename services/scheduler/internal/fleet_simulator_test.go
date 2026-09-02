@@ -156,7 +156,7 @@ func TestSimulatedFleetExcludesStaleNodes(t *testing.T) {
 		})
 	}
 
-	eligible, dropped := FilterByHealth(rich, defaultObservedReportTTL, fresh)
+	eligible, dropped, _ := FilterByHealth(rich, defaultObservedReportTTL, fresh)
 
 	if dropped[HealthFilterReasonStale] == 0 {
 		t.Fatal("the node that stopped heartbeating should have been dropped as stale")

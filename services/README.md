@@ -97,23 +97,29 @@ General config notes:
 
 - `scheduler.report_ttl` must be a duration string such as `"30s"` in JSON config files.
 - `scheduler.binding_ttl` must be a duration string such as `"30s"` in JSON config files.
-- `scheduler.report_ttl` controls how long an observed node heartbeat stays healthy.
+- `scheduler.report_ttl` controls how long an observed node heartbeat stays healthy. Unset, it is the smaller of `30s` and `scheduler.binding_ttl`. It must not exceed `scheduler.binding_ttl`: routing has to outlive placement eligibility, or a node's bindings expire while the scheduler is still filling it and its live sandboxes 404. The relation is checked at config load.
 - `scheduler.binding_ttl` controls how long sandbox-to-node bindings survive without a fresh `RecordAssignment` or heartbeat roster refresh.
 - `scheduler.reconcile_grace` is how recently a binding must have been written for a heartbeat reconcile to leave it alone when the node's roster omits it; it covers the gap between a node collecting its roster and the scheduler acting on it, during which a newly placed sandbox is bound but in no roster yet. Unset, it is the smaller of `10s` and half of `scheduler.binding_ttl`. An explicit value must be shorter than `scheduler.binding_ttl` and, when `scheduler.heartbeat_interval` is set, at least two intervals long; both relations are checked at config load and again when the binding store is built.
-- `scheduler.heartbeat_interval` is the interval nodes are expected to report at. It is used only to validate the TTLs and grace above against it at startup: `scheduler.report_ttl` and `scheduler.binding_ttl` must be at least three intervals, `scheduler.reconcile_grace` at least two. Unset, those checks are skipped; the scheduler still re-checks the binding-TTL relation on every heartbeat against the interval each node reports.
+- `scheduler.heartbeat_interval` is the interval nodes are expected to report at. It is used only to validate the TTLs and grace above against it at startup: `scheduler.report_ttl` and `scheduler.binding_ttl` must be at least three intervals, `scheduler.reconcile_grace` at least two. Unset, those checks are skipped; the scheduler still re-checks both TTL relations on every heartbeat against the interval each node reports, and withholds roster elision from a node whose interval either TTL cannot cover three of — that node's roster is reconciled in full on every heartbeat, and the misordering is logged once per node. The heartbeat itself is never refused for it: refusing would take a live node's data plane down over a configuration relation.
 - `scheduler.schedule_health_gate` (default `true`) excludes nodes whose last heartbeat is older than `scheduler.report_ttl`, or that report themselves unhealthy or draining, from placement. Setting it to `false` restores placement on any discovered node regardless of heartbeat age.
 - `scheduler.redis_addr` selects Redis-backed sandbox binding storage when set; when empty, the scheduler uses the in-memory binding store. It accepts `host:port`, a comma-separated list of cluster seeds (`host1:6379,host2:6379,host3:6379`), or a Redis URL such as `redis://[:password@]host:6379/db`.
 
   Whether to speak the cluster protocol is asked of the server rather than inferred from the address, so a single-seed cluster works and a misconfiguration fails at startup rather than on the first `MOVED`. Bindings are keyed by sandbox id and node indexes by node id, each with its own hash tag, so they shard across the cluster instead of piling into one slot — the read path that every proxied request takes is a single key in a single slot.
 - `--query-only` starts a read-only scheduler that supports only `LookupNode`; it requires `scheduler.redis_addr` and does not need node discovery config.
-- `scheduler.artifact_store_capacity` controls how many distinct P2P artifact keys the in-memory artifact index keeps before LRU eviction; defaults to `1000000`.
-- `scheduler.artifact_lookup_node_limit` controls how many node IDs a P2P artifact lookup returns; values `<= 0` return all matching nodes.
+- `scheduler.artifact_store_capacity` controls how many distinct P2P artifact keys the in-memory artifact index keeps before LRU eviction; defaults to `1000000`. Evictions are counted by `agentenv_scheduler_p2p_artifact_evictions_total`.
+- `scheduler.artifact_lookup_node_limit` controls how many node IDs a P2P artifact lookup returns; defaults to `8`. A node dials at most four candidates concurrently and stops at the first hit, so a longer answer is response bytes spent on nodes that are never contacted. The returned subset is a prefix of Go's randomised map order, which spreads fetches across providers; `agentenv_scheduler_p2p_lookup_peers` is the distribution of answer sizes. Values `<= 0` return all matching nodes.
+- `scheduler.auth_token` is the shared bearer token every gRPC caller — the gateway, each node's heartbeat reporter — must present as `authorization: Bearer <token>` request metadata. When unset the listener accepts every call, which is how every deployment before this key behaved; the scheduler logs `scheduler gRPC authentication is disabled` once at startup. When set, every RPC on the `Scheduler` service — placement, bindings, heartbeats, event reports, the P2P index and the mobility records — is refused with `UNAUTHENTICATED` unless the token matches (constant-time compare); only `grpc.health.v1.Health` stays open so readiness and liveness probes keep working. Refusals are counted by `agentenv_scheduler_auth_rejected_total{reason="missing"|"malformed"|"invalid"}` and appear under `status="unauthenticated"` in `agentenv_scheduler_rpc_duration_seconds`. Roll out by distributing the token to gateways and nodes first, then setting it here; unsetting it is the rollback.
+- `scheduler.auth_token_file` names a file holding the token instead, for deployments that mount secrets rather than render them into config. The file must exist and be non-empty when the key is set; setting both `auth_token` and `auth_token_file` is refused.
+- `scheduler.reservations_enabled` (default `false`) lets the reservation ledger adjust each node's last heartbeat snapshot between heartbeats: node-reported create/fork/delete/pause/resume events move the running, paused, allocated-CPU and allocated-memory counts the way the node's own accounting does, and each placement the scheduler makes reserves one sandbox, one start in flight and the requested CPU and memory against the chosen node until that node reports the create or its next heartbeat overtakes it. This is what lets two placements inside one heartbeat interval see each other. The ledger is advisory — events are delivered best-effort and the heartbeat always wins — and ships off because a defect in it would refuse placements for capacity the fleet has. `agentenv_scheduler_reservation_drift` is the histogram of how far, in sandboxes, the ledger had moved a node when its heartbeat replaced that view; a distribution stuck at zero means the interval is short enough that the ledger is not doing anything.
+- `scheduler.max_reservation_delta` (default `512`) clamps how far the ledger may move one node's sandbox count from what its last heartbeat reported, in either direction. Events that would cross it are dropped whole. Events are lossy by construction, and the clamp is what keeps a node that has stopped heartbeating from carrying unbounded phantom load until its entries expire at twice `scheduler.report_ttl`.
 - `SCHEDULER_BINDING_TTL=<duration>` overrides `scheduler.binding_ttl` from the environment.
 - `SCHEDULER_RECONCILE_GRACE=<duration>` overrides `scheduler.reconcile_grace` from the environment.
 - `SCHEDULER_HEARTBEAT_INTERVAL=<duration>` overrides `scheduler.heartbeat_interval` from the environment.
 - `SCHEDULER_REDIS_ADDR=<addr>` overrides `scheduler.redis_addr` from the environment.
 - `SCHEDULER_ARTIFACT_STORE_CAPACITY=<count>` overrides `scheduler.artifact_store_capacity` from the environment.
 - `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT=<count>` overrides `scheduler.artifact_lookup_node_limit` from the environment.
+- `SCHEDULER_AUTH_TOKEN=<token>` and `SCHEDULER_AUTH_TOKEN_FILE=<path>` override `scheduler.auth_token` and `scheduler.auth_token_file` from the environment.
+- `SCHEDULER_RESERVATIONS_ENABLED=<bool>` and `SCHEDULER_MAX_RESERVATION_DELTA=<count>` override `scheduler.reservations_enabled` and `scheduler.max_reservation_delta` from the environment.
 
 ### Scheduling strategy
 
@@ -123,8 +129,10 @@ General config notes:
 |---|---|
 | `round_robin` (default) | Cycles through eligible nodes in stable order |
 | `random` | Picks a uniformly random eligible node |
+| `least_loaded_of_two` (alias `p2c`) | Samples two eligible nodes and picks the less loaded by heartbeat snapshot; bounds the maximum load far more tightly than round-robin against a view up to one heartbeat interval stale, without the herding that "pick the least loaded" produces |
+| `bin_pack` | Fills the most loaded eligible node — the one closest to its `scheduler.node_resource_limit` ceiling without being over it. Right for draining or consolidating a fleet; **wrong for tail latency**, because a burst of creates all land on one node where each start contends with the others for that node's network-slot and iptables locks, so the slowest create in the burst gets slower. Only bounded by `scheduler.node_resource_limit`: with no limit configured it fills one node indefinitely |
 
-The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). Current built-in strategies ignore the snapshot, but custom strategy implementations can use it for load-aware decisions.
+The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). `round_robin` and `random` ignore the snapshot; `least_loaded_of_two` and `bin_pack` score it. Only `round_robin` asks for its candidates in a stable order (`Strategy.NeedsStableOrder`); the others skip the per-placement sort that order costs.
 
 ### Node resource limit
 
@@ -159,7 +167,7 @@ Example:
 }
 ```
 
-When all nodes are filtered out, the scheduler returns `Unavailable` to the caller.
+When every node is filtered out, the scheduler returns `RESOURCE_EXHAUSTED` — the fleet exists but has no capacity right now, and a retry after a moment may find some; the message says whether the resource limits or the caller's own `exclude_node_ids` emptied the list. When discovery has no nodes at all it returns `UNAVAILABLE`, which no retry will fix. The gateway maps the two to `503` with and without `Retry-After` respectively.
 
 ## Gateway configuration
 

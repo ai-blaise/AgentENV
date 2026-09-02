@@ -13,6 +13,26 @@ import (
 
 const defaultSchedulerArtifactStoreCapacity = 1_000_000
 
+// defaultSchedulerArtifactLookupNodeLimit bounds how many providers one P2P
+// artifact lookup names.
+//
+// Unlimited was the wrong default: a popular base layer is held by most of the
+// fleet, and the node dials at most four candidates concurrently and stops at
+// the first hit, so everything past the first few is response bytes and
+// peer-filter work spent on nodes that are never contacted.
+const defaultSchedulerArtifactLookupNodeLimit = 8
+
+// defaultSchedulerReportTTL is how long a node's heartbeat keeps it a placement
+// candidate when scheduler.report_ttl is unset, capped at the binding TTL.
+// See applyDefaults for why it is derived rather than fixed.
+const defaultSchedulerReportTTL = 30 * time.Second
+
+// defaultSchedulerMaxReservationDelta bounds how far the reservation ledger may
+// move one node's reported sandbox count before the next heartbeat corrects
+// it. Events are lossy and the count is advisory; the clamp is what keeps a
+// node that stops heartbeating from accumulating phantom load without bound.
+const defaultSchedulerMaxReservationDelta = 512
+
 type Node struct {
 	ID       string `json:"id"`
 	Endpoint string `json:"endpoint"`
@@ -58,8 +78,18 @@ type NodeResourceLimit struct {
 }
 
 type SchedulerConfig struct {
-	GRPCListenAddr          string                   `json:"grpc_listen_addr"`
-	MetricsListenAddr       string                   `json:"metrics_listen_addr"`
+	GRPCListenAddr    string `json:"grpc_listen_addr"`
+	MetricsListenAddr string `json:"metrics_listen_addr"`
+	// Strategy picks a node from the eligible candidates: round_robin (the
+	// default), random, least_loaded_of_two (alias p2c) or bin_pack.
+	//
+	// bin_pack fills the most loaded node that still passes every limit in
+	// NodeResourceLimit. That is right for draining or consolidating a fleet
+	// and wrong for tail latency: it concentrates concurrent starts on one
+	// node, where they contend for the same network-slot and iptables locks,
+	// so the slowest create in a burst gets slower. It is also only bounded by
+	// NodeResourceLimit — with no limit configured it fills one node
+	// indefinitely.
 	Strategy                string                   `json:"strategy"`
 	ReportTTL               time.Duration            `json:"report_ttl"`
 	BindingTTL              time.Duration            `json:"binding_ttl"`
@@ -84,6 +114,25 @@ type SchedulerConfig struct {
 	// newly placed sandbox is bound but not yet in any roster. Zero uses the
 	// store default.
 	ReconcileGrace time.Duration `json:"reconcile_grace"`
+	// AuthToken is the shared secret every gRPC caller must present as
+	// `authorization: Bearer <token>` metadata. Empty leaves the listener
+	// open, which is what every deployment before this key did; the scheduler
+	// says so once at startup. AuthTokenFile names a file holding the token
+	// instead, for deployments that mount secrets rather than render them
+	// into config. Setting both is refused rather than resolved by precedence.
+	AuthToken     string `json:"auth_token"`
+	AuthTokenFile string `json:"auth_token_file"`
+	// ReservationsEnabled lets node-reported lifecycle events and the
+	// scheduler's own placements adjust a node's last heartbeat snapshot
+	// between heartbeats. Off by default: the ledger is advisory and the
+	// heartbeat overwrites it, so the cost of leaving it off is that a burst
+	// inside one interval reads the same numbers, and the cost of a defect in
+	// it would be placements refused for capacity the fleet has.
+	ReservationsEnabled bool `json:"reservations_enabled"`
+	// MaxReservationDelta clamps how far the ledger may move one node's
+	// sandbox count from what its last heartbeat reported. Zero uses the
+	// default.
+	MaxReservationDelta int `json:"max_reservation_delta"`
 }
 
 // HealthGateEnabled reports whether health-gated placement is on, defaulting
@@ -108,6 +157,10 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		ScheduleHealthGate      *bool                     `json:"schedule_health_gate"`
 		HeartbeatInterval       json.RawMessage           `json:"heartbeat_interval"`
 		ReconcileGrace          json.RawMessage           `json:"reconcile_grace"`
+		AuthToken               *string                   `json:"auth_token"`
+		AuthTokenFile           *string                   `json:"auth_token_file"`
+		ReservationsEnabled     *bool                     `json:"reservations_enabled"`
+		MaxReservationDelta     *int                      `json:"max_reservation_delta"`
 	}
 
 	parsed := wire{}
@@ -144,6 +197,18 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.ArtifactLookupNodeLimit != nil {
 		s.ArtifactLookupNodeLimit = *parsed.ArtifactLookupNodeLimit
+	}
+	if parsed.AuthToken != nil {
+		s.AuthToken = *parsed.AuthToken
+	}
+	if parsed.AuthTokenFile != nil {
+		s.AuthTokenFile = *parsed.AuthTokenFile
+	}
+	if parsed.ReservationsEnabled != nil {
+		s.ReservationsEnabled = *parsed.ReservationsEnabled
+	}
+	if parsed.MaxReservationDelta != nil {
+		s.MaxReservationDelta = *parsed.MaxReservationDelta
 	}
 
 	if len(bytes.TrimSpace(parsed.ReportTTL)) > 0 {
@@ -392,10 +457,10 @@ func defaultConfig(service string) Config {
 			GRPCListenAddr:          ":9090",
 			MetricsListenAddr:       ":9101",
 			Strategy:                "round_robin",
-			ReportTTL:               30 * time.Second,
 			BindingTTL:              30 * time.Second,
 			ArtifactStoreCapacity:   defaultSchedulerArtifactStoreCapacity,
-			ArtifactLookupNodeLimit: 0,
+			ArtifactLookupNodeLimit: defaultSchedulerArtifactLookupNodeLimit,
+			MaxReservationDelta:     defaultSchedulerMaxReservationDelta,
 			Nodes: []Node{
 				{ID: "local-node", Endpoint: "http://127.0.0.1:8000"},
 			},
@@ -430,6 +495,8 @@ func overrideWithEnv(cfg *Config) error {
 	set("SCHEDULER_METRICS_LISTEN_ADDR", &cfg.Scheduler.MetricsListenAddr)
 	set("SCHEDULER_STRATEGY", &cfg.Scheduler.Strategy)
 	set("SCHEDULER_REDIS_ADDR", &cfg.Scheduler.RedisAddr)
+	set("SCHEDULER_AUTH_TOKEN", &cfg.Scheduler.AuthToken)
+	set("SCHEDULER_AUTH_TOKEN_FILE", &cfg.Scheduler.AuthTokenFile)
 	set("GATEWAY_HTTP_LISTEN_ADDR", &cfg.Gateway.HTTPListenAddr)
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
@@ -472,6 +539,22 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT %q: %w", v, err)
 		}
 		cfg.Scheduler.ArtifactLookupNodeLimit = limit
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_RESERVATIONS_ENABLED")); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_RESERVATIONS_ENABLED %q: %w", v, err)
+		}
+		cfg.Scheduler.ReservationsEnabled = b
+	}
+
+	if v := strings.TrimSpace(os.Getenv("SCHEDULER_MAX_RESERVATION_DELTA")); v != "" {
+		delta, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid SCHEDULER_MAX_RESERVATION_DELTA %q: %w", v, err)
+		}
+		cfg.Scheduler.MaxReservationDelta = delta
 	}
 
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_REQUEST_TIMEOUT")); v != "" {
@@ -556,11 +639,21 @@ func (c *Config) applyDefaults() {
 	// Exactly zero is unset. A negative duration is an explicit value — the
 	// operator wrote it, or a template rendered it — and is left for validate
 	// to refuse rather than silently replaced with the default.
-	if c.Scheduler.ReportTTL == 0 {
-		c.Scheduler.ReportTTL = 30 * time.Second
-	}
 	if c.Scheduler.BindingTTL == 0 {
 		c.Scheduler.BindingTTL = 30 * time.Second
+	}
+	// An unset report TTL follows the binding TTL down, the way an unset
+	// reconcile grace does: validate refuses a report TTL above the binding
+	// TTL, and substituting a fixed 30s under a shorter binding TTL the
+	// operator did write would refuse to boot over a key they never wrote.
+	if c.Scheduler.ReportTTL == 0 {
+		c.Scheduler.ReportTTL = defaultSchedulerReportTTL
+		if c.Scheduler.BindingTTL > 0 && c.Scheduler.BindingTTL < defaultSchedulerReportTTL {
+			c.Scheduler.ReportTTL = c.Scheduler.BindingTTL
+		}
+	}
+	if c.Scheduler.MaxReservationDelta == 0 {
+		c.Scheduler.MaxReservationDelta = defaultSchedulerMaxReservationDelta
 	}
 	if strings.TrimSpace(c.Scheduler.Discovery.Mode) == "" {
 		c.Scheduler.Discovery.Mode = "static"
@@ -607,6 +700,12 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 		if c.Scheduler.HeartbeatInterval < 0 {
 			return errors.New("scheduler.heartbeat_interval must not be negative")
+		}
+		if c.Scheduler.MaxReservationDelta < 0 {
+			return errors.New("scheduler.max_reservation_delta must not be negative")
+		}
+		if strings.TrimSpace(c.Scheduler.AuthToken) != "" && strings.TrimSpace(c.Scheduler.AuthTokenFile) != "" {
+			return errors.New("scheduler.auth_token and scheduler.auth_token_file are both set; configure one")
 		}
 		if err := validateSchedulerTTLOrdering(c.Scheduler); err != nil {
 			return err
@@ -816,6 +915,20 @@ func CheckReconcileGrace(bindingTTL time.Duration, reconcileGrace time.Duration,
 // after expiry. An implicit relation that is already false is worth turning
 // into a startup error rather than an intermittent outage.
 func validateSchedulerTTLOrdering(cfg SchedulerConfig) error {
+	// A node stops receiving placements when its heartbeat is older than
+	// report_ttl and loses its routing when a binding is older than
+	// binding_ttl. Routing must outlive placement: a node that missed two
+	// heartbeats but is still running its sandboxes is still the only place
+	// they can be reached, and expiring its bindings while it is still healthy
+	// enough to receive new work 404s live sandboxes on a node the scheduler
+	// is simultaneously filling. The shipped defaults are equal.
+	if cfg.ReportTTL > cfg.BindingTTL {
+		return fmt.Errorf(
+			"scheduler.report_ttl (%s) must not exceed scheduler.binding_ttl (%s); "+
+				"a node's bindings would expire while it is still a placement candidate",
+			cfg.ReportTTL, cfg.BindingTTL,
+		)
+	}
 	minimum := MinTTLForHeartbeatInterval(cfg.HeartbeatInterval)
 	if minimum <= 0 {
 		// Nodes report their interval on every heartbeat; without a configured

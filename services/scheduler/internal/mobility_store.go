@@ -200,6 +200,23 @@ const defaultMobilityKeyPrefix = "agentenv:scheduler:mobility"
 // and is rebuilt from the records the node re-reports.
 const defaultMobilityIndexTTL = 24 * time.Hour
 
+// MobilityStoreFor returns the mobility store that matches a binding store:
+// Redis-backed on the binding store's own client when bindings are in Redis,
+// in-memory otherwise.
+//
+// The two are decided together because they answer the same question — is
+// there a store outside this process — and a deployment that put bindings in
+// Redis so a restart or a second replica could see them needs its mobility
+// records there for the same reason. Sharing the client is deliberate: every
+// mobility operation is request-scoped and bounded by the same timeout, so it
+// costs the pool nothing a binding write does not.
+func MobilityStoreFor(bindings BindingStore) MobilityStore {
+	if redisStore, ok := bindings.(*RedisBindingStore); ok && redisStore != nil && redisStore.client != nil {
+		return NewRedisMobilityStore(redisStore.client)
+	}
+	return NewInMemoryMobilityStore()
+}
+
 func NewRedisMobilityStore(client redis.UniversalClient) *RedisMobilityStore {
 	return &RedisMobilityStore{
 		client:           client,

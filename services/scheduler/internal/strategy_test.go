@@ -153,3 +153,84 @@ func TestLeastLoadedOfTwoBoundsMaxLoadBetterThanRoundRobin(t *testing.T) {
 			leastLoadedMax, roundRobinMax)
 	}
 }
+
+// Bin-pack fills the fullest node that is still eligible. Everything it is
+// handed has already passed the limits, so "fullest" is "closest to its
+// ceiling" — what a drain or a consolidation wants.
+func TestBinPackChoosesTheMostLoadedEligibleNode(t *testing.T) {
+	strategy := NewBinPackStrategy()
+	nodes := []RichNode{
+		snapshotNode("light", 2, 0, 0),
+		snapshotNode("heavy", 40, 0, 0),
+		snapshotNode("medium", 20, 0, 0),
+	}
+	for i := 0; i < 20; i++ {
+		got, err := strategy.Select(nodes, nil)
+		if err != nil {
+			t.Fatalf("Select: %v", err)
+		}
+		if got.ID != "heavy" {
+			t.Fatalf("selected %q, want the most loaded node", got.ID)
+		}
+	}
+}
+
+// An unreported node scores as unknown, which is "avoid" for a spreading
+// strategy but must not read as "fullest" for a packing one. It is chosen
+// only when nothing has reported at all.
+func TestBinPackPrefersReportedNodesAndBreaksTiesByID(t *testing.T) {
+	strategy := NewBinPackStrategy()
+
+	got, err := strategy.Select([]RichNode{
+		{Node: Node{ID: "unreported", Endpoint: "http://unreported"}},
+		snapshotNode("known", 1, 0, 0),
+	}, nil)
+	if err != nil || got.ID != "known" {
+		t.Fatalf("selected %q (%v), want the node that has reported", got.ID, err)
+	}
+
+	got, err = strategy.Select([]RichNode{snapshotNode("b", 5, 0, 0), snapshotNode("a", 5, 0, 0)}, nil)
+	if err != nil || got.ID != "a" {
+		t.Fatalf("tie went to %q (%v), want the lower ID whatever the input order", got.ID, err)
+	}
+
+	got, err = strategy.Select([]RichNode{{Node: Node{ID: "only", Endpoint: "http://only"}}}, nil)
+	if err != nil || got.ID != "only" {
+		t.Fatalf("selected %q (%v), want the sole unreported node when nothing has reported", got.ID, err)
+	}
+
+	if _, err := strategy.Select(nil, nil); err == nil {
+		t.Fatal("no candidates must be an error")
+	}
+}
+
+// Only round-robin's answer depends on the order candidates arrive in; every
+// other strategy declines the sort it would otherwise pay for on each
+// placement.
+func TestNeedsStableOrderIsRoundRobinOnly(t *testing.T) {
+	for name, want := range map[string]bool{
+		"round_robin":         true,
+		"random":              false,
+		"least_loaded_of_two": false,
+		"p2c":                 false,
+		"bin_pack":            false,
+	} {
+		strategy := NewStrategy(name)
+		if got := strategy.NeedsStableOrder(); got != want {
+			t.Fatalf("%s: NeedsStableOrder = %v, want %v", name, got, want)
+		}
+	}
+	if got := NewStrategy("bin_pack").Name(); got != "bin_pack" {
+		t.Fatalf("bin_pack resolves to %q", got)
+	}
+}
+
+// A strategy whose metrics collapse into "unknown" is invisible on a
+// dashboard; every registered name has a label.
+func TestEveryStrategyHasAMetricLabel(t *testing.T) {
+	for _, name := range []string{"round_robin", "random", "least_loaded_of_two", "p2c", "bin_pack"} {
+		if got := schedulerStrategyLabel(name); got == "unknown" {
+			t.Fatalf("strategy %q has no metric label", name)
+		}
+	}
+}

@@ -162,7 +162,7 @@ func newRedisBindingStoreForTestWithGrace(t *testing.T, ttl time.Duration, grace
 	return store
 }
 
-func startRedisServerForTest(t *testing.T) string {
+func startRedisServerForTest(t testing.TB) string {
 	t.Helper()
 
 	bin := strings.TrimSpace(os.Getenv("REDIS_SERVER_BIN"))
@@ -196,7 +196,7 @@ func startRedisServerForTest(t *testing.T) string {
 // tryStartRedisServer starts one redis-server on a freshly chosen port and
 // waits for it to answer PING. It reports false when the process exited
 // before readiness, which is what a lost port race looks like.
-func tryStartRedisServer(t *testing.T, bin string) (addr string, output string, ok bool) {
+func tryStartRedisServer(t testing.TB, bin string) (addr string, output string, ok bool) {
 	t.Helper()
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")

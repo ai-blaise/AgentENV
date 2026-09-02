@@ -54,4 +54,5 @@
 - [Persistence Artifact Inventory](./internals/persistence-artifact-inventory.md)
 - [Proxy Design](./internals/proxy-design.md)
 - [Distributed Control Plane](./internals/services.md)
+- [Scheduler Benchmarks](./internals/scheduler-benchmarks.md)
 - [P2P Artifact Transport](./internals/p2p-design.md)

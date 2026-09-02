@@ -234,7 +234,8 @@ func TestReportedEventsCountAgainstPlacementUntilTheNextHeartbeat(t *testing.T) 
 	five := uint32(5)
 	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, time.Minute)
 	service := NewService(nil, registry, NewStrategy("round_robin"), NewInMemoryBindingStore(time.Minute),
-		WithNodeResourceLimit(&config.NodeResourceLimit{MaxSandboxCount: &five}))
+		WithNodeResourceLimit(&config.NodeResourceLimit{MaxSandboxCount: &five}),
+		WithReservations(true, 0))
 	ctx := context.Background()
 
 	heartbeat := func(count uint32) {
@@ -262,7 +263,7 @@ func TestReportedEventsCountAgainstPlacementUntilTheNextHeartbeat(t *testing.T) 
 		switch status.Code(err) {
 		case codes.OK:
 			return true
-		case codes.Unavailable:
+		case codes.ResourceExhausted:
 			return false
 		default:
 			t.Fatalf("schedule: %v", err)
@@ -270,6 +271,9 @@ func TestReportedEventsCountAgainstPlacementUntilTheNextHeartbeat(t *testing.T) 
 		}
 	}
 
+	// Each successful placement also reserves one sandbox against the node
+	// until a create event settles it, so the arithmetic below counts the
+	// placement as well as the reports.
 	heartbeat(3)
 	if !placeable() {
 		t.Fatal("three of five must be placeable")
@@ -302,7 +306,8 @@ func TestReportSandboxEventRejectsASupersededIncarnation(t *testing.T) {
 	five := uint32(5)
 	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, time.Minute)
 	service := NewService(nil, registry, NewStrategy("round_robin"), NewInMemoryBindingStore(time.Minute),
-		WithNodeResourceLimit(&config.NodeResourceLimit{MaxSandboxCount: &five}))
+		WithNodeResourceLimit(&config.NodeResourceLimit{MaxSandboxCount: &five}),
+		WithReservations(true, 0))
 	ctx := context.Background()
 	older := "0199a000-0000-7000-8000-000000000001"
 	newer := "0199b000-0000-7000-8000-000000000002"
@@ -340,7 +345,7 @@ func TestReportSandboxEventRejectsASupersededIncarnation(t *testing.T) {
 	if err := report(newer); err != nil {
 		t.Fatalf("the live incarnation's batch was refused: %v", err)
 	}
-	if _, err := service.Schedule(ctx, &schedulerv1.ScheduleRequest{}); status.Code(err) != codes.Unavailable {
+	if _, err := service.Schedule(ctx, &schedulerv1.ScheduleRequest{}); status.Code(err) != codes.ResourceExhausted {
 		t.Fatalf("three creates over three must exceed five: %v", err)
 	}
 	if err := report(newest); err != nil {

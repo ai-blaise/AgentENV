@@ -32,10 +32,17 @@ type Service struct {
 	// defaults to on; disabling it restores the previous behavior of placing on
 	// any discovered node regardless of heartbeat age.
 	healthGateEnabled bool
-	// ledger folds node-reported lifecycle events onto the last heartbeat
-	// snapshot, closing the window in which a burst of creates all read the
-	// same stale numbers. Advisory only; see ReservationLedger.
+	// ledger folds node-reported lifecycle events and this scheduler's own
+	// placements onto the last heartbeat snapshot, closing the window in which
+	// a burst of creates all read the same stale numbers. Advisory only; see
+	// ReservationLedger. It is consulted only while reservationsEnabled.
 	ledger *ReservationLedger
+	// reservationsEnabled is the ledger's rollback switch. Off, placement
+	// reads heartbeat snapshots verbatim and events are counted for loss but
+	// applied to nothing.
+	reservationsEnabled bool
+	// maxReservationDelta is the ledger's per-node clamp.
+	maxReservationDelta int
 	// candidateSampleSize bounds how many nodes one placement inspects. Zero
 	// disables sampling and restores whole-fleet evaluation.
 	candidateSampleSize int
@@ -75,7 +82,7 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		strategy:            strategy,
 		reportTTL:           defaultObservedReportTTL,
 		healthGateEnabled:   true,
-		ledger:              NewReservationLedger(0),
+		maxReservationDelta: defaultMaxReservationDelta,
 		candidateSampleSize: defaultCandidateSampleSize,
 		rosters:             newRosterCache(),
 		bindingTTL:          defaultBindingTTL,
@@ -83,11 +90,15 @@ func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store
 		eventLoss:           newEventLossTracker(),
 		mobility:            NewInMemoryMobilityStore(),
 		store:               store,
-		artifacts:           NewInMemoryArtifactStore(defaultArtifactStoreCapacity, 0),
+		artifacts:           NewInMemoryArtifactStore(defaultArtifactStoreCapacity, defaultArtifactLookupNodeLimit),
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
+	// Built after the options so the valve follows the configured report TTL:
+	// a node that has stopped heartbeating stops carrying phantom load at
+	// about the moment the health gate stops offering it work.
+	s.ledger = newReservationLedger(2*s.reportTTL, s.maxReservationDelta)
 	return s
 }
 
@@ -118,6 +129,31 @@ func WithNodeResourceLimit(limit *config.NodeResourceLimit) ServiceOption {
 func WithArtifactStore(store ArtifactStore) ServiceOption {
 	return func(s *Service) {
 		s.artifacts = store
+	}
+}
+
+// WithArtifactStoreCapacity builds the in-memory artifact index with the
+// configured bounds: how many distinct keys it holds before evicting, and how
+// many providers one lookup names. A non-positive capacity takes the default;
+// a non-positive lookup limit means unlimited, as the config documents it —
+// the shipped default of eight is the config's to apply, so an operator who
+// writes zero gets what they asked for.
+func WithArtifactStoreCapacity(capacity int, lookupNodeLimit int) ServiceOption {
+	return func(s *Service) {
+		s.artifacts = NewInMemoryArtifactStore(capacity, lookupNodeLimit)
+	}
+}
+
+// WithReservations switches the reservation ledger on, with the per-node clamp
+// on how far it may move a node's reported sandbox count. Off — the shipped
+// default — placement reads heartbeat snapshots verbatim, which is what every
+// deployment before the ledger did. A non-positive clamp takes the default.
+func WithReservations(enabled bool, maxDelta int) ServiceOption {
+	return func(s *Service) {
+		s.reservationsEnabled = enabled
+		if maxDelta > 0 {
+			s.maxReservationDelta = maxDelta
+		}
 	}
 }
 
@@ -194,14 +230,23 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	// Sampling inside the registry avoids copying and sorting the fleet just to
 	// discard almost all of it.
 	discovered := s.nodes.SampleNodes(s.candidateSampleSize /* allowLingering */, false)
+	// The registry hands the candidates back unordered. Only a strategy whose
+	// answer depends on the order pays for one.
+	if s.strategy.NeedsStableOrder() {
+		sortNodesByID(discovered)
+	}
 	rich := make([]RichNode, 0, len(discovered))
 	for _, n := range discovered {
 		snapshot, health := s.nodes.PeekObservedHealth(n.ID)
+		if s.reservationsEnabled {
+			// Fold in what this node has told us, and what we have placed on
+			// it, since its last heartbeat, so a burst of creates does not
+			// keep reading the same stale numbers.
+			snapshot = s.ledger.ApplyTo(n.ID, snapshot, now)
+		}
 		rich = append(rich, RichNode{
-			Node: n,
-			// Fold in what this node has told us since its last heartbeat, so a
-			// burst of creates does not keep reading the same stale numbers.
-			Snapshot: s.ledger.ApplyTo(n.ID, snapshot, now),
+			Node:     n,
+			Snapshot: snapshot,
 			Health:   health,
 		})
 	}
@@ -211,12 +256,17 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 	eligible := rich
 	if s.healthGateEnabled {
 		var dropped map[HealthFilterReason]int
-		eligible, dropped = FilterByHealth(rich, s.reportTTL, now)
+		var failedOpen bool
+		eligible, dropped, failedOpen = FilterByHealth(rich, s.reportTTL, now)
 		for reason, count := range dropped {
 			recordSchedulerNodesFiltered(string(reason), count)
 		}
+		if failedOpen {
+			schedulerScheduleFailOpenTotal.Inc()
+		}
 	}
 	eligible = FilterByResourceLimit(eligible, s.resourceLimit)
+	withinLimits := len(eligible)
 	// A node that already refused this sandbox is authoritative about its own
 	// capacity, so retrying into it would loop. Excluding every candidate is
 	// treated as an exhausted fleet, not as "try them all again".
@@ -232,11 +282,18 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 			zap.Error(selectErr),
 		)
 		if errors.Is(selectErr, ErrNoNodes) {
-			err = status.Error(codes.Unavailable, "no nodes available")
+			err = noNodeError(len(discovered), withinLimits)
 			return nil, err
 		}
 		err = status.Error(codes.Internal, selectErr.Error())
 		return nil, err
+	}
+	if s.reservationsEnabled {
+		// Hold the placement against the node until it reports the sandbox.
+		// Without this, two placements inside one heartbeat interval read the
+		// same numbers and both go to the node that looked emptiest.
+		cpu, memoryBytes := hintedResources(req.GetHint())
+		s.ledger.Reserve(node.ID, cpu, memoryBytes, now)
 	}
 	s.logger.Debug("scheduler selected node",
 		zap.String("strategy", s.strategy.Name()),
@@ -247,6 +304,36 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 		zap.Int("eligible_nodes", len(eligible)),
 	)
 	return &schedulerv1.ScheduleResponse{Node: node.Node.ToProto()}, nil
+}
+
+// noNodeError distinguishes a fleet with nothing in it from a fleet with
+// nothing left in it.
+//
+// The caller has to tell them apart: no discovered nodes is a deployment with
+// no fleet behind it, which no retry will fix, and is Unavailable as it always
+// was. Nodes that were all filtered — over their limits, or every one of them
+// having already refused this sandbox — is capacity, which a retry after a
+// moment may find, and is ResourceExhausted so the gateway can say so with a
+// Retry-After. The message names which filter emptied the list.
+func noNodeError(discovered int, withinLimits int) error {
+	if discovered == 0 {
+		return status.Error(codes.Unavailable, "no nodes available")
+	}
+	if withinLimits == 0 {
+		return status.Error(codes.ResourceExhausted, "no node satisfies the configured resource limits")
+	}
+	return status.Error(codes.ResourceExhausted, "every eligible node has already refused this sandbox")
+}
+
+// hintedResources reads what a placement asked for, in the units the ledger
+// keeps. A warm create carries no resources on its hint and reserves the
+// sandbox alone.
+func hintedResources(hint *schedulerv1.ScheduleRequestHint) (cpu uint32, memoryBytes uint64) {
+	cold := hint.GetNewColdSandbox()
+	if cold == nil {
+		return 0, 0
+	}
+	return cold.GetCpuCount(), cold.GetMemoryMb() << 20
 }
 
 // summarizeScheduleHint renders a compact, log-friendly description of a
@@ -450,8 +537,11 @@ func (s *Service) Heartbeat(ctx context.Context, req *schedulerv1.HeartbeatReque
 		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
 	}
 	// The heartbeat is the authoritative count, so anything the ledger was
-	// carrying for this node is now either included in it or lost.
-	s.ledger.Reset(nodeID)
+	// carrying for this node from before it arrived is now either included in
+	// it or lost. What arrived after it did is not, and stays.
+	if s.reservationsEnabled {
+		schedulerReservationDrift.Observe(float64(s.ledger.TrimBefore(nodeID, now)))
+	}
 	// A new incarnation counts its events from zero. The tracker also infers a
 	// restart from a total that went backwards, but a process that emits more
 	// than its predecessor did before its first heartbeat would not be caught
@@ -513,6 +603,16 @@ const maxReportedHeartbeatIntervalMs = uint64(24 * 60 * 60 * 1000)
 // from the most recent response — so it takes effect on the next heartbeat and
 // is given back the moment the ordering holds again.
 //
+// The report TTL is held to the same relation. A node whose interval leaves
+// fewer than three heartbeats inside it flaps between ready and stale on a
+// single lost packet, and every flap is a round in which its roster was not
+// reconciled. The scheduler cannot fix the node's interval, and refusing the
+// heartbeat outright would take a live node's data plane down over a
+// configuration relation — worse than the flapping it would prevent. What it
+// can do is take no shortcuts with that node: reconcile its roster in full on
+// every heartbeat that does land, and say once, naming the knob, that the
+// relation is wrong.
+//
 // Zero means the node did not report an interval. That is an older node, not a
 // node heartbeating infinitely fast, so there is nothing to check and nothing
 // to withhold.
@@ -525,15 +625,16 @@ func (s *Service) mayElideRoster(nodeID string, intervalMs uint64) bool {
 	}
 	interval := time.Duration(intervalMs) * time.Millisecond
 	minimum := config.MinTTLForHeartbeatInterval(interval)
-	if s.bindingTTL >= minimum {
+	if s.bindingTTL >= minimum && s.reportTTL >= minimum {
 		return true
 	}
 	if s.ttlOrderingWarned.mark(nodeID) {
-		s.logger.Warn("scheduler binding TTL is too short for a node's heartbeat interval",
+		s.logger.Warn("scheduler TTLs are too short for a node's heartbeat interval; roster elision withheld",
 			zap.String("node_id", nodeID),
 			zap.Duration("heartbeat_interval", interval),
 			zap.Duration("binding_ttl", s.bindingTTL),
-			zap.Duration("required_binding_ttl", minimum),
+			zap.Duration("report_ttl", s.reportTTL),
+			zap.Duration("required_ttl", minimum),
 		)
 	}
 	return false
@@ -757,7 +858,9 @@ func (s *Service) ReportSandboxEvent(_ context.Context, req *schedulerv1.ReportS
 		return nil, status.Error(codes.FailedPrecondition, "service instance has been superseded")
 	}
 
-	s.ledger.Apply(nodeID, req.GetEvents(), time.Now())
+	if s.reservationsEnabled {
+		s.ledger.Apply(nodeID, req.GetEvents(), time.Now())
+	}
 	s.eventLoss.observeReceived(nodeID, len(req.GetEvents()))
 	s.logger.Debug("scheduler applied sandbox event batch",
 		zap.String("node_id", nodeID),
@@ -852,6 +955,7 @@ func (s *Service) LookupP2PArtifact(_ context.Context, req *schedulerv1.LookupP2
 		req.GetExcludeNodeId(),
 		time.Now(),
 	)
+	schedulerP2PLookupPeers.Observe(float64(len(peers)))
 	return &schedulerv1.LookupP2PArtifactResponse{Peers: peers}, nil
 }
 

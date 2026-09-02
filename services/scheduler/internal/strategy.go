@@ -14,6 +14,12 @@ var ErrNoNodes = errors.New("no nodes available")
 type Strategy interface {
 	Select(nodes []RichNode, hint *schedulerv1.ScheduleRequestHint) (RichNode, error)
 	Name() string
+	// NeedsStableOrder reports whether Select's answer depends on the order
+	// candidates arrive in. Round-robin does — its cycle is only a cycle over
+	// a list that stays put — and pays for a sort on every placement to get
+	// it. Strategies that draw or score have no use for the order, and at
+	// fleet scale the sort was most of what a placement cost.
+	NeedsStableOrder() bool
 }
 
 type RoundRobinStrategy struct {
@@ -32,6 +38,8 @@ func (s *RoundRobinStrategy) Name() string {
 	return "round_robin"
 }
 
+func (s *RoundRobinStrategy) NeedsStableOrder() bool { return true }
+
 type RandomStrategy struct{}
 
 func NewRandomStrategy() *RandomStrategy {
@@ -49,10 +57,14 @@ func (s *RandomStrategy) Name() string {
 	return "random"
 }
 
+func (s *RandomStrategy) NeedsStableOrder() bool { return false }
+
 func NewStrategy(name string) Strategy {
 	switch name {
 	case "least_loaded_of_two", "p2c":
 		return NewLeastLoadedOfTwoStrategy()
+	case "bin_pack":
+		return NewBinPackStrategy()
 	case "random":
 		return NewRandomStrategy()
 	case "round_robin":
@@ -102,6 +114,60 @@ func (s *LeastLoadedOfTwoStrategy) Select(nodes []RichNode, _ *schedulerv1.Sched
 func (s *LeastLoadedOfTwoStrategy) Name() string {
 	return "least_loaded_of_two"
 }
+
+func (s *LeastLoadedOfTwoStrategy) NeedsStableOrder() bool { return false }
+
+// BinPackStrategy fills the most loaded candidate that is still eligible.
+//
+// Every node handed to Select has already passed the resource limits, so
+// "most loaded" is "closest to its ceiling without being over it". That is
+// what a drain or a consolidation wants: the fleet's occupied set stays as
+// small as possible and the rest can be emptied and removed.
+//
+// It is the wrong strategy for tail latency, and is off by default for that
+// reason. A burst of creates all score the same node highest and all land on
+// it, where each start contends with the others for the node's network-slot
+// and iptables locks — the per-node serialisation that makes the slowest
+// create in a burst slow. It is also only bounded by the configured resource
+// limits: with none, it fills one node indefinitely.
+type BinPackStrategy struct{}
+
+func NewBinPackStrategy() *BinPackStrategy {
+	return &BinPackStrategy{}
+}
+
+func (s *BinPackStrategy) Select(nodes []RichNode, _ *schedulerv1.ScheduleRequestHint) (RichNode, error) {
+	if len(nodes) == 0 {
+		return RichNode{}, ErrNoNodes
+	}
+
+	// A node with no snapshot scores as unknown, which nodeLoadScore renders as
+	// maximally loaded — the right answer for "avoid it" but the wrong one for
+	// "pack into it". It is only chosen when nothing has reported.
+	best, found := RichNode{}, false
+	bestScore := 0.0
+	for _, n := range nodes {
+		if n.Snapshot == nil {
+			continue
+		}
+		score := nodeLoadScore(n)
+		// Ties go to the lower ID so two equal nodes do not split a burst by
+		// whatever order they were handed in.
+		if !found || score > bestScore || (score == bestScore && n.ID < best.ID) {
+			best, bestScore, found = n, score, true
+		}
+	}
+	if !found {
+		return nodes[0], nil
+	}
+	return best, nil
+}
+
+func (s *BinPackStrategy) Name() string {
+	return "bin_pack"
+}
+
+func (s *BinPackStrategy) NeedsStableOrder() bool { return false }
 
 // nodeLoadScore ranks a node's current occupancy. Lower is more available.
 //

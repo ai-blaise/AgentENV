@@ -228,8 +228,11 @@ func TestFilterByHealthDropsStaleNode(t *testing.T) {
 	fresh := healthyNode("fresh", now)
 	stale := healthyNode("stale", now.Add(-5*time.Minute))
 
-	got, dropped := FilterByHealth([]RichNode{fresh, stale}, 30*time.Second, now)
+	got, dropped, failedOpen := FilterByHealth([]RichNode{fresh, stale}, 30*time.Second, now)
 
+	if failedOpen {
+		t.Fatal("a fleet with a fresh node must not fail open")
+	}
 	if len(got) != 1 || got[0].ID != "fresh" {
 		t.Fatalf("FilterByHealth kept %v, want only the fresh node", nodeIDsOf(got))
 	}
@@ -250,7 +253,7 @@ func TestFilterByHealthDropsNeverSeenAndUnhealthyAndDraining(t *testing.T) {
 	draining := healthyNode("draining", now)
 	draining.Health.Status = schedulerv1.NodeStatus_NODE_STATUS_LINGERING
 
-	got, dropped := FilterByHealth([]RichNode{fresh, neverSeen, unhealthy, draining}, 30*time.Second, now)
+	got, dropped, _ := FilterByHealth([]RichNode{fresh, neverSeen, unhealthy, draining}, 30*time.Second, now)
 
 	if len(got) != 1 || got[0].ID != "fresh" {
 		t.Fatalf("FilterByHealth kept %v, want only the fresh node", nodeIDsOf(got))
@@ -277,10 +280,13 @@ func TestFilterByHealthFailsOpenWhenEveryNodeIsStale(t *testing.T) {
 		healthyNode("b", now.Add(-6*time.Minute)),
 	}
 
-	got, dropped := FilterByHealth(nodes, 30*time.Second, now)
+	got, dropped, failedOpen := FilterByHealth(nodes, 30*time.Second, now)
 
 	if len(got) != 2 {
 		t.Fatalf("FilterByHealth kept %v, want fail-open with both nodes", nodeIDsOf(got))
+	}
+	if !failedOpen {
+		t.Fatal("returning every stale node must be reported as failing open")
 	}
 	// The drop reasons are still reported so the fail-open path is observable
 	// rather than looking identical to a healthy fleet.
@@ -293,7 +299,7 @@ func TestFilterByHealthDisabledTTLKeepsEverything(t *testing.T) {
 	now := time.Now()
 	nodes := []RichNode{healthyNode("a", now.Add(-time.Hour))}
 
-	got, dropped := FilterByHealth(nodes, 0, now)
+	got, dropped, _ := FilterByHealth(nodes, 0, now)
 
 	if len(got) != 1 {
 		t.Fatalf("FilterByHealth kept %v, want the node when TTL is disabled", nodeIDsOf(got))
@@ -309,4 +315,54 @@ func nodeIDsOf(nodes []RichNode) []string {
 		ids = append(ids, n.ID)
 	}
 	return ids
+}
+
+// Placement and the node view GET /nodes renders must call the same node stale
+// at the same instant. They used to compute it separately, and agreed only by
+// coincidence; this drives both from one registry state across the boundary
+// and asserts they never disagree.
+func TestPlacementAndNodeViewAgreeOnStaleness(t *testing.T) {
+	const ttl = 10 * time.Second
+	start := time.Unix(1_700_000_000, 0)
+
+	for _, tc := range []struct {
+		name      string
+		elapsed   time.Duration
+		wantStale bool
+	}{
+		{name: "fresh", elapsed: time.Second, wantStale: false},
+		{name: "exactly the ttl", elapsed: ttl, wantStale: false},
+		{name: "one millisecond past", elapsed: ttl + time.Millisecond, wantStale: true},
+		{name: "long past", elapsed: time.Hour, wantStale: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, ttl)
+			if _, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+				NodeId:            "node-a",
+				ClusterId:         "cluster",
+				ServiceInstanceId: "svc-a",
+				Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+			}, start); err != nil {
+				t.Fatalf("heartbeat: %v", err)
+			}
+			now := start.Add(tc.elapsed)
+
+			snapshot, health := registry.PeekObservedHealth("node-a")
+			_, dropped, _ := FilterByHealth([]RichNode{{Node: Node{ID: "node-a"}, Snapshot: snapshot, Health: health}}, ttl, now)
+			placementStale := dropped[HealthFilterReasonStale] == 1
+
+			view, ok := registry.GetObserved("node-a", "cluster", now)
+			if !ok {
+				t.Fatal("observed node missing")
+			}
+			viewStale := view.GetSnapshot().GetStatus() == schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY
+
+			if placementStale != tc.wantStale {
+				t.Fatalf("placement stale = %v, want %v", placementStale, tc.wantStale)
+			}
+			if viewStale != placementStale {
+				t.Fatalf("node view stale = %v but placement stale = %v; the two must agree", viewStale, placementStale)
+			}
+		})
+	}
 }

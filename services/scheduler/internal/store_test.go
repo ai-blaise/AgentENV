@@ -1,8 +1,10 @@
 package scheduler
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -624,4 +626,236 @@ func TestAShortBindingTTLBootsWithoutAnExplicitGrace(t *testing.T) {
 	if store.reconcileGrace != 5*time.Second {
 		t.Fatalf("reconcile grace = %s, want half the 10s ttl", store.reconcileGrace)
 	}
+}
+
+// The default bounds how many providers a lookup names. Unlimited handed every
+// holder of a popular layer to a node that dials four and stops at the first
+// hit; the rest was response bytes and peer-filter work for nothing.
+func TestArtifactLookupLimitDefaultsToEight(t *testing.T) {
+	service := NewService(nil, nil, NewStrategy("round_robin"), NewInMemoryBindingStore(time.Minute))
+	store, ok := service.artifacts.(*InMemoryArtifactStore)
+	if !ok {
+		t.Fatalf("default artifact store is %T", service.artifacts)
+	}
+	if store.lookupNodeLimit != 8 {
+		t.Fatalf("default lookup limit = %d, want 8", store.lookupNodeLimit)
+	}
+
+	for i := 0; i < 12; i++ {
+		store.Record("cluster-1", "backend", "artifact-a", nodeIDForIndex(i))
+	}
+	if got := store.Lookup("cluster-1", "backend", "artifact-a"); len(got) != 8 {
+		t.Fatalf("lookup returned %d providers of 12, want exactly the limit", len(got))
+	}
+
+	// The option carries the configured bounds through verbatim: an explicit
+	// zero is the documented "unlimited", not a request for the default.
+	configured := NewService(nil, nil, NewStrategy("round_robin"), NewInMemoryBindingStore(time.Minute),
+		WithArtifactStoreCapacity(10, 3))
+	if got := configured.artifacts.(*InMemoryArtifactStore).lookupNodeLimit; got != 3 {
+		t.Fatalf("configured lookup limit = %d, want 3", got)
+	}
+	unlimited := NewService(nil, nil, NewStrategy("round_robin"), NewInMemoryBindingStore(time.Minute),
+		WithArtifactStoreCapacity(10, 0))
+	for i := 0; i < 12; i++ {
+		unlimited.artifacts.Record("cluster-1", "backend", "artifact-a", nodeIDForIndex(i))
+	}
+	if got := unlimited.artifacts.Lookup("cluster-1", "backend", "artifact-a"); len(got) != 12 {
+		t.Fatalf("an explicit zero limit returned %d of 12 providers, want all", len(got))
+	}
+}
+
+// assertArtifactIndexConsistent walks both maps: every key's provider set is
+// mirrored in each provider's reverse index and vice versa, and neither holds
+// an empty set. Eviction is the path most likely to tear them apart.
+func assertArtifactIndexConsistent(t *testing.T, store *InMemoryArtifactStore) {
+	t.Helper()
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	for key, nodes := range store.entries {
+		if len(nodes) == 0 {
+			t.Fatalf("entries[%v] is empty but present", key)
+		}
+		for nodeID := range nodes {
+			if _, ok := store.nodeKeys[nodeID][key]; !ok {
+				t.Fatalf("entries names %s for %v but nodeKeys does not", nodeID, key)
+			}
+		}
+	}
+	for nodeID, keys := range store.nodeKeys {
+		if len(keys) == 0 {
+			t.Fatalf("nodeKeys[%s] is empty but present", nodeID)
+		}
+		for key := range keys {
+			if _, ok := store.entries[key][nodeID]; !ok {
+				t.Fatalf("nodeKeys names %v for %s but entries does not", key, nodeID)
+			}
+		}
+	}
+	if store.lru.Len() != len(store.entries) {
+		t.Fatalf("lru holds %d keys, entries %d", store.lru.Len(), len(store.entries))
+	}
+}
+
+func TestArtifactStoreEvictionKeepsBothIndexesConsistentAndIsCounted(t *testing.T) {
+	const capacity = 16
+	store := NewInMemoryArtifactStore(capacity, 0)
+	before := counterValue(t, schedulerP2PArtifactEvictionsTotal)
+
+	// Three providers per key, four times the capacity in keys, providers
+	// shared across keys so a single eviction touches several reverse indexes.
+	for i := 0; i < 4*capacity; i++ {
+		key := fmt.Sprintf("artifact-%03d", i)
+		for j := 0; j < 3; j++ {
+			store.Record("cluster-1", "backend", key, nodeIDForIndex((i+j)%7))
+		}
+	}
+
+	assertArtifactIndexConsistent(t, store)
+	if len(store.entries) != capacity {
+		t.Fatalf("entries = %d, want the capacity", len(store.entries))
+	}
+	if evicted := counterValue(t, schedulerP2PArtifactEvictionsTotal) - before; evicted != 3*capacity {
+		t.Fatalf("evictions counted = %v, want %d", evicted, 3*capacity)
+	}
+
+	// Forgetting a provider after evictions must find nothing dangling.
+	store.ForgetNode(nodeIDForIndex(3))
+	assertArtifactIndexConsistent(t, store)
+	for key := range store.entries {
+		if _, ok := store.entries[key][nodeIDForIndex(3)]; ok {
+			t.Fatalf("%v still names the forgotten node", key)
+		}
+	}
+}
+
+// Readers and writers over a capacity-forced eviction workload, under -race.
+// The store's consistency rests on the LRU never calling back from Get and
+// never from a goroutine of its own; this is the regression guard for the day
+// the cache is swapped for one that does.
+func TestArtifactStoreConcurrentLookupRecordForget(t *testing.T) {
+	const capacity = 64
+	store := NewInMemoryArtifactStore(capacity, 4)
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	key := func(i int) string { return fmt.Sprintf("artifact-%04d", i) }
+
+	for w := 0; w < 2; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				store.Record("cluster-1", "backend", key(i%(4*capacity)), nodeIDForIndex((i+w)%16))
+			}
+		}(w)
+	}
+	for r := 0; r < 8; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				_ = store.Lookup("cluster-1", "backend", key((i*7+r)%(4*capacity)))
+			}
+		}(r)
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			store.ForgetNode(nodeIDForIndex(i % 16))
+		}
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	assertArtifactIndexConsistent(t, store)
+}
+
+// ForgetNode releases the write lock between chunks, so lookups on the rest
+// of the index get through a large node's departure instead of waiting for
+// the whole walk. The hook runs where the lock is released; a lookup there
+// must complete and must see the walk half done.
+func TestForgetNodeReleasesTheLockBetweenChunks(t *testing.T) {
+	const keys = 3*forgetNodeChunkSize + 5
+	store := NewInMemoryArtifactStore(10*keys, 0)
+	for i := 0; i < keys; i++ {
+		store.Record("cluster-1", "backend", fmt.Sprintf("artifact-%05d", i), "departing")
+		store.Record("cluster-1", "backend", fmt.Sprintf("artifact-%05d", i), "staying")
+	}
+
+	pauses := 0
+	sawPartialWalk := false
+	store.betweenForgetChunks = func() {
+		pauses++
+		// A lookup here would deadlock if the write lock were still held. The
+		// walk order is the map's, so which keys are already forgotten is not
+		// knowable; that the staying provider is still named is.
+		got := store.Lookup("cluster-1", "backend", "artifact-00000")
+		if len(got) == 0 || len(got) > 2 {
+			t.Fatalf("mid-walk lookup = %v, want the staying provider with or without the departing one", got)
+		}
+		store.mu.RLock()
+		remaining := len(store.nodeKeys["departing"])
+		store.mu.RUnlock()
+		if remaining > 0 && remaining < keys {
+			sawPartialWalk = true
+		}
+	}
+
+	store.ForgetNode("departing")
+
+	if pauses != 3 {
+		t.Fatalf("lock released %d times, want once per chunk boundary (3 for %d keys)", pauses, keys)
+	}
+	if !sawPartialWalk {
+		t.Fatal("no chunk boundary observed a partially forgotten node")
+	}
+	if _, ok := store.nodeKeys["departing"]; ok {
+		t.Fatal("the departed node's reverse index survived the walk")
+	}
+	assertArtifactIndexConsistent(t, store)
+	for i := 0; i < keys; i += forgetNodeChunkSize {
+		if got := store.Lookup("cluster-1", "backend", fmt.Sprintf("artifact-%05d", i)); len(got) != 1 || got[0] != "staying" {
+			t.Fatalf("after the walk %d: %v", i, got)
+		}
+	}
+}
+
+// A record for the departing node that lands between two chunks is a later
+// statement than the forget and is kept, in both maps.
+func TestForgetNodeKeepsAKeyRecordedMidWalk(t *testing.T) {
+	const keys = 2 * forgetNodeChunkSize
+	store := NewInMemoryArtifactStore(10*keys, 0)
+	for i := 0; i < keys; i++ {
+		store.Record("cluster-1", "backend", fmt.Sprintf("artifact-%05d", i), "departing")
+	}
+	store.betweenForgetChunks = func() {
+		store.Record("cluster-1", "backend", "artifact-late", "departing")
+	}
+
+	store.ForgetNode("departing")
+
+	if got := store.Lookup("cluster-1", "backend", "artifact-late"); len(got) != 1 || got[0] != "departing" {
+		t.Fatalf("the mid-walk record was lost: %v", got)
+	}
+	if _, ok := store.nodeKeys["departing"]; !ok {
+		t.Fatal("the reverse index for a node with a live key was dropped")
+	}
+	assertArtifactIndexConsistent(t, store)
 }

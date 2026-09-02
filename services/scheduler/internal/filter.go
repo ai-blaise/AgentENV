@@ -19,6 +19,23 @@ const (
 	HealthFilterReasonTerminating HealthFilterReason = "terminating"
 )
 
+// heartbeatStale is the one definition of "this node's last heartbeat is too
+// old", shared by placement (FilterByHealth) and the node view GET /nodes
+// renders (deriveObservedNodeViewLocked). Two copies of this comparison would
+// let the operator's view and the scheduler's decision disagree about the
+// same node; one copy makes them agree by construction.
+//
+// A node is stale when it has been seen and the time since exceeds the TTL.
+// Exactly the TTL is not stale. A non-positive TTL disables the check, and an
+// unseen node — lastSeenUnixMs zero — is not stale either: that is a different
+// condition, reported under its own reason.
+func heartbeatStale(lastSeenUnixMs int64, nowMs int64, ttl time.Duration) bool {
+	if lastSeenUnixMs <= 0 || ttl <= 0 {
+		return false
+	}
+	return nowMs-lastSeenUnixMs > ttl.Milliseconds()
+}
+
 // FilterByHealth removes nodes that are not currently fit to receive new
 // sandboxes: never heartbeated, heartbeat older than reportTTL, or
 // self-reported as unhealthy or draining.
@@ -33,14 +50,14 @@ const (
 // at once, and refusing all placement in that case turns a recoverable blip
 // into a total outage. Partial staleness still fails closed, which is the case
 // this filter exists for. The returned reasons describe the dropped nodes even
-// when the fail-open path returns them all, so the decision is observable.
-func FilterByHealth(nodes []RichNode, reportTTL time.Duration, now time.Time) ([]RichNode, map[HealthFilterReason]int) {
+// when the fail-open path returns them all, and failedOpen says that it did,
+// so the decision is observable.
+func FilterByHealth(nodes []RichNode, reportTTL time.Duration, now time.Time) (healthy []RichNode, dropped map[HealthFilterReason]int, failedOpen bool) {
 	if len(nodes) == 0 {
-		return nodes, nil
+		return nodes, nil, false
 	}
 
-	healthy := make([]RichNode, 0, len(nodes))
-	var dropped map[HealthFilterReason]int
+	healthy = make([]RichNode, 0, len(nodes))
 	drop := func(reason HealthFilterReason) {
 		if dropped == nil {
 			dropped = make(map[HealthFilterReason]int, 4)
@@ -53,7 +70,7 @@ func FilterByHealth(nodes []RichNode, reportTTL time.Duration, now time.Time) ([
 		switch {
 		case !n.Health.Seen:
 			drop(HealthFilterReasonNeverSeen)
-		case reportTTL > 0 && nowMs-n.Health.LastSeenUnixMs > reportTTL.Milliseconds():
+		case heartbeatStale(n.Health.LastSeenUnixMs, nowMs, reportTTL):
 			drop(HealthFilterReasonStale)
 		case n.Health.Status == schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY:
 			drop(HealthFilterReasonUnhealthy)
@@ -65,9 +82,9 @@ func FilterByHealth(nodes []RichNode, reportTTL time.Duration, now time.Time) ([
 	}
 
 	if len(healthy) == 0 {
-		return nodes, dropped
+		return nodes, dropped, true
 	}
-	return healthy, dropped
+	return healthy, dropped, false
 }
 
 // FilterByResourceLimit removes nodes that exceed any configured resource

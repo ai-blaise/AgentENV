@@ -51,6 +51,48 @@ var (
 		},
 		[]string{"status"},
 	)
+	// schedulerScheduleFailOpenTotal counts placements decided over stale
+	// nodes because no fresh one existed. A steady rate is a scheduler that
+	// cannot hear its fleet; a burst on startup is the deliberate window in
+	// which the registry is empty and every node counts as unseen.
+	schedulerScheduleFailOpenTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_schedule_failopen_total",
+			Help: "Placements that fell open to stale candidates because every node failed the health gate.",
+		},
+	)
+	// schedulerReservationDrift is how far, in sandboxes, the reservation
+	// ledger had moved a node from its last heartbeat when the next heartbeat
+	// replaced it. Fleet-wide by design: a node label would be unbounded at
+	// fleet scale, and the distribution is what says whether the interval is
+	// short enough for the ledger to matter and the clamp wide enough not to.
+	schedulerReservationDrift = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "agentenv_scheduler_reservation_drift",
+			Help:    "Sandboxes the reservation ledger had added to or removed from a node's reported count when a heartbeat replaced it.",
+			Buckets: []float64{0, 1, 2, 4, 8, 16, 32, 64, 128, 256, 512},
+		},
+	)
+	// schedulerP2PArtifactEvictionsTotal counts artifact keys the index
+	// dropped for capacity. A non-zero rate means the fleet publishes more
+	// distinct artifacts than scheduler.artifact_store_capacity holds, and
+	// lookups for the evicted ones fall back to a broad peer poll.
+	schedulerP2PArtifactEvictionsTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "agentenv_scheduler_p2p_artifact_evictions_total",
+			Help: "P2P artifact index keys evicted for capacity.",
+		},
+	)
+	// schedulerP2PLookupPeers is how many providers a lookup returned after
+	// health filtering. Zeros are misses; a mass at the lookup limit means the
+	// limit, not the fleet, is what bounds the answer.
+	schedulerP2PLookupPeers = promauto.NewHistogram(
+		prometheus.HistogramOpts{
+			Name:    "agentenv_scheduler_p2p_lookup_peers",
+			Help:    "Providers returned per P2P artifact lookup.",
+			Buckets: []float64{0, 1, 2, 4, 8, 16, 32, 64},
+		},
+	)
 )
 
 func MetricsUnaryInterceptor() grpc.UnaryServerInterceptor {
@@ -106,6 +148,8 @@ func schedulerRPCLabel(fullMethod string) string {
 		return "LookupNode"
 	case "RecordAssignment":
 		return "RecordAssignment"
+	case "RecordAssignments":
+		return "RecordAssignments"
 	case "Heartbeat":
 		return "Heartbeat"
 	case "ListObservedNodes":
@@ -116,6 +160,22 @@ func schedulerRPCLabel(fullMethod string) string {
 		return "GetNode"
 	case "UnregisterNode":
 		return "UnregisterNode"
+	case "ListP2pPeers":
+		return "ListP2pPeers"
+	case "RecordP2pArtifact":
+		return "RecordP2pArtifact"
+	case "ForgetP2pArtifact":
+		return "ForgetP2pArtifact"
+	case "LookupP2pArtifact":
+		return "LookupP2pArtifact"
+	case "UpsertMobilityRecord":
+		return "UpsertMobilityRecord"
+	case "GetMobilityRecord":
+		return "GetMobilityRecord"
+	case "ListMobilityRecords":
+		return "ListMobilityRecords"
+	case "RemoveMobilityRecord":
+		return "RemoveMobilityRecord"
 	default:
 		return ""
 	}
@@ -129,6 +189,8 @@ func schedulerStrategyLabel(strategy string) string {
 		return "random"
 	case "least_loaded_of_two", "p2c":
 		return "least_loaded_of_two"
+	case "bin_pack":
+		return "bin_pack"
 	default:
 		return "unknown"
 	}

@@ -105,10 +105,14 @@ These variables apply to both the gateway and scheduler processes.
 |----------|---------|-------------|
 | `SCHEDULER_GRPC_LISTEN_ADDR` | `:9090` | gRPC listen address |
 | `SCHEDULER_METRICS_LISTEN_ADDR` | `:9101` | Prometheus metrics listen address |
-| `SCHEDULER_STRATEGY` | `round_robin` | Node selection strategy for new sandboxes: `round_robin` or `random` |
+| `SCHEDULER_STRATEGY` | `round_robin` | Node selection strategy for new sandboxes: `round_robin`, `random`, `least_loaded_of_two` (alias `p2c`) or `bin_pack`. `bin_pack` fills the fullest eligible node and is only bounded by `scheduler.node_resource_limit`; it concentrates concurrent starts on one node and is the wrong choice for tail latency. |
+| `SCHEDULER_AUTH_TOKEN` | unset | Shared bearer token every scheduler gRPC caller must send as `authorization: Bearer <token>` metadata. Unset = every RPC accepted (logged once at startup). Set = every `Scheduler` RPC without a matching token is refused `UNAUTHENTICATED`; `grpc.health.v1.Health` stays open for probes. |
+| `SCHEDULER_AUTH_TOKEN_FILE` | unset | Path to a file holding the token instead of `SCHEDULER_AUTH_TOKEN`. Must exist and be non-empty when set; setting both is refused. |
+| `SCHEDULER_RESERVATIONS_ENABLED` | `false` | Let node-reported sandbox events and the scheduler's own placements adjust each node's last heartbeat between heartbeats, so placements inside one interval see each other. Advisory; the heartbeat always wins. |
+| `SCHEDULER_MAX_RESERVATION_DELTA` | `512` | Clamp on how far the reservation ledger may move one node's sandbox count from its last heartbeat, in either direction. |
 | `SCHEDULER_REDIS_ADDR` | unset | Redis address for persistent sandbox-to-node bindings (for example, `redis:6379`). Unset = in-memory bindings, lost on scheduler restart. |
-| `SCHEDULER_BINDING_TTL` | `30s` | How long a sandbox-to-node binding is kept without a confirming heartbeat. Accepts Go duration strings (for example, `1m`). |
+| `SCHEDULER_BINDING_TTL` | `30s` | How long a sandbox-to-node binding is kept without a confirming heartbeat. Accepts Go duration strings (for example, `1m`). `scheduler.report_ttl` (config only; unset = the smaller of `30s` and this) must not exceed it. |
 | `SCHEDULER_RECONCILE_GRACE` | smaller of `10s` and half `SCHEDULER_BINDING_TTL` | How recently a binding must have been written for a heartbeat reconcile to leave it alone when the node's roster omits it. Must be shorter than the binding TTL. |
 | `SCHEDULER_HEARTBEAT_INTERVAL` | unset | The interval nodes are expected to heartbeat at. Set only to have the TTLs and grace validated against it at startup; unset skips those checks. |
 | `SCHEDULER_ARTIFACT_STORE_CAPACITY` | `1000000` | Maximum number of P2P artifact entries held in the scheduler's in-memory index |
-| `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT` | `0` | Maximum number of nodes checked per P2P artifact lookup. `0` means no limit. |
+| `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT` | `8` | Maximum number of nodes named per P2P artifact lookup. `0` means no limit. |

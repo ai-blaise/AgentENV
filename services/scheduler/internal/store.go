@@ -126,6 +126,22 @@ const (
 
 const defaultArtifactStoreCapacity = 1_000_000
 
+// defaultArtifactLookupNodeLimit bounds how many providers one lookup names.
+// The reasoning is with config.defaultSchedulerArtifactLookupNodeLimit, which
+// this mirrors for a Service built without options.
+const defaultArtifactLookupNodeLimit = 8
+
+// forgetNodeChunkSize bounds how many of a departing node's keys ForgetNode
+// removes under one hold of the write lock.
+//
+// ForgetNode is the one operation on this store that is not O(1): it walks
+// every key the node held, and a node that published a large image cache
+// holds tens of thousands. Holding the write lock for the whole walk stalls
+// every lookup on every other key for its duration, on the request path of
+// every peer trying to fetch a layer. Releasing between chunks lets those
+// through; the walk itself takes no longer.
+const forgetNodeChunkSize = 256
+
 // BindingAssignment is one sandbox-to-node binding in a batch write.
 type BindingAssignment struct {
 	SandboxID string
@@ -482,6 +498,10 @@ type InMemoryArtifactStore struct {
 	nodeKeys        map[string]map[artifactIndexKey]struct{}
 	lru             *lru.Cache[artifactIndexKey, struct{}]
 	lookupNodeLimit int
+	// betweenForgetChunks, when set, runs each time ForgetNode has released
+	// the lock between two chunks. It exists so a test can prove the lock is
+	// released mid-walk; production leaves it nil.
+	betweenForgetChunks func()
 }
 
 func NewInMemoryArtifactStore(capacity int, lookupNodeLimit int) *InMemoryArtifactStore {
@@ -548,12 +568,15 @@ func (s *InMemoryArtifactStore) Lookup(clusterID string, backend string, key str
 		s.mu.RUnlock()
 		return nil
 	}
-	s.lru.Get(indexKey)
 	resultCapacity := len(nodes)
 	if s.lookupNodeLimit > 0 && s.lookupNodeLimit < resultCapacity {
 		resultCapacity = s.lookupNodeLimit
 	}
 	result := make([]string, 0, resultCapacity)
+	// A prefix of the map's iteration order, which Go randomises per
+	// iteration: with more providers than the limit, successive lookups name
+	// different subsets, spreading fetches across them for free. A sorted
+	// prefix would send every peer to the same few nodes.
 	for nodeID := range nodes {
 		result = append(result, nodeID)
 		if s.lookupNodeLimit > 0 && len(result) >= s.lookupNodeLimit {
@@ -562,9 +585,24 @@ func (s *InMemoryArtifactStore) Lookup(clusterID string, backend string, key str
 	}
 	s.mu.RUnlock()
 
+	// The recency touch happens outside s.mu on purpose. The LRU has its own
+	// lock and Get never fires the eviction callback, so nothing here needs
+	// the store lock — and running library code under it would make the
+	// store's consistency depend on that library never calling back from Get,
+	// which an expiring or TTL-based LRU would break. See evictLocked.
+	s.lru.Get(indexKey)
+
 	return result
 }
 
+// ForgetNode removes a node from every key it provided, in chunks so lookups
+// on the rest of the index are not held behind the whole walk.
+//
+// The keys are snapshotted once. A Record for the same node that lands between
+// chunks adds to both maps under its own lock hold and is left alone: it is a
+// later statement about the node than this forget, and removing it would make
+// the index disagree with what the node just said. The reverse index is only
+// dropped once it is empty, so such a key stays reachable from both sides.
 func (s *InMemoryArtifactStore) ForgetNode(nodeID string) {
 	nodeID = strings.TrimSpace(nodeID)
 	if nodeID == "" {
@@ -572,18 +610,32 @@ func (s *InMemoryArtifactStore) ForgetNode(nodeID string) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	keys := s.nodeKeys[nodeID]
-	for indexKey := range keys {
-		if nodes := s.entries[indexKey]; len(nodes) > 0 {
-			delete(nodes, nodeID)
-			if len(nodes) == 0 {
-				s.removeArtifactKeyLocked(indexKey)
-			}
-		}
+	keys := make([]artifactIndexKey, 0, len(s.nodeKeys[nodeID]))
+	for indexKey := range s.nodeKeys[nodeID] {
+		keys = append(keys, indexKey)
 	}
-	delete(s.nodeKeys, nodeID)
+	s.forgetKeysLocked(nodeID, keys[:min(len(keys), forgetNodeChunkSize)])
+	s.mu.Unlock()
+
+	for start := forgetNodeChunkSize; start < len(keys); start += forgetNodeChunkSize {
+		if s.betweenForgetChunks != nil {
+			s.betweenForgetChunks()
+		}
+		s.mu.Lock()
+		s.forgetKeysLocked(nodeID, keys[start:min(start+forgetNodeChunkSize, len(keys))])
+		s.mu.Unlock()
+	}
+}
+
+// forgetKeysLocked removes nodeID from each key and each key from nodeID's
+// reverse index, dropping the reverse index once nothing is left in it.
+func (s *InMemoryArtifactStore) forgetKeysLocked(nodeID string, keys []artifactIndexKey) {
+	for _, indexKey := range keys {
+		s.forgetLocked(indexKey, nodeID)
+	}
+	if held := s.nodeKeys[nodeID]; held != nil && len(held) == 0 {
+		delete(s.nodeKeys, nodeID)
+	}
 }
 
 func (s *InMemoryArtifactStore) forgetLocked(indexKey artifactIndexKey, nodeID string) {
@@ -607,8 +659,19 @@ func (s *InMemoryArtifactStore) removeArtifactKeyLocked(indexKey artifactIndexKe
 	s.lru.Remove(indexKey)
 }
 
-// evictLocked runs from LRU callbacks while callers hold s.mu's write lock.
+// evictLocked keeps entries and nodeKeys consistent when the LRU drops a key
+// for capacity.
+//
+// It mutates both maps without taking s.mu, so it is only correct if the LRU
+// invokes it while the caller already holds the write lock. That is a
+// requirement on the LRU implementation, not an observation about this one:
+// the callback must fire only from Add, Remove and Resize — every call to
+// which is made under s.mu.Lock here — and never from Get, Peek, Contains or
+// a background goroutine. golang-lru/v2's plain Cache satisfies it; its
+// expirable variant does not, because its expiry goroutine evicts on a timer
+// with no lock of ours held. Swapping the cache means re-establishing this.
 func (s *InMemoryArtifactStore) evictLocked(indexKey artifactIndexKey, _ struct{}) {
+	schedulerP2PArtifactEvictionsTotal.Inc()
 	nodes := s.entries[indexKey]
 	delete(s.entries, indexKey)
 	for nodeID := range nodes {

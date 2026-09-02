@@ -16,6 +16,8 @@ than no gate, because it reads as a rollback that will not roll back.
 | Node stops accepting work when out of contact | `observability.scheduler_report.kill_switch.action` | `disabled` | A partitioned node keeps accepting creates |
 | Health-gated placement | scheduler `WithHealthGate` | on | Any discovered node is a candidate, however stale |
 | Bounded candidate sampling | scheduler `WithCandidateSampleSize` | 32 | Every placement inspects the whole fleet |
+| Reservation ledger | `scheduler.reservations_enabled` | off | Placement reads each heartbeat snapshot verbatim; a burst inside one interval sees the same numbers |
+| Scheduler gRPC authentication | `scheduler.auth_token` | unset | Every RPC is accepted; the health service is open either way |
 | Gateway binding cache | `gateway.binding_cache_size` (or a negative `gateway.binding_cache_ttl`) | 65536 / 2s | Zero or negative size, or a negative TTL, disables; every request re-resolves |
 | Gateway scheduler credential | `gateway.scheduler_auth_token` | unset | Scheduler RPCs carry no `authorization` metadata |
 | Snapshot artifact sealing | `snapshot.artifact_sealing_secret` | unset | Fixed artifacts are not advertised to peers at all |

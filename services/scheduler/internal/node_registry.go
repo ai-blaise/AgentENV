@@ -106,10 +106,21 @@ func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeR
 	return registry
 }
 
-// Snapshot returns discovered nodes filtered by their derived status.
+// Snapshot returns discovered nodes filtered by their derived status, sorted
+// by ID so listings are stable.
 // See NodeStatus in scheduler.proto for the full status derivation table.
 func (r *AtomicNodeRegistry) Snapshot(allowLingering bool) []Node {
+	result := r.snapshotUnordered(allowLingering)
+	sortNodesByID(result)
+	return result
+}
+
+// snapshotUnordered is Snapshot without the sort. Placement takes this path
+// when its strategy has no use for the order, because at fleet scale the sort
+// was most of what a placement cost.
+func (r *AtomicNodeRegistry) snapshotUnordered(allowLingering bool) []Node {
 	r.mu.RLock()
+	defer r.mu.RUnlock()
 	result := make([]Node, 0, len(r.nodesByID))
 	for _, node := range r.nodesByID {
 		if r.lingeringIDs[node.ID] && !allowLingering {
@@ -117,11 +128,14 @@ func (r *AtomicNodeRegistry) Snapshot(allowLingering bool) []Node {
 		}
 		result = append(result, node)
 	}
-	r.mu.RUnlock()
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].ID < result[j].ID
-	})
 	return result
+}
+
+// sortNodesByID orders nodes by ID in place.
+func sortNodesByID(nodes []Node) {
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].ID < nodes[j].ID
+	})
 }
 
 // SampleNodes returns at most `size` schedulable nodes chosen uniformly at
@@ -132,11 +146,12 @@ func (r *AtomicNodeRegistry) Snapshot(allowLingering bool) []Node {
 // node list before discarding all but a handful, which is what kept placement
 // linear in fleet size even once per-node snapshot cloning was bounded.
 //
-// A size of zero means "no bound" and falls back to Snapshot, preserving the
-// previous whole-fleet behaviour exactly.
+// A size of zero means "no bound" and returns the whole fleet. Neither path
+// sorts: a caller whose strategy needs a stable order sorts what it got, and
+// every other caller keeps the cost of not doing so.
 func (r *AtomicNodeRegistry) SampleNodes(size int, allowLingering bool) []Node {
 	if size <= 0 {
-		return r.Snapshot(allowLingering)
+		return r.snapshotUnordered(allowLingering)
 	}
 
 	r.mu.RLock()
@@ -591,7 +606,7 @@ func (r *AtomicNodeRegistry) deriveObservedNodeViewLocked(record observedNodeRec
 		ttl = defaultObservedReportTTL
 	}
 
-	if out.GetLastSeenUnixMs() > 0 && nowMs-out.GetLastSeenUnixMs() > ttl.Milliseconds() {
+	if heartbeatStale(out.GetLastSeenUnixMs(), nowMs, ttl) {
 		out.Snapshot.Status = schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY
 	} else if !inDiscovery {
 		out.Snapshot.Status = schedulerv1.NodeStatus_NODE_STATUS_CONNECTING
