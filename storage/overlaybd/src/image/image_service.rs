@@ -393,30 +393,22 @@ impl ImageService {
     ) -> Result<Arc<dyn VirtualFile>> {
         let remote_runtime = self.remote_runtime().await?;
         let source = self.open_backend_source_with_size(url, source_size).await?;
-        // OSS blobs always go through the file cache (when available) regardless
-        // of RemoteOpenMode. RemoteOpenMode::Direct is only meaningful for the
-        // P2P accelerator path, which acts as its own cache; OSS has no P2P
-        // channel, so we always want the local file cache as a read-ahead layer.
-        if Self::is_oss_url(url) {
-            if let Some(cache) = remote_runtime.file_cache.as_ref() {
-                let cache_file = Self::open_cached_blob(cache, url, source, source_size).await?;
-                return Ok(cache_file);
-            }
-            return Ok(source);
+        // Every remote blob gets the local block cache when there is one, in
+        // both modes.
+        //
+        // `Direct` used to return the bare source, on the reasoning that the
+        // P2P accelerator is itself a cache. It is not one for a demand read:
+        // a streamed range is verified in flight and deliberately never lands
+        // in the P2P store, so with no cache here a re-read of the same block
+        // goes back over the network every time. The two layers answer
+        // different questions -- P2P is where a block is fetched from, the
+        // cache is whether it has to be fetched at all -- and choosing between
+        // them was never the trade it looked like.
+        if let Some(cache) = remote_runtime.file_cache.as_ref() {
+            let cache_file = Self::open_cached_blob(cache, url, source, source_size).await?;
+            return Ok(cache_file);
         }
-        let remote_mode = *self.inner.remote_mode.read();
-        match remote_mode {
-            RemoteOpenMode::Direct => Ok(source),
-            RemoteOpenMode::Cached => {
-                if let Some(cache) = remote_runtime.file_cache.as_ref() {
-                    let cache_file =
-                        Self::open_cached_blob(cache, url, source, source_size).await?;
-                    Ok(cache_file)
-                } else {
-                    Ok(source)
-                }
-            }
-        }
+        Ok(source)
     }
 
     pub(crate) async fn open_remote_blob_for_bk_download_with_size(
@@ -1012,6 +1004,87 @@ mod tests {
     /// down -- it made every open a second slower. An unroutable address is
     /// used rather than a closed port because a closed port on loopback is
     /// refused immediately; the timeout only bites where packets go nowhere.
+    /// The local block cache is not something P2P replaces.
+    ///
+    /// `Direct` -- the mode a reachable facade selects -- used to return the
+    /// bare remote source with no `CachedFs` layer at all, on the reasoning
+    /// that the accelerator is itself a cache. It is not one for a demand
+    /// read: a streamed range is verified in flight and never lands in the P2P
+    /// store, so without this every re-read of the same block goes back over
+    /// the network. The two layers answer different questions -- P2P is where
+    /// a block is fetched from, the cache is whether it has to be fetched at
+    /// all.
+    ///
+    /// A size hint is passed so the open needs no network: the registry
+    /// backend skips its length probe when it is given one, which is what lets
+    /// this assert the layering without standing up a registry.
+    #[tokio::test]
+    async fn a_direct_mode_blob_is_still_wrapped_in_the_local_cache() {
+        let tmp = TempDir::new().expect("tempdir");
+        let cache_dir = tmp.path().join("cache");
+        let global_path = tmp.path().join("overlaybd.json");
+        write_json(
+            &global_path,
+            &serde_json::json!({
+                "registryFsVersion": "v2",
+                "ioEngine": 0,
+                "cacheConfig": {
+                    "cacheType": "file",
+                    "cacheDir": cache_dir,
+                    "cacheSizeGB": 1,
+                    "refillSize": 262144,
+                    "blockSize": 65536
+                }
+            }),
+        );
+
+        let service = ImageService::from_config_path(&global_path)
+            .await
+            .expect("service");
+        service.set_remote_mode_direct_for_test();
+        assert!(
+            service
+                .file_cache_for_test()
+                .await
+                .expect("cache lookup")
+                .is_some(),
+            "this configuration must have a file cache, or the test proves nothing"
+        );
+
+        let url = "https://registry.example/v2/ns/repo/blobs/sha256:deadbeef";
+        let file = service
+            .open_remote_blob_with_size(url, Some(65_536))
+            .await
+            .expect("open a remote blob in direct mode");
+
+        assert!(
+            cached_file_count(&cache_dir) > 0,
+            "a direct-mode blob was opened with no cache entry, so every re-read \
+             of the same block goes back over the network"
+        );
+        drop(file);
+    }
+
+    /// Counts the entries a file cache has materialised.
+    fn cached_file_count(cache_dir: &Path) -> usize {
+        fn walk(dir: &Path, count: &mut usize) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, count);
+                } else {
+                    *count += 1;
+                }
+            }
+        }
+        let mut count = 0;
+        walk(cache_dir, &mut count);
+        count
+    }
+
     #[tokio::test]
     async fn deciding_whether_to_accelerate_does_not_block_the_caller() {
         let tmp = TempDir::new().expect("tempdir");
