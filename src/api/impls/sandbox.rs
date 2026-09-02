@@ -13,8 +13,8 @@ use crate::cfg::ConfigManager;
 use crate::image::ResolvedBlockImage;
 use crate::observability::prometheus::SandboxStageTimer;
 use crate::orchestrator::{
-    CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxLaunchSource, SandboxListFilter,
-    SandboxMetadata, SandboxState, SandboxTimeoutAction,
+    AdmissionRejectReason, CreateSandboxRequest, NewTimeout, OrchestratorError,
+    SandboxLaunchSource, SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
 };
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
@@ -32,6 +32,94 @@ use super::ApiImpl;
 
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
     ApiImpl::error(404, format!("sandbox {} not found", id.into()))
+}
+
+/// The word this node uses for "my own admission gate declined this create".
+///
+/// The gateway sends the same header with the same value for its own capacity
+/// refusals and keys create rescheduling on it, so a refusal reads the same
+/// wherever it originated. A bare 503 does not: it reads as the whole fleet
+/// being unavailable rather than as "place this elsewhere".
+const REFUSAL_REASON_NODE_AT_CAPACITY: &str = "node_at_capacity";
+
+/// A create refused by this node's own capacity, in the parts the 503 carries.
+struct NodeAtCapacity {
+    body: models::Error,
+    retry_after_secs: i32,
+}
+
+impl NodeAtCapacity {
+    fn new(reason: AdmissionRejectReason, retry_after: Duration) -> Self {
+        let retry_after_secs = retry_after.as_secs();
+        Self {
+            body: ApiImpl::error(
+                503,
+                format!("node at capacity ({reason}); retry after {retry_after_secs}s"),
+            ),
+            // Seconds is the header's unit and i32 its declared width; a
+            // configured value past that is a misconfiguration, not a reason to
+            // drop the retry hint.
+            retry_after_secs: i32::try_from(retry_after_secs).unwrap_or(i32::MAX),
+        }
+    }
+
+    /// `None` for anything that is not a capacity refusal, which must not be
+    /// answered as one: the caller would place the sandbox elsewhere and hit
+    /// the same fault again.
+    fn of(err: &OrchestratorError) -> Option<Self> {
+        match err {
+            OrchestratorError::AdmissionRejected {
+                reason,
+                retry_after,
+            } => Some(Self::new(*reason, *retry_after)),
+            _ => None,
+        }
+    }
+}
+
+/// Answers a failed warm create.
+fn sandboxes_post_error(err: OrchestratorError) -> SandboxesPostResponse {
+    match NodeAtCapacity::of(&err) {
+        Some(refusal) => SandboxesPostResponse::Status503_NodeAtCapacity {
+            body: refusal.body,
+            retry_after: Some(refusal.retry_after_secs),
+            x_agentenv_refusal_reason: Some(REFUSAL_REASON_NODE_AT_CAPACITY.to_string()),
+        },
+        None => SandboxesPostResponse::Status500_ServerError(ApiImpl::server_error(err)),
+    }
+}
+
+/// Answers a failed cold create, after its own bad-request classification.
+fn sandboxes_cold_post_error(err: OrchestratorError) -> SandboxesColdPostResponse {
+    match NodeAtCapacity::of(&err) {
+        Some(refusal) => SandboxesColdPostResponse::Status503_NodeAtCapacity {
+            body: refusal.body,
+            retry_after: Some(refusal.retry_after_secs),
+            x_agentenv_refusal_reason: Some(REFUSAL_REASON_NODE_AT_CAPACITY.to_string()),
+        },
+        None => SandboxesColdPostResponse::Status500_ServerError(ApiImpl::server_error(err)),
+    }
+}
+
+/// Answers a fork that failed before any child was attempted.
+///
+/// A capacity refusal is refused as a whole rather than reported per child:
+/// the fan-out is admitted once, before the source leaves `Running`, so there
+/// are no partial outcomes to report and a 201 carrying an array of identical
+/// refusals would hide the one status a gateway can act on.
+fn sandboxes_sandbox_id_fork_post_error(
+    err: OrchestratorError,
+) -> SandboxesSandboxIdForkPostResponse {
+    match NodeAtCapacity::of(&err) {
+        Some(refusal) => SandboxesSandboxIdForkPostResponse::Status503_NodeAtCapacity {
+            body: refusal.body,
+            retry_after: Some(refusal.retry_after_secs),
+            x_agentenv_refusal_reason: Some(REFUSAL_REASON_NODE_AT_CAPACITY.to_string()),
+        },
+        None => {
+            SandboxesSandboxIdForkPostResponse::Status500_ServerError(ApiImpl::server_error(err))
+        }
+    }
 }
 
 fn default_sandbox_timeout() -> Duration {
@@ -66,14 +154,7 @@ impl From<OrchestratorError> for models::Error {
             OrchestratorError::AdmissionRejected {
                 reason,
                 retry_after,
-            } => Self::new(
-                503,
-                format!(
-                    "node at capacity ({}); retry after {}s",
-                    reason,
-                    retry_after.as_secs()
-                ),
-            ),
+            } => NodeAtCapacity::new(reason, retry_after).body,
             OrchestratorError::SandboxNotFound(id) => sandbox_not_found(id),
             OrchestratorError::InvalidSandboxState { .. } => Self::new(400, err.to_string()),
             OrchestratorError::SandboxOperationFailed {
@@ -598,9 +679,7 @@ impl Sandboxes<()> for ApiImpl {
                     Some(message) => Ok(SandboxesColdPostResponse::Status400_BadRequest(
                         Self::error(400, message),
                     )),
-                    None => Ok(SandboxesColdPostResponse::Status500_ServerError(
-                        Self::internal_error(&err),
-                    )),
+                    None => Ok(sandboxes_cold_post_error(err)),
                 }
             }
         }
@@ -642,6 +721,9 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewSandbox,
     ) -> Result<SandboxesPostResponse, ()> {
+        if let Some(refusal) = self.forced_admission_refusal() {
+            return Ok(sandboxes_post_error(refusal));
+        }
         let timer = SandboxStageTimer::new("create_warm");
         let snapshot = match timer
             .time(
@@ -718,9 +800,7 @@ impl Sandboxes<()> for ApiImpl {
                     },
                 )
             }
-            Err(err) => Ok(SandboxesPostResponse::Status500_ServerError(
-                Self::internal_error(&err),
-            )),
+            Err(err) => Ok(sandboxes_post_error(err)),
         }
     }
 
@@ -923,9 +1003,7 @@ impl Sandboxes<()> for ApiImpl {
                     format!("sandbox cannot be forked from {} state", state),
                 )),
             ),
-            Err(err) => Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
-                err.into(),
-            )),
+            Err(err) => Ok(sandboxes_sandbox_id_fork_post_error(err)),
         }
     }
 
@@ -1581,7 +1659,17 @@ impl ApiImpl {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use tower::ServiceExt;
+
     use super::*;
+    use crate::api::impls::auth::API_KEY_HEADER;
+    use crate::cfg::AdmissionConfig;
+    use crate::orchestrator::{AdmissionController, NodeCapacityInputs, OrchestratorMetrics};
+
+    const TEST_API_KEY: &str =
+        "e2b_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
     fn parse_metadata_filter_with_none_returns_none() {
@@ -1810,5 +1898,219 @@ mod tests {
         };
         let error = network_policy_from_update(&body).unwrap_err();
         assert!(error.to_string().contains("0.0.0.0/0"));
+    }
+
+    /// A create the node refuses for capacity, captured off the wire.
+    ///
+    /// `services/gateway/internal/testdata/node_admission_503.json` is the
+    /// gateway's only description of this node's refusal: its create retries
+    /// fire on the status, the refusal reason and the Retry-After that arrive
+    /// here. Writing the file from the node's own response is what keeps the
+    /// two halves of that contract from drifting apart unnoticed.
+    #[tokio::test]
+    async fn admission_refusal_wire_shape_is_written_for_the_gateway() {
+        // A real gate, refusing a real create, gives the reason and the
+        // Retry-After the response carries.
+        let controller = AdmissionController::new(AdmissionConfig {
+            enabled: true,
+            max_sandbox_count: Some(0),
+            max_sandbox_starting_count: None,
+            max_allocated_cpu: None,
+            max_allocated_memory_bytes: None,
+            max_sandbox_count_including_paused: None,
+            min_free_network_slots: None,
+            retry_after_secs: 2,
+            snapshot_max_age_ms: 200,
+        });
+        let reason = controller
+            .try_admit(
+                1,
+                SandboxResources {
+                    cpu_count: 1,
+                    memory_mib: 128,
+                    disk_size_mib: 0,
+                },
+                NodeCapacityInputs::default(),
+                || async { Some(OrchestratorMetrics::default()) },
+            )
+            .await
+            .expect_err("a node with no room must refuse");
+
+        let api = Arc::new(
+            build_api_impl()
+                .await
+                .refusing_creates(reason, controller.retry_after()),
+        );
+        let response = crate::api::server::new(api)
+            .oneshot(
+                http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri("/sandboxes")
+                    .header(http::header::HOST, "localhost")
+                    .header(API_KEY_HEADER, TEST_API_KEY)
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(r#"{"templateID":"tpl"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let status = response.status().as_u16();
+        let headers: std::collections::BTreeMap<String, String> = response
+            .headers()
+            .iter()
+            // content-length describes this transfer, not the refusal, and the
+            // gateway replays the fixture body verbatim: a stale length there
+            // would only contradict what it writes.
+            .filter(|(name, _)| *name != http::header::CONTENT_LENGTH)
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let body: serde_json::Value = serde_json::from_slice(
+            &http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes(),
+        )
+        .unwrap();
+
+        assert_eq!(status, 503);
+        // Spelled out rather than read back from this crate: the header name
+        // and the word are the gateway's (services/gateway/internal/shed.go),
+        // and a rename on this side is exactly the drift the fixture exists to
+        // catch.
+        assert_eq!(
+            headers.get("x-agentenv-refusal-reason").map(String::as_str),
+            Some("node_at_capacity")
+        );
+        assert_eq!(headers.get("retry-after").map(String::as_str), Some("2"));
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/json")
+        );
+        assert_eq!(body["code"], 503);
+        assert_eq!(
+            body["message"],
+            "node at capacity (sandbox_count); retry after 2s"
+        );
+
+        let fixture = serde_json::to_string_pretty(&serde_json::json!({
+            "status": status,
+            "headers": headers,
+            "body": body,
+        }))
+        .unwrap()
+            + "\n";
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("services/gateway/internal/testdata/node_admission_503.json");
+        // Only on a change, so a repeat run leaves the tree alone.
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(fixture.as_str()) {
+            std::fs::write(&path, &fixture).expect("write the gateway's admission fixture");
+        }
+    }
+
+    /// All three create paths refuse alike, so a gateway reschedules a cold
+    /// start or a fork on the same signal it reschedules a warm create on.
+    #[test]
+    fn every_create_path_refuses_capacity_the_same_way() {
+        let refused = || OrchestratorError::AdmissionRejected {
+            reason: AdmissionRejectReason::NetworkSlots,
+            retry_after: Duration::from_secs(9),
+        };
+        let expected = (
+            503,
+            "node at capacity (network_slots); retry after 9s".to_string(),
+            Some(9),
+            Some("node_at_capacity".to_string()),
+        );
+
+        let warm = match sandboxes_post_error(refused()) {
+            SandboxesPostResponse::Status503_NodeAtCapacity {
+                body,
+                retry_after,
+                x_agentenv_refusal_reason,
+            } => (
+                body.code,
+                body.message,
+                retry_after,
+                x_agentenv_refusal_reason,
+            ),
+            other => panic!("a warm create must refuse capacity as a 503, got {other:?}"),
+        };
+        assert_eq!(warm, expected);
+
+        let cold = match sandboxes_cold_post_error(refused()) {
+            SandboxesColdPostResponse::Status503_NodeAtCapacity {
+                body,
+                retry_after,
+                x_agentenv_refusal_reason,
+            } => (
+                body.code,
+                body.message,
+                retry_after,
+                x_agentenv_refusal_reason,
+            ),
+            other => panic!("a cold create must refuse capacity as a 503, got {other:?}"),
+        };
+        assert_eq!(cold, expected);
+
+        let fork = match sandboxes_sandbox_id_fork_post_error(refused()) {
+            SandboxesSandboxIdForkPostResponse::Status503_NodeAtCapacity {
+                body,
+                retry_after,
+                x_agentenv_refusal_reason,
+            } => (
+                body.code,
+                body.message,
+                retry_after,
+                x_agentenv_refusal_reason,
+            ),
+            other => panic!("a fork must refuse capacity as a 503, got {other:?}"),
+        };
+        assert_eq!(fork, expected);
+    }
+
+    /// Only a capacity refusal may claim the reason a gateway retries on.
+    #[test]
+    fn other_create_failures_are_not_dressed_as_capacity_refusals() {
+        let err = OrchestratorError::SchedulerContactLost { elapsed_secs: 42 };
+        assert!(NodeAtCapacity::of(&err).is_none());
+
+        let error = ApiImpl::server_error(err);
+        assert_eq!(
+            error.code, 500,
+            "the body must not contradict the 500 it rides on"
+        );
+        assert!(error.message.contains("scheduler"), "{}", error.message);
+    }
+
+    async fn build_api_impl() -> ApiImpl {
+        let root = tempfile::tempdir().unwrap();
+        let orchestrator = crate::orchestrator::Orchestrator::new(
+            crate::orchestrator::InMemoryMetadataStore::new(),
+            crate::sandbox::NodeBackendFactory::Firecracker(
+                crate::sandbox::FirecrackerSandboxFactory::new(),
+            ),
+            crate::orchestrator::FileBackedSandboxPersister::new_for_test(
+                root.path().to_path_buf(),
+            ),
+        )
+        .await
+        .unwrap();
+        ApiImpl::new(
+            orchestrator,
+            Arc::new(crate::snapshot::mock::mock_snapshot_manager()),
+            Arc::new(crate::template::TemplateBuilder::new()),
+            Arc::new(crate::image::ImageResolver::new(
+                &crate::cfg::AppConfig::default(),
+            )),
+            None,
+            Vec::new(),
+            crate::api_key::ApiKey::new(TEST_API_KEY).unwrap(),
+        )
     }
 }

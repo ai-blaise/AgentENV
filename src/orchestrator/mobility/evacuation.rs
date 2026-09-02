@@ -388,6 +388,7 @@ async fn run_move(
     cancel: MoveCancel,
     budget: DrainBudget,
 ) -> anyhow::Result<()> {
+    let sandbox_id = planned.sandbox_id;
     let mut task = tokio::spawn({
         let cancel = cancel.clone();
         async move { executor.execute(&planned, &cancel).await }
@@ -400,25 +401,35 @@ async fn run_move(
         Ok(joined) => joined,
         Err(_) => {
             cancel.request();
-            let unwound = tokio::time::timeout(budget.unwind_grace, &mut task)
-                .await
-                .is_ok();
-            // A failure either way: the move overran its ceiling and was
-            // asked to give the sandbox back. Reported as a timeout rather
-            // than as whatever the unwind returned, because what the drain
-            // knows is that it stopped the move, not why it was slow.
-            return Err(if unwound {
-                anyhow::anyhow!(
+            return match tokio::time::timeout(budget.unwind_grace, &mut task).await {
+                // The move was past its point of no return when it was asked
+                // to stop, and finished the handover instead of unwinding —
+                // which is what a migration must do once the guest is live
+                // elsewhere. Reporting a failure here would tell an operator
+                // the origin still owns a sandbox that has moved, and the
+                // record would say otherwise.
+                Ok(Ok(Ok(()))) => {
+                    warn!(
+                        %sandbox_id,
+                        "the move overran {:?} but had already committed; counting it as migrated",
+                        budget.move_timeout
+                    );
+                    Ok(())
+                }
+                // A genuine unwind. Reported as a timeout rather than as
+                // whatever the compensation returned, because what the drain
+                // knows is that it stopped the move, not why it was slow.
+                Ok(Ok(Err(_))) => Err(anyhow::anyhow!(
                     "move timed out after {:?} and was unwound",
                     budget.move_timeout
-                )
-            } else {
-                anyhow::anyhow!(
+                )),
+                Ok(Err(error)) => Err(anyhow::anyhow!("the move panicked: {error}")),
+                Err(_) => Err(anyhow::anyhow!(
                     "move timed out after {:?} and had not unwound {:?} later; it is still running",
                     budget.move_timeout,
                     budget.unwind_grace
-                )
-            });
+                )),
+            };
         }
     };
 
@@ -917,6 +928,80 @@ mod tests {
         );
     }
 
+    /// The moves still running when the failure budget dies have to be told to
+    /// stop. The drain has stopped waiting on them, and a migration nobody is
+    /// waiting for still has to put the sandbox back somewhere — so the request
+    /// has to reach the moves in flight, not only the ones already finished.
+    ///
+    /// Observed from inside the executor on purpose: the report's shape is
+    /// identical whether or not the request is ever sent.
+    #[tokio::test]
+    async fn stopping_early_asks_the_moves_still_in_flight_to_stop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct WaitsToBeStopped {
+            hanging: SandboxId,
+            started: Arc<AtomicBool>,
+            stopped: Arc<AtomicBool>,
+        }
+
+        #[async_trait::async_trait]
+        impl MoveExecutor for WaitsToBeStopped {
+            async fn execute(
+                &self,
+                planned: &PlannedMove,
+                cancel: &MoveCancel,
+            ) -> anyhow::Result<()> {
+                if planned.sandbox_id == self.hanging {
+                    self.started.store(true, Ordering::SeqCst);
+                    cancel.requested().await;
+                    self.stopped.store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                // Ordering, not timing: the budget must die with a move
+                // genuinely in flight or the test proves nothing.
+                while !self.started.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+                anyhow::bail!("restore refused")
+            }
+        }
+
+        let plan = plan_of(2);
+        let started = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let report = drain(
+            &plan,
+            Arc::new(WaitsToBeStopped {
+                hanging: plan.moves[0].sandbox_id,
+                started: Arc::clone(&started),
+                stopped: Arc::clone(&stopped),
+            }),
+            DrainBudget {
+                max_concurrent: 2,
+                max_failures: 0,
+                ..DrainBudget::default()
+            },
+        )
+        .await;
+
+        assert!(report.stopped_early);
+        assert_eq!(
+            report.not_attempted,
+            vec![plan.moves[0].sandbox_id],
+            "the hanging move is the one the drain stopped waiting on"
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !stopped.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the drain stopped early but never asked the in-flight move to stop"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Concurrency is what keeps a drain from competing with the live traffic
     /// on both ends of every move.
     #[tokio::test]
@@ -967,8 +1052,11 @@ mod cancellation_tests {
     use super::tests::{fingerprint, record};
     use super::*;
     use crate::orchestrator::mobility::claim::MobilityCoordinator;
-    use crate::orchestrator::mobility::record::{LocalMobilityStore, MobilityStore};
+    use crate::orchestrator::mobility::record::{
+        LocalMobilityStore, MobilityGeneration, MobilityStore, MobilityWrite,
+    };
     use crate::orchestrator::mobility::saga::{MigrationOutcome, MigrationSaga, MigrationSteps};
+    use crate::types::SandboxId;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     /// A restore that gets as far as holding the sandbox's state open on the
@@ -1003,13 +1091,13 @@ mod cancellation_tests {
 
     /// What a drain executes in production: the migration saga, on behalf of
     /// the destination.
-    struct SagaExecutor {
-        saga: MigrationSaga<LocalMobilityStore>,
+    struct SagaExecutor<S: MobilityStore> {
+        saga: MigrationSaga<S>,
         host: MigrationFingerprint,
     }
 
     #[async_trait::async_trait]
-    impl MoveExecutor for SagaExecutor {
+    impl<S: MobilityStore + 'static> MoveExecutor for SagaExecutor<S> {
         async fn execute(&self, planned: &PlannedMove, cancel: &MoveCancel) -> anyhow::Result<()> {
             match self
                 .saga
@@ -1102,5 +1190,128 @@ mod cancellation_tests {
             MobilityState::Parked,
             "the claim must be given back, leaving the origin the sandbox's only owner"
         );
+    }
+
+    /// A move that passes its point of no return while it is being asked to
+    /// stop has committed the handover, and the record says so. Reporting it as
+    /// a failure that "was unwound" tells an operator the origin still owns a
+    /// sandbox that has moved, and the drained-node-empty decision is then made
+    /// against the opposite of what the store holds.
+    #[tokio::test]
+    async fn a_move_that_commits_during_the_unwind_grace_is_reported_as_migrated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalMobilityStore::open(dir.path().join("mobility"))
+            .await
+            .expect("open store");
+        let paused = record(2048, "k1");
+        store.upsert(&paused).await.expect("seed record");
+
+        let ttl = Duration::from_secs(30);
+        let saga = MigrationSaga::new(
+            Arc::new(
+                MobilityCoordinator::new(
+                    SlowCommit {
+                        inner: store.clone(),
+                    },
+                    "node-b",
+                )
+                .with_claim_ttl(ttl),
+            ),
+            Arc::new(InstantRestore),
+        )
+        .with_claim_ttl(ttl);
+
+        let plan = EvacuationPlan {
+            moves: vec![PlannedMove {
+                sandbox_id: paused.sandbox_id,
+                to_node_id: "node-b".to_string(),
+                resources: paused.resources,
+            }],
+            unplaceable: Vec::new(),
+        };
+        let report = drain(
+            &plan,
+            Arc::new(SagaExecutor {
+                saga,
+                host: fingerprint("k1"),
+            }),
+            DrainBudget {
+                // Short enough that the timeout lands inside the commit, long
+                // enough that the commit then finishes well inside the grace.
+                move_timeout: Duration::from_millis(100),
+                unwind_grace: Duration::from_secs(5),
+                ..DrainBudget::default()
+            },
+        )
+        .await;
+
+        assert_eq!(
+            report.migrated,
+            vec![paused.sandbox_id],
+            "a committed handover is a migration, whatever the clock said: {:?}",
+            report.failed
+        );
+        assert!(report.failed.is_empty());
+        assert!(
+            matches!(
+                store.get(&paused.sandbox_id).await.expect("get").expect("record").state,
+                MobilityState::Evacuated { ref to_node_id, .. } if to_node_id == "node-b"
+            ),
+            "the report and the record have to agree about who owns the sandbox"
+        );
+    }
+
+    /// A restore with nothing to do, so the only slow step is the commit.
+    struct InstantRestore;
+
+    #[async_trait::async_trait]
+    impl MigrationSteps for InstantRestore {
+        async fn restore(&self, _record: &MobilityRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn discard_restored(&self, _record: &MobilityRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn release_origin_state(&self, _record: &MobilityRecord) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Takes long enough over the commit that the drain's ceiling expires
+    /// inside it, which is what a busy scheduler looks like from here.
+    struct SlowCommit {
+        inner: LocalMobilityStore,
+    }
+
+    #[async_trait::async_trait]
+    impl MobilityStore for SlowCommit {
+        async fn upsert(&self, record: &MobilityRecord) -> anyhow::Result<MobilityWrite> {
+            self.inner.upsert(record).await
+        }
+
+        async fn compare_and_set(
+            &self,
+            expected: Option<MobilityGeneration>,
+            record: &MobilityRecord,
+        ) -> anyhow::Result<MobilityWrite> {
+            if matches!(record.state, MobilityState::Evacuated { .. }) {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            self.inner.compare_and_set(expected, record).await
+        }
+
+        async fn get(&self, sandbox_id: &SandboxId) -> anyhow::Result<Option<MobilityRecord>> {
+            self.inner.get(sandbox_id).await
+        }
+
+        async fn list(&self) -> anyhow::Result<Vec<MobilityRecord>> {
+            self.inner.list().await
+        }
+
+        async fn remove(&self, sandbox_id: &SandboxId) -> anyhow::Result<()> {
+            self.inner.remove(sandbox_id).await
+        }
     }
 }

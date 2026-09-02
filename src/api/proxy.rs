@@ -90,9 +90,7 @@ const E2B_SANDBOX_ID_HEADER: &str = "e2b-sandbox-id";
 const TARGET_PORT_HEADER: &str = "x-agentenv-target-port";
 /// E2B-compatible alias for the target port header.
 const E2B_TARGET_PORT_HEADER: &str = "e2b-sandbox-port";
-#[cfg(test)]
-const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
-#[cfg(not(test))]
+/// How long a proxied request may wait to open a connection to the upstream.
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a proxied request may wait for the upstream to send headers.
@@ -118,6 +116,8 @@ const PROXY_REQUEST_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) struct ProxyTimeouts {
     pub(crate) response_header: Duration,
     pub(crate) request_body_idle: Duration,
+    pub(crate) connect: Duration,
+    pub(crate) auto_resume: Duration,
 }
 
 impl Default for ProxyTimeouts {
@@ -125,13 +125,13 @@ impl Default for ProxyTimeouts {
         Self {
             response_header: PROXY_RESPONSE_HEADER_TIMEOUT,
             request_body_idle: PROXY_REQUEST_BODY_IDLE_TIMEOUT,
+            connect: PROXY_CONNECT_TIMEOUT,
+            auto_resume: PROXY_AUTO_RESUME_TIMEOUT,
         }
     }
 }
 
-#[cfg(test)]
-const PROXY_AUTO_RESUME_TIMEOUT: Duration = Duration::from_millis(100);
-#[cfg(not(test))]
+/// How long a request to a paused sandbox waits for the resume it triggered.
 const PROXY_AUTO_RESUME_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn auto_resume_min_sandbox_timeout() -> Duration {
@@ -147,12 +147,12 @@ fn auto_resume_min_sandbox_timeout() -> Duration {
     })
 }
 
-pub(crate) fn build_proxy_client() -> ProxyClient {
+pub(crate) fn build_proxy_client(connect_timeout: Duration) -> ProxyClient {
     let mut connector = HttpConnector::new();
     // Proxied requests and responses are small, so Nagle only ever adds a
     // delayed-ACK wait to them.
     connector.set_nodelay(true);
-    connector.set_connect_timeout(Some(PROXY_CONNECT_TIMEOUT));
+    connector.set_connect_timeout(Some(connect_timeout));
     // Interaction IPs are reused across sandbox runtime generations. Hyper keys
     // its idle pool by authority, so a pooled connection can retain a stale VM flow.
     Client::builder(TokioExecutor::new())
@@ -716,6 +716,7 @@ async fn proxy_websocket_request(
     // forwarding the upstream's copies would duplicate or conflict with them.
     remove_websocket_handshake_headers(&mut upstream_headers);
     remove_hop_by_hop_headers(&mut upstream_headers);
+    strip_proxy_managed_response_headers(&mut upstream_headers);
 
     let mut response = websocket_upgrade.on_upgrade(move |socket| async move {
         bridge_websocket_streams(socket, upstream_websocket, sandbox_id_for_bridge).await;
@@ -735,6 +736,7 @@ fn map_websocket_handshake_rejection_response(
 ) -> Response<Body> {
     let (mut parts, body) = response.into_parts();
     remove_hop_by_hop_headers(&mut parts.headers);
+    strip_proxy_managed_response_headers(&mut parts.headers);
     let body = body.map_or_else(Body::empty, Body::from);
     Response::from_parts(parts, body)
 }
@@ -754,51 +756,15 @@ async fn resolve_proxy_request(
 
     let mut auto_resume_attempted = false;
     let target = loop {
-        match api_impl.orchestrator().proxy_lookup_for(&sandbox_id).await {
-            Ok(ProxyLookupResult::Ready(target)) => break target,
-            Ok(ProxyLookupResult::NotFound) => {
-                return Err(ProxyRequestError::SandboxNotFound(sandbox_id))
-            }
-            Ok(ProxyLookupResult::Paused { auto_resume: true }) => {
-                if auto_resume_attempted {
-                    return Err(ProxyRequestError::AutoResumeFailed(sandbox_id));
-                }
-                try_auto_resume(api_impl, sandbox_id).await?;
+        let lookup = api_impl.orchestrator().proxy_lookup_for(&sandbox_id).await;
+        match classify_proxy_lookup(sandbox_id, lookup, auto_resume_attempted) {
+            ProxyLookupDecision::Ready(target) => break target,
+            ProxyLookupDecision::Resume => {
+                try_auto_resume(api_impl, sandbox_id, api_impl.proxy_timeouts().auto_resume)
+                    .await?;
                 auto_resume_attempted = true;
-                continue;
             }
-            Ok(ProxyLookupResult::Paused { auto_resume: false }) => {
-                return Err(ProxyRequestError::SandboxUnavailable(
-                    sandbox_id,
-                    SandboxState::Paused,
-                ))
-            }
-            Ok(ProxyLookupResult::Unavailable(_)) | Ok(ProxyLookupResult::RouteMissing)
-                if auto_resume_attempted =>
-            {
-                return Err(ProxyRequestError::AutoResumeFailed(sandbox_id))
-            }
-            Ok(ProxyLookupResult::Unavailable(state)) => {
-                return Err(ProxyRequestError::SandboxUnavailable(sandbox_id, state))
-            }
-            Ok(ProxyLookupResult::RouteMissing) => {
-                return Err(ProxyRequestError::MissingRuntimeRoute(sandbox_id))
-            }
-            Err(OrchestratorError::SandboxNotFound(_)) => {
-                return Err(ProxyRequestError::SandboxNotFound(sandbox_id))
-            }
-            Err(err) if auto_resume_attempted => {
-                warn!(
-                    sandbox_id = %sandbox_id,
-                    error = %err,
-                    "failed to resolve proxy target after auto-resume"
-                );
-                return Err(ProxyRequestError::AutoResumeFailed(sandbox_id));
-            }
-            Err(err) => {
-                warn!(sandbox_id = %sandbox_id, error = %err, "failed to resolve proxy target");
-                return Err(ProxyRequestError::InternalServerError);
-            }
+            ProxyLookupDecision::Reject(err) => return Err(err),
         }
     };
 
@@ -816,12 +782,76 @@ async fn resolve_proxy_request(
     })
 }
 
+/// What one proxy-target lookup means for the resolve loop.
+enum ProxyLookupDecision {
+    Ready(ProxyTarget),
+    /// The sandbox is paused with auto-resume on and has not been resumed yet.
+    Resume,
+    Reject(ProxyRequestError),
+}
+
+/// Turns one lookup outcome into the loop's next move.
+///
+/// Split out of the loop because `auto_resume_attempted` selects the
+/// client-visible status for four of these outcomes — 410 versus 502, 500
+/// versus 502 — and in the loop those choices were only reachable through a
+/// resume that succeeds, which nothing short of a live backend can arrange.
+fn classify_proxy_lookup(
+    sandbox_id: SandboxId,
+    lookup: Result<ProxyLookupResult, OrchestratorError>,
+    auto_resume_attempted: bool,
+) -> ProxyLookupDecision {
+    match lookup {
+        Ok(ProxyLookupResult::Ready(target)) => ProxyLookupDecision::Ready(target),
+        Ok(ProxyLookupResult::NotFound) => {
+            ProxyLookupDecision::Reject(ProxyRequestError::SandboxNotFound(sandbox_id))
+        }
+        Ok(ProxyLookupResult::Paused { auto_resume: true }) => {
+            if auto_resume_attempted {
+                ProxyLookupDecision::Reject(ProxyRequestError::AutoResumeFailed(sandbox_id))
+            } else {
+                ProxyLookupDecision::Resume
+            }
+        }
+        Ok(ProxyLookupResult::Paused { auto_resume: false }) => ProxyLookupDecision::Reject(
+            ProxyRequestError::SandboxUnavailable(sandbox_id, SandboxState::Paused),
+        ),
+        Ok(ProxyLookupResult::Unavailable(_)) | Ok(ProxyLookupResult::RouteMissing)
+            if auto_resume_attempted =>
+        {
+            ProxyLookupDecision::Reject(ProxyRequestError::AutoResumeFailed(sandbox_id))
+        }
+        Ok(ProxyLookupResult::Unavailable(state)) => {
+            ProxyLookupDecision::Reject(ProxyRequestError::SandboxUnavailable(sandbox_id, state))
+        }
+        Ok(ProxyLookupResult::RouteMissing) => {
+            ProxyLookupDecision::Reject(ProxyRequestError::MissingRuntimeRoute(sandbox_id))
+        }
+        Err(OrchestratorError::SandboxNotFound(_)) => {
+            ProxyLookupDecision::Reject(ProxyRequestError::SandboxNotFound(sandbox_id))
+        }
+        Err(err) if auto_resume_attempted => {
+            warn!(
+                sandbox_id = %sandbox_id,
+                error = %err,
+                "failed to resolve proxy target after auto-resume"
+            );
+            ProxyLookupDecision::Reject(ProxyRequestError::AutoResumeFailed(sandbox_id))
+        }
+        Err(err) => {
+            warn!(sandbox_id = %sandbox_id, error = %err, "failed to resolve proxy target");
+            ProxyLookupDecision::Reject(ProxyRequestError::InternalServerError)
+        }
+    }
+}
+
 async fn try_auto_resume(
     api_impl: &ApiImpl,
     sandbox_id: SandboxId,
+    budget: Duration,
 ) -> Result<(), ProxyRequestError> {
     match timeout(
-        PROXY_AUTO_RESUME_TIMEOUT,
+        budget,
         api_impl.orchestrator().resume_sandbox(
             sandbox_id,
             NewTimeout::EnsureMinimum(auto_resume_min_sandbox_timeout()),
@@ -840,7 +870,7 @@ async fn try_auto_resume(
         Err(_) => {
             warn!(
                 sandbox_id = %sandbox_id,
-                timeout_ms = PROXY_AUTO_RESUME_TIMEOUT.as_millis(),
+                timeout_ms = budget.as_millis(),
                 "sandbox auto-resume timed out"
             );
             Err(ProxyRequestError::AutoResumeTimedOut(sandbox_id))
@@ -1134,18 +1164,25 @@ fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
     headers.remove(HeaderName::from_static("keep-alive"));
 }
 
+/// Drops the control headers only this node may speak.
+///
+/// The disown header is a control signal this node emits, and the gateway acts
+/// on it by dropping a cached binding and re-resolving. A guest can put any
+/// header it likes on its own responses, so one that set this could make every
+/// request it serves cost a scheduler round trip. Anything arriving from
+/// inside the sandbox is guest output, never a statement about what this node
+/// owns — on the HTTP response, on a WebSocket 101, and on a handshake the
+/// guest rejects alike.
+fn strip_proxy_managed_response_headers(headers: &mut HeaderMap) {
+    headers.remove(SANDBOX_DISOWNED_HEADER);
+}
+
 fn map_upstream_response(response: Response<Incoming>) -> Response<Body> {
     let (mut parts, body) = response.into_parts();
     // Mirror the request-side filtering on the way back so connection-scoped
     // headers from the upstream do not leak through this proxy hop.
     remove_hop_by_hop_headers(&mut parts.headers);
-    // The disown header is a control signal this node emits, and the gateway
-    // acts on it by dropping a cached binding and re-resolving. A guest can
-    // put any header it likes on its own responses, so one that set this could
-    // make every request it serves cost a scheduler round trip. Strip it here:
-    // anything arriving from inside the sandbox is guest output, never a
-    // statement about what this node owns.
-    parts.headers.remove(SANDBOX_DISOWNED_HEADER);
+    strip_proxy_managed_response_headers(&mut parts.headers);
     Response::from_parts(parts, Body::new(body.map_err(axum::Error::new)))
 }
 
@@ -1333,6 +1370,70 @@ mod tests {
         assert!(parse_host_proxy_route(Some(bad_sandbox), &domains).is_err());
     }
 
+    /// A served proxy domain also carries ordinary multi-label hosts. Only the
+    /// single label directly under the domain is a data-plane route; anything
+    /// deeper is a normal control-plane request, and treating it as a route
+    /// turns every such host into a 400.
+    #[test]
+    fn parse_host_proxy_route_ignores_multi_label_subdomains() {
+        let sandbox_id = SandboxId::new();
+        let domains = vec!["sandbox.example.invalid".to_string()];
+
+        for host in [
+            format!("edge-1.8080-{sandbox_id}.sandbox.example.invalid"),
+            "us-east.myapp.sandbox.example.invalid".to_string(),
+            "a.b.sandbox.example.invalid".to_string(),
+        ] {
+            assert_eq!(
+                parse_host_proxy_route(Some(&host), &domains).unwrap(),
+                None,
+                "{host} is not a sandbox data-plane host"
+            );
+        }
+    }
+
+    /// An upgrade is both headers together. Either one alone belongs to some
+    /// other protocol — h2c, or a hop that set Connection: Upgrade on its own —
+    /// and answering those over a `ws://` upstream breaks plain HTTP traffic.
+    #[test]
+    fn websocket_upgrade_needs_both_handshake_headers() {
+        let cases = [
+            (
+                vec![("connection", "upgrade"), ("upgrade", "websocket")],
+                true,
+            ),
+            (
+                vec![
+                    ("connection", "Keep-Alive, Upgrade"),
+                    ("upgrade", "WebSocket"),
+                ],
+                true,
+            ),
+            (vec![("connection", "upgrade")], false),
+            (vec![("upgrade", "websocket")], false),
+            (
+                vec![("connection", "keep-alive, upgrade"), ("upgrade", "h2c")],
+                false,
+            ),
+            (vec![], false),
+        ];
+
+        for (headers, expected) in cases {
+            let mut map = HeaderMap::new();
+            for (name, value) in &headers {
+                map.append(
+                    HeaderName::from_static(name),
+                    HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            assert_eq!(
+                is_websocket_upgrade_request(&map),
+                expected,
+                "{headers:?} should classify as websocket={expected}"
+            );
+        }
+    }
+
     async fn read_http_request_head(stream: &mut tokio::net::TcpStream) {
         let mut request = Vec::new();
         let mut buffer = [0_u8; 1024];
@@ -1408,7 +1509,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let runtime = tokio::spawn(simulate_runtime_generation_change(listener));
-        let client = build_proxy_client();
+        let client = build_proxy_client(ProxyTimeouts::default().connect);
 
         let first_response = client.request(empty_proxy_request(address)).await.unwrap();
         assert_eq!(first_response.status(), StatusCode::OK);
@@ -1581,6 +1682,11 @@ mod tests {
                 HeaderName::from_static("x-upstream-ws-custom"),
                 HeaderValue::from_static("ws-header-value"),
             );
+            // A guest claiming this node no longer owns the sandbox.
+            response.headers_mut().insert(
+                HeaderName::from_static(SANDBOX_DISOWNED_HEADER),
+                HeaderValue::from_static("1"),
+            );
             response.headers_mut().insert(
                 header::SEC_WEBSOCKET_EXTENSIONS,
                 HeaderValue::from_static("permessage-deflate"),
@@ -1596,6 +1702,8 @@ mod tests {
             Response::builder()
                 .status(StatusCode::UNAUTHORIZED)
                 .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                // A guest claiming this node no longer owns the sandbox.
+                .header(SANDBOX_DISOWNED_HEADER, "1")
                 .body(Body::from("upstream denied websocket"))
                 .unwrap()
         }
@@ -2196,6 +2304,194 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(body, Bytes::from_static(b"sandbox auto-resume failed"));
+    }
+
+    /// The two auto-resume proxy tests both end in a 502 that a `try_auto_resume`
+    /// doing nothing at all produces just as well, so the failure has to be
+    /// asserted where it is raised.
+    #[tokio::test]
+    async fn try_auto_resume_reports_the_failure_when_the_resume_errors() {
+        let sandbox_id = SandboxId::new();
+        let api = build_api().await;
+        api.orchestrator()
+            .set_proxy_target_for_test(
+                sandbox_id,
+                ProxyTarget::new(Ipv4Addr::LOCALHOST),
+                crate::orchestrator::SandboxState::Paused,
+            )
+            .await;
+        api.orchestrator()
+            .set_auto_resume_for_test(&sandbox_id, true)
+            .await
+            .unwrap();
+
+        let error = try_auto_resume(&api, sandbox_id, ProxyTimeouts::default().auto_resume)
+            .await
+            .expect_err("resuming a sandbox with no paused state must fail");
+
+        assert!(
+            matches!(error, ProxyRequestError::AutoResumeFailed(id) if id == sandbox_id),
+            "expected AutoResumeFailed, got {error:?}"
+        );
+    }
+
+    /// A resume that keeps the sandbox's own expiry re-pauses it as soon as the
+    /// original deadline lapses, so a request that resumed a sandbox would flap
+    /// it under steady traffic. The floor is what stops that, and it is only
+    /// visible in the metadata the resume leaves behind.
+    #[tokio::test]
+    async fn auto_resume_raises_the_sandbox_timeout_to_the_configured_floor() {
+        let sandbox_id = SandboxId::new();
+        let api = build_api().await;
+        api.orchestrator()
+            .set_proxy_target_for_test(
+                sandbox_id,
+                ProxyTarget::new(Ipv4Addr::LOCALHOST),
+                crate::orchestrator::SandboxState::Running,
+            )
+            .await;
+        // Shorter than the floor, so a resume that honours the sandbox's own
+        // expiry and one that raises it disagree.
+        api.orchestrator()
+            .keep_alive_for(sandbox_id, Some(Duration::from_secs(1)), true)
+            .await
+            .unwrap();
+
+        try_auto_resume(&api, sandbox_id, ProxyTimeouts::default().auto_resume)
+            .await
+            .expect("resuming an already-running sandbox only updates its timeout");
+
+        let floor = Duration::from_secs(
+            ConfigManager::global_config()
+                .orchestrator
+                .auto_resume_min_sandbox_timeout_secs,
+        );
+        assert!(!floor.is_zero(), "the shipped floor must not be zero");
+        let metadata = api
+            .orchestrator()
+            .get_sandbox(&sandbox_id)
+            .await
+            .unwrap()
+            .expect("resumed sandbox metadata");
+        assert_eq!(metadata.timeout, Some(floor));
+    }
+
+    /// A resume that never returns must not hold the client's request open
+    /// behind it. Nothing else in the suite reaches the 504.
+    #[tokio::test]
+    async fn auto_resume_gives_up_when_the_resume_outlives_its_budget() {
+        let sandbox_id = SandboxId::new();
+        let api = build_api().await;
+        // Resuming makes resume_sandbox wait for the transition that this
+        // sandbox will never make, which is the only stall a unit test can
+        // arrange without a backend.
+        api.orchestrator()
+            .set_metadata_state_for_test(sandbox_id, crate::orchestrator::SandboxState::Resuming)
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_auto_resume(&api, sandbox_id, Duration::from_millis(50)),
+        )
+        .await
+        .expect("try_auto_resume must return on its own budget, not the orchestrator's")
+        .expect_err("a resume that never completes must not succeed");
+
+        assert!(
+            matches!(error, ProxyRequestError::AutoResumeTimedOut(id) if id == sandbox_id),
+            "expected AutoResumeTimedOut, got {error:?}"
+        );
+        let response = proxy_error_response(&error);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from_static(b"sandbox auto-resume timed out"));
+    }
+
+    /// After a resume has been attempted, every non-Ready outcome is the
+    /// resume's failure and must read as one. Before it, the same outcomes are
+    /// ordinary states with their own, different, client-visible answers.
+    #[test]
+    fn a_lookup_after_a_resume_attempt_reports_the_resume_failure() {
+        let sandbox_id = SandboxId::new();
+        let cases: [(ProxyLookupResult, StatusCode, StatusCode); 3] = [
+            (
+                ProxyLookupResult::Unavailable(SandboxState::Paused),
+                StatusCode::GONE,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                ProxyLookupResult::RouteMissing,
+                StatusCode::BAD_GATEWAY,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                ProxyLookupResult::Paused { auto_resume: true },
+                // Not attempted yet: the loop resumes rather than answering.
+                StatusCode::CONTINUE,
+                StatusCode::BAD_GATEWAY,
+            ),
+        ];
+
+        for (lookup, before_resume, after_resume) in cases {
+            assert_eq!(
+                decision_status(classify_proxy_lookup(sandbox_id, Ok(lookup.clone()), false)),
+                before_resume,
+                "{lookup:?} before a resume attempt"
+            );
+            assert_eq!(
+                decision_status(classify_proxy_lookup(sandbox_id, Ok(lookup.clone()), true)),
+                after_resume,
+                "{lookup:?} after a resume attempt"
+            );
+        }
+
+        let orchestrator_failure = || {
+            Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: SandboxState::Paused,
+            })
+        };
+        assert_eq!(
+            decision_status(classify_proxy_lookup(
+                sandbox_id,
+                orchestrator_failure(),
+                false
+            )),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a lookup failure with no resume behind it is this node's fault"
+        );
+        assert_eq!(
+            decision_status(classify_proxy_lookup(
+                sandbox_id,
+                orchestrator_failure(),
+                true
+            )),
+            StatusCode::BAD_GATEWAY,
+            "a lookup failure after a resume is the resume's failure"
+        );
+    }
+
+    /// `CONTINUE` stands for "the loop resumes and looks again", which no
+    /// rejection maps to.
+    fn decision_status(decision: ProxyLookupDecision) -> StatusCode {
+        match decision {
+            ProxyLookupDecision::Ready(_) => StatusCode::OK,
+            ProxyLookupDecision::Resume => StatusCode::CONTINUE,
+            ProxyLookupDecision::Reject(err) => proxy_error_response(&err).status(),
+        }
+    }
+
+    /// The deadlines a proxied request actually ships with. They were compile
+    /// -time constants that tests replaced wholesale, so no test ever saw the
+    /// values production runs on.
+    #[test]
+    fn proxy_timeouts_default_to_the_shipped_deadlines() {
+        let timeouts = ProxyTimeouts::default();
+        assert_eq!(timeouts.connect, Duration::from_secs(5));
+        assert_eq!(timeouts.auto_resume, Duration::from_secs(60));
+        assert_eq!(timeouts.response_header, Duration::from_secs(30));
+        assert_eq!(timeouts.request_body_idle, Duration::from_secs(30));
     }
 
     #[tokio::test]
@@ -2865,6 +3161,7 @@ mod tests {
             ProxyTimeouts {
                 response_header: Duration::from_secs(5),
                 request_body_idle: Duration::from_millis(500),
+                ..ProxyTimeouts::default()
             },
         )
         .await;
@@ -2920,6 +3217,7 @@ mod tests {
             ProxyTimeouts {
                 response_header: Duration::from_millis(50),
                 request_body_idle: Duration::from_millis(50),
+                ..ProxyTimeouts::default()
             },
         )
         .await;
@@ -3027,6 +3325,10 @@ mod tests {
                 .is_none(),
             "upstream sec-websocket-* headers should not leak through the proxy"
         );
+        assert!(
+            response.headers().get(SANDBOX_DISOWNED_HEADER).is_none(),
+            "the disown signal is this node's to send; a guest 101 must not carry it"
+        );
 
         let initial_message = websocket.next().await.unwrap().unwrap();
         let initial_payload: Value =
@@ -3084,6 +3386,10 @@ mod tests {
         assert_eq!(
             response.body().as_deref(),
             Some(b"upstream denied websocket".as_slice())
+        );
+        assert!(
+            response.headers().get(SANDBOX_DISOWNED_HEADER).is_none(),
+            "the disown signal is this node's to send; a guest rejection must not carry it"
         );
     }
 }

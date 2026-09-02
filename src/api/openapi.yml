@@ -1374,6 +1374,28 @@ paths:
           $ref: "#/components/responses/401"
         "400":
           $ref: "#/components/responses/400"
+        "503":
+          description: Node at capacity
+          headers:
+            retry-after:
+              description: >
+                Seconds to wait before retrying, from the node's
+                orchestrator.admission.retry_after_secs.
+              schema:
+                type: integer
+                format: int32
+            x-agentenv-refusal-reason:
+              description: >
+                Why the create was refused. node_at_capacity means this node's
+                own admission gate declined it, so the same request can succeed
+                on another node; a gateway reads it to place the sandbox
+                elsewhere instead of failing the client.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1413,6 +1435,28 @@ paths:
           $ref: "#/components/responses/401"
         "400":
           $ref: "#/components/responses/400"
+        "503":
+          description: Node at capacity
+          headers:
+            retry-after:
+              description: >
+                Seconds to wait before retrying, from the node's
+                orchestrator.admission.retry_after_secs.
+              schema:
+                type: integer
+                format: int32
+            x-agentenv-refusal-reason:
+              description: >
+                Why the create was refused. node_at_capacity means this node's
+                own admission gate declined it, so the same request can succeed
+                on another node; a gateway reads it to place the sandbox
+                elsewhere instead of failing the client.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1644,6 +1688,28 @@ paths:
           $ref: "#/components/responses/404"
         "401":
           $ref: "#/components/responses/401"
+        "503":
+          description: Node at capacity
+          headers:
+            retry-after:
+              description: >
+                Seconds to wait before retrying, from the node's
+                orchestrator.admission.retry_after_secs.
+              schema:
+                type: integer
+                format: int32
+            x-agentenv-refusal-reason:
+              description: >
+                Why the create was refused. node_at_capacity means this node's
+                own admission gate declined it, so the same request can succeed
+                on another node; a gateway reads it to place the sandbox
+                elsewhere instead of failing the client.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/500"
 

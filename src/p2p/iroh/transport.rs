@@ -278,12 +278,45 @@ impl IrohBlobsP2pTransport {
         self.published_catalog.descriptor_for(key).await
     }
 
+    /// Refuses a blob this node already holds that is larger than the caller's
+    /// bound.
+    ///
+    /// A local hit is a blob this node imported or previously fetched, so it
+    /// is not peer-controlled in the way a download is. The bound still
+    /// applies: the caller asked for something it can hold, and a local
+    /// artifact that has since grown past that is no more holdable for having
+    /// come from here.
+    async fn ensure_local_blob_within(
+        &self,
+        blob_hash: iroh_blobs::Hash,
+        max_bytes: u64,
+    ) -> Result<()> {
+        let size = self
+            .store
+            .observe(blob_hash)
+            .await
+            .map_err(|err| Error::internal_message("size local P2P blob", err))?
+            .size();
+        if size > max_bytes {
+            return Err(Error::ArtifactTooLarge { limit: max_bytes });
+        }
+        Ok(())
+    }
+
     /// Export a local blob to a caller-requested destination path and return its size in bytes.
+    ///
+    /// The bound is checked before the first byte is written, so a refusal
+    /// leaves nothing at the destination. Both fetch paths export through
+    /// here, including the one that has just downloaded: a blob already
+    /// complete in the local store transfers nothing, so the download's
+    /// arrival-time bound never sees it.
     async fn export_local_blob(
         &self,
         blob_hash: iroh_blobs::Hash,
         destination: &Path,
+        max_bytes: u64,
     ) -> Result<u64> {
+        self.ensure_local_blob_within(blob_hash, max_bytes).await?;
         self.store
             .export(blob_hash, destination)
             .await
@@ -305,10 +338,13 @@ impl IrohBlobsP2pTransport {
         let range_start = range.start;
         let range_end = range.end;
         let inner = Box::pin(self.store.export_ranges(blob_hash, range).stream());
+        // Every terminal arm below zeroes `remaining`, so it is the single
+        // stop signal: a satisfied range and a range that ended in an error
+        // both refuse to poll the exporter again.
         let stream = stream::unfold(
-            (inner, expected_len, false),
-            move |(mut inner, mut remaining, done_after_error)| async move {
-                if done_after_error || remaining == 0 {
+            (inner, expected_len),
+            move |(mut inner, mut remaining)| async move {
+                if remaining == 0 {
                     return None;
                 }
                 while let Some(item) = inner.next().await {
@@ -321,7 +357,7 @@ impl IrohBlobsP2pTransport {
                                         reason: "exported range chunk length does not fit u64"
                                             .to_string(),
                                     }),
-                                    (inner, 0, true),
+                                    (inner, 0),
                                 ));
                             };
                             let Some(leaf_end) = leaf.offset.checked_add(data_len) else {
@@ -329,7 +365,7 @@ impl IrohBlobsP2pTransport {
                                     Err(Error::InvalidDescriptor {
                                         reason: "exported range chunk end overflow".to_string(),
                                     }),
-                                    (inner, 0, true),
+                                    (inner, 0),
                                 ));
                             };
                             let overlap_start = leaf.offset.max(range_start);
@@ -341,12 +377,12 @@ impl IrohBlobsP2pTransport {
                             let end = (overlap_end - leaf.offset) as usize;
                             let bytes = leaf.data.slice(start..end);
                             remaining = remaining.saturating_sub(bytes.len() as u64);
-                            return Some((Ok(bytes), (inner, remaining, false)));
+                            return Some((Ok(bytes), (inner, remaining)));
                         }
                         ExportRangesItem::Error(err) => {
                             return Some((
                                 Err(Error::internal_message("export local P2P blob range", err)),
-                                (inner, 0, true),
+                                (inner, 0),
                             ));
                         }
                     }
@@ -358,7 +394,7 @@ impl IrohBlobsP2pTransport {
                         Err(Error::InvalidDescriptor {
                             reason: format!("exported range ended {remaining} bytes short"),
                         }),
-                        (inner, 0, true),
+                        (inner, 0),
                     ))
                 }
             },
@@ -368,26 +404,12 @@ impl IrohBlobsP2pTransport {
 
     /// Reads a blob this node already holds, refusing one larger than the
     /// caller's bound.
-    ///
-    /// A local hit is a blob this node imported or previously fetched, so it
-    /// is not peer-controlled in the way a download is. The bound still
-    /// applies: the caller asked for something it can hold in memory, and a
-    /// local artifact that has since grown past that is no more holdable for
-    /// having come from here.
     async fn read_local_blob_bytes(
         &self,
         blob_hash: iroh_blobs::Hash,
         max_bytes: u64,
     ) -> Result<Bytes> {
-        let size = self
-            .store
-            .observe(blob_hash)
-            .await
-            .map_err(|err| Error::internal_message("size local P2P blob", err))?
-            .size();
-        if size > max_bytes {
-            return Err(Error::ArtifactTooLarge { limit: max_bytes });
-        }
+        self.ensure_local_blob_within(blob_hash, max_bytes).await?;
         self.store
             .get_bytes(blob_hash)
             .await
@@ -597,7 +619,9 @@ impl P2pTransport for IrohBlobsP2pTransport {
             BlobFetchSource::Local { blob_hash } => {
                 // A local lookup hit still goes through export so callers get the
                 // artifact at the requested destination rather than a store path.
-                let size = self.export_local_blob(blob_hash, destination).await?;
+                let size = self
+                    .export_local_blob(blob_hash, destination, max_bytes)
+                    .await?;
                 debug!(size, "fetched artifact from local P2P store");
                 return Ok(size);
             }
@@ -612,7 +636,9 @@ impl P2pTransport for IrohBlobsP2pTransport {
         self.download_blob(GetRequest::blob(blob_hash), providers, max_bytes)
             .await?;
         self.try_advertise_fetched_blob(descriptor, blob_hash).await;
-        let size = self.export_local_blob(blob_hash, destination).await?;
+        let size = self
+            .export_local_blob(blob_hash, destination, max_bytes)
+            .await?;
         debug!(providers_count, size, "fetched artifact from P2P provider");
         Ok(size)
     }
@@ -791,7 +817,16 @@ impl Drop for IrohBlobsP2pTransport {
             return;
         }
         let router = self.router.clone();
-        tokio::spawn(async move {
+        // Drop can run with no runtime current — on a plain std::thread that
+        // held the last Arc, or after the runtime is gone at process exit.
+        // A bare tokio::spawn panics there, and a panic in drop during an
+        // in-flight unwind aborts the process, so a skipped courtesy shutdown
+        // is the better trade.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            warn!("tokio runtime unavailable during drop, skipping iroh router shutdown");
+            return;
+        };
+        handle.spawn(async move {
             if let Err(err) = router.shutdown().await {
                 debug!(error = %err, "embedded iroh-blobs artifact transport shutdown failed");
             }
@@ -1299,11 +1334,35 @@ mod tests {
                 "expected a size refusal from the local path, got {error:?}"
             );
 
+            // The disk path is the same promise: a local hit is exported
+            // straight to the caller's destination, so the bound has to stop
+            // it before the first byte lands there.
+            let refused_local = temp.path().join("refused-local.bin");
+            let error = consumer
+                .fetch(&local, &refused_local, limit)
+                .await
+                .expect_err("a local blob past the limit must not be written to disk");
+            assert!(
+                matches!(error, Error::ArtifactTooLarge { limit: reported } if reported == limit),
+                "expected a size refusal from the local disk path, got {error:?}"
+            );
+            assert!(
+                !refused_local.exists(),
+                "a refused local fetch must leave no artifact at the destination"
+            );
+
             let held = consumer
                 .fetch_bytes(&local, bytes.len() as u64 * 2)
                 .await
                 .context("read the local artifact under a sufficient limit")?;
             assert_eq!(held.len(), bytes.len());
+
+            let allowed_local = temp.path().join("allowed-local.bin");
+            let size = consumer
+                .fetch(&local, &allowed_local, bytes.len() as u64 * 2)
+                .await
+                .context("export the local artifact under a sufficient limit")?;
+            assert_eq!(size, bytes.len() as u64);
 
             consumer.shutdown().await.context("shutdown consumer P2P")?;
             provider.shutdown().await.context("shutdown provider P2P")?;
@@ -1470,6 +1529,51 @@ mod tests {
 
         consumer.shutdown().await.context("shutdown consumer P2P")?;
         provider.shutdown().await.context("shutdown provider P2P")?;
+        Ok(())
+    }
+
+    /// A range running off the end of the blob has to end the stream in an
+    /// error. Callers may already have committed response headers by the time
+    /// they poll it, so a short read that finishes cleanly is a truncation
+    /// they have no way left to report.
+    #[tokio::test]
+    async fn a_local_range_export_that_ends_short_fails_the_stream() -> Result<()> {
+        let temp = tempfile::tempdir().context("create temp test dir")?;
+        let transport = test_transport(
+            &p2p_config(temp.path().join("store")),
+            "self-node",
+            Arc::new(NoopP2pPeerDiscovery),
+        )
+        .await
+        .context("start P2P transport")?;
+
+        let key = "test/p2p/iroh/short-range".to_string();
+        let bytes = vec![3u8; 4096];
+        transport
+            .publish(&P2pPublishRequest::bytes(key.clone(), bytes.clone()))
+            .await
+            .context("publish artifact")?;
+        let local = transport
+            .get_local(&key)
+            .await
+            .context("a published artifact should resolve locally")?;
+
+        let stream = transport
+            .fetch_byte_range(&local, 0, bytes.len() * 2)
+            .await
+            .context("open a range longer than the blob")?;
+        // Report the length rather than the body: a truncated success is the
+        // interesting fact, and 4 KiB of payload in the failure is not.
+        let error = collect_range_stream(stream)
+            .await
+            .map(|bytes| bytes.len())
+            .expect_err("a range past the end of the blob must not complete successfully");
+        assert!(
+            error.to_string().contains("bytes short"),
+            "expected a short-read refusal, got {error:?}"
+        );
+
+        transport.shutdown().await.context("shutdown P2P")?;
         Ok(())
     }
 
@@ -1825,8 +1929,12 @@ mod tests {
         Ok(())
     }
 
+    /// A key this node already holds never reaches peer lookup at all: the
+    /// local catalog answers first, whatever discovery has to say. The
+    /// self-peer branch inside `lookup_peers` is a different guard, pinned
+    /// separately below.
     #[tokio::test]
-    async fn lookup_skips_self_peer() -> Result<()> {
+    async fn lookup_answers_from_the_local_catalog_before_consulting_discovery() -> Result<()> {
         let temp = tempfile::tempdir().context("create temp test dir")?;
         let self_transport = test_transport(
             &p2p_config(temp.path().join("self-store")),
@@ -1873,5 +1981,87 @@ mod tests {
             .await
             .context("shutdown self P2P")?;
         Ok(())
+    }
+
+    /// Discovery rows are the scheduler's view of the fleet, and they can name
+    /// this node under either identity: the right node id carrying an address
+    /// this process no longer listens on, or the right address under a node id
+    /// it no longer uses. Either way the answer is this node's own catalog.
+    ///
+    /// `lookup` answers from the catalog before discovery is consulted, so the
+    /// branch is only reachable by calling `lookup_peers` directly. An
+    /// unreachable endpoint and a foreign node id make a dial distinguishable
+    /// from a local hit: dialling the first fails, and dialling the second
+    /// comes back through the catalog protocol with a peer provider rather
+    /// than a local one.
+    #[tokio::test]
+    async fn lookup_peers_answers_locally_for_either_self_identity() -> Result<()> {
+        let temp = tempfile::tempdir().context("create temp test dir")?;
+        let transport = test_transport(
+            &p2p_config(temp.path().join("store")),
+            "self-node",
+            Arc::new(NoopP2pPeerDiscovery),
+        )
+        .await
+        .context("start P2P transport")?;
+        let local_endpoint = transport
+            .local_endpoint()
+            .context("transport should expose a local endpoint")?;
+
+        let key = "test/p2p/iroh/self-identity".to_string();
+        transport
+            .publish(&P2pPublishRequest::bytes(
+                key.clone(),
+                b"local artifact bytes".as_slice(),
+            ))
+            .await
+            .context("publish artifact")?;
+
+        let matches_node_id = P2pPeer {
+            node_id: "self-node".to_string(),
+            endpoint: invalid_endpoint(),
+        };
+        let matches_endpoint = P2pPeer {
+            node_id: "some-other-node".to_string(),
+            endpoint: local_endpoint,
+        };
+        for peer in [matches_node_id, matches_endpoint] {
+            let descriptor = transport
+                .lookup_peers(vec![peer.clone()], &key)
+                .await
+                .with_context(|| format!("{peer:?} should resolve to the local catalog"))?;
+            assert_eq!(
+                descriptor.providers,
+                vec![P2pArtifactProvider::Local],
+                "{peer:?} names this node, so the descriptor must come from its own catalog"
+            );
+        }
+
+        transport.shutdown().await.context("shutdown P2P")?;
+        Ok(())
+    }
+
+    /// Drop is a courtesy shutdown, and the runtime it wants is not always
+    /// there: the last reference can be released on a plain thread or after
+    /// the runtime is gone at process exit. A panic in drop during an in-flight
+    /// unwind aborts the process, which is a far worse outcome than an iroh
+    /// router left for the OS to reclaim.
+    #[test]
+    fn dropping_a_live_transport_off_the_runtime_does_not_panic() {
+        let runtime = tokio::runtime::Runtime::new().expect("build a test runtime");
+        let temp = tempfile::tempdir().expect("create temp test dir");
+        let transport = runtime
+            .block_on(test_transport(
+                &p2p_config(temp.path().join("store")),
+                "self-node",
+                Arc::new(NoopP2pPeerDiscovery),
+            ))
+            .expect("start P2P transport");
+
+        // Not shut down first: the drop path under test is the one that still
+        // has a live router to dispose of.
+        std::thread::spawn(move || drop(transport))
+            .join()
+            .expect("dropping a live transport off the runtime must not panic");
     }
 }

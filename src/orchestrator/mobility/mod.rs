@@ -12,7 +12,10 @@ mod runtime;
 mod saga;
 mod scheduler_store;
 
-pub use claim::{ClaimOutcome, MobilityCoordinator, ResumeFence, DEFAULT_CLAIM_TTL};
+pub use claim::{
+    ClaimOutcome, CommitFailure, CommitStanding, MobilityCoordinator, ReleaseOutcome, ResumeFence,
+    DEFAULT_CLAIM_TTL,
+};
 pub use evacuation::{
     drain, plan_evacuation, DestinationCandidate, DrainBudget, DrainReport, EvacuationPlan,
     MoveCancel, MoveExecutor, PlannedMove, SandboxLayers, UnplaceableReason, UnplaceableSandbox,

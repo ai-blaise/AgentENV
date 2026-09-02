@@ -27,6 +27,17 @@
 //! destination" and "the record says so". A crash there loses the restored
 //! guest but keeps the origin's copy, which is the direction to fail in.
 //!
+//! # The commit's own failures
+//!
+//! That direction only holds while the record agrees. A commit whose reply is
+//! lost may have applied, and a rollback on that reading discards the guest
+//! while leaving a tombstone naming the node that discarded it — the origin
+//! keeps its copy and is fenced off from it, which is not a direction to fail
+//! in but a sandbox no node will run. So the saga distinguishes a write that
+//! never went out from one whose answer went missing, and re-reads the record
+//! rather than guessing. What it cannot settle it reports as unfinished,
+//! keeping the guest: that is the only state consistent with both answers.
+//!
 //! # Compensation
 //!
 //! Rollback tears down the destination's partial restore before releasing the
@@ -49,7 +60,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tracing::{info, warn};
 
-use super::claim::{ClaimOutcome, MobilityCoordinator, DEFAULT_CLAIM_TTL};
+use super::claim::{
+    ClaimOutcome, CommitFailure, CommitStanding, MobilityCoordinator, ReleaseOutcome,
+    DEFAULT_CLAIM_TTL,
+};
 use super::evacuation::MoveCancel;
 use super::lease::{LeaseGuardian, LeaseLost, LeasePacing, LeaseWatch, RenewOutcome};
 use super::record::{MobilityRecord, MobilityStore};
@@ -92,7 +106,45 @@ pub enum MigrationOutcome {
     NotClaimable(ClaimOutcome),
     /// The restore failed and the sandbox was left with its origin.
     RolledBack { reason: String },
+    /// The guest is live here and the record could not be read to say whether
+    /// the handover was recorded.
+    ///
+    /// Not a rollback, because nothing was unwound. A live guest on this node
+    /// is consistent with both states the record could be in; discarding it is
+    /// only right for one of them, and wrong for the other in a way nothing can
+    /// undo — a tombstone naming a node that threw the guest away fences every
+    /// node, including the origin, out of the sandbox for good.
+    ///
+    /// What remains exposed is the other half: if the record still says
+    /// `Claimed`, that claim lapses while this guest runs. That is the lesser
+    /// half — bounded by the TTL and recoverable, against a loss that is
+    /// neither — and closing it needs a store that answers, which is what the
+    /// caller has to wait for.
+    Unresolved { reason: String },
 }
+
+/// What the saga concluded about its own commit.
+enum CommitDecision {
+    /// The record names this node. The handover stands.
+    Committed,
+    /// The handover did not happen and will not. Compensate.
+    Unwind(String),
+    /// Neither could be established. See [`MigrationOutcome::Unresolved`].
+    Unresolved(String),
+}
+
+/// How many times an ambiguous commit is re-read before the saga stops trying
+/// to decide it.
+///
+/// Bounded because a guest is held up while this runs, and an outage that
+/// outlasts a few reads is not one more read away from settling.
+const COMMIT_RESOLUTION_ATTEMPTS: usize = 4;
+
+/// Delay before the second re-read, doubling from there.
+///
+/// The first re-read is immediate: the write is already over, and the ordinary
+/// shape of this failure is a lost reply from a store that is still answering.
+const COMMIT_RESOLUTION_BACKOFF: Duration = Duration::from_millis(100);
 
 /// Runs migrations on behalf of a destination node.
 pub struct MigrationSaga<S: MobilityStore> {
@@ -194,25 +246,58 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
         // is asking for exactly the ambiguity this ordering exists to remove;
         // what remains is one store write, and finishing it is faster than
         // tearing down a restore that worked.
-        let committed = self.coordinator.complete(sandbox_id).await;
+        //
+        // The write races the lease all the same. A wedged store can hold it
+        // open past the point the guardian gives the claim up, and the origin
+        // then resumes a sandbox that is already live here. Losing the lease
+        // outranks finishing the handover: the origin is about to take over, so
+        // this copy goes whether or not the write landed. What that may leave
+        // behind — a tombstone naming a node that discarded its guest — is what
+        // the rollback's release path clears.
+        let decision = tokio::select! {
+            biased;
+            lost = lease.lost() => {
+                CommitDecision::Unwind(format!("the claim was lost while recording the handover: {lost}"))
+            }
+            committed = self.coordinator.complete(sandbox_id) => match committed {
+                Ok(true) => CommitDecision::Committed,
+                Ok(false) => {
+                    CommitDecision::Unwind("the claim was lost during the restore".to_string())
+                }
+                // The read failed, so no write went out and the record is
+                // untouched. Unwinding is safe and is the direction to fail in.
+                Err(CommitFailure::NeverSent(error)) => CommitDecision::Unwind(format!(
+                    "the handover could not be recorded: {error:#}"
+                )),
+                // The write may well have applied. Discarding the guest before
+                // finding out is what loses the sandbox for good.
+                Err(CommitFailure::Ambiguous(error)) => {
+                    self.settle_ambiguous_commit(sandbox_id, &error).await
+                }
+            },
+        };
+        // Only now: the disambiguation above is a series of reads that decide
+        // whether this node owns the sandbox, and dropping the renewal first
+        // would let the claim go stale underneath them.
         guardian.release();
 
-        // A store error here is not a reason to return: the guest is already
-        // live on this node, and propagating with `?` would leave it running
-        // with the record still saying the origin owns it — two nodes, one
-        // sandbox, and nobody's fence able to see it. An unreachable store
-        // cannot be distinguished from a lost claim, so it is treated as one.
-        let reason = match committed {
-            Ok(true) => None,
-            Ok(false) => Some("the claim was lost during the restore".to_string()),
-            Err(error) => Some(format!("the handover could not be recorded: {error:#}")),
-        };
-        if let Some(reason) = reason {
-            // The guest running here is now the second copy, so it is the one
-            // that has to go.
-            warn!(%sandbox_id, "{reason}; discarding the restore rather than keeping two copies");
-            self.roll_back(&claimed, &reason).await;
-            return Ok(MigrationOutcome::RolledBack { reason });
+        match decision {
+            CommitDecision::Committed => {}
+            CommitDecision::Unwind(reason) => {
+                // The guest running here is now the second copy, so it is the
+                // one that has to go.
+                warn!(%sandbox_id, "{reason}; discarding the restore rather than keeping two copies");
+                self.roll_back(&claimed, &reason).await;
+                return Ok(MigrationOutcome::RolledBack { reason });
+            }
+            CommitDecision::Unresolved(reason) => {
+                warn!(
+                    %sandbox_id,
+                    "{reason}; keeping the restored guest, which is the only choice consistent \
+                     with both states the record could be in"
+                );
+                return Ok(MigrationOutcome::Unresolved { reason });
+            }
         }
 
         if let Err(error) = self.steps.release_origin_state(&claimed).await {
@@ -230,6 +315,61 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
         Ok(MigrationOutcome::Migrated)
     }
 
+    /// Decides an ambiguous commit by asking the record who owns the sandbox.
+    ///
+    /// The lease is still held throughout. These reads are the whole of what
+    /// stands between a lost reply and a sandbox no node will run: `Evacuated`
+    /// is terminal, so a rollback that guesses wrong here cannot be taken back.
+    async fn settle_ambiguous_commit(
+        &self,
+        sandbox_id: &SandboxId,
+        error: &anyhow::Error,
+    ) -> CommitDecision {
+        let mut last_error = format!("{error:#}");
+        let mut backoff = COMMIT_RESOLUTION_BACKOFF;
+        for attempt in 0..COMMIT_RESOLUTION_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(backoff).await;
+                backoff *= 2;
+            }
+            match self.coordinator.commit_standing(sandbox_id).await {
+                // Only this node's own commit puts this node's id there, so
+                // the write landed and the reply is what went missing.
+                Ok(CommitStanding::Committed) => return CommitDecision::Committed,
+                // The write did not land and the claim is still ours, so
+                // sending it again is the same conditional write as before.
+                Ok(CommitStanding::StillClaimed) => {
+                    match self.coordinator.complete(sandbox_id).await {
+                        Ok(true) => return CommitDecision::Committed,
+                        Ok(false) => {
+                            return CommitDecision::Unwind(
+                                "the claim was lost during the restore".to_string(),
+                            )
+                        }
+                        Err(CommitFailure::NeverSent(error)) => {
+                            return CommitDecision::Unwind(format!(
+                                "the handover could not be recorded: {error:#}"
+                            ))
+                        }
+                        // Ambiguous again, and for the same reason. Round again
+                        // rather than act on a doubt that has not been resolved.
+                        Err(CommitFailure::Ambiguous(error)) => last_error = format!("{error:#}"),
+                    }
+                }
+                Ok(CommitStanding::Lost { detail }) => {
+                    return CommitDecision::Unwind(format!(
+                        "the handover was not recorded: {detail}"
+                    ))
+                }
+                Err(error) => last_error = format!("{error:#}"),
+            }
+        }
+        CommitDecision::Unresolved(format!(
+            "the handover was neither confirmed nor ruled out in {COMMIT_RESOLUTION_ATTEMPTS} \
+             attempts: {last_error}"
+        ))
+    }
+
     /// Tears down the partial restore, then gives the claim back.
     ///
     /// In that order: releasing first would let a second destination start
@@ -245,11 +385,42 @@ impl<S: MobilityStore + 'static> MigrationSaga<S> {
             return;
         }
         match self.coordinator.release(&record.sandbox_id).await {
-            Ok(true) => info!(sandbox_id = %record.sandbox_id, reason, "rolled back migration"),
-            Ok(false) => warn!(
+            Ok(ReleaseOutcome::Released) => {
+                info!(sandbox_id = %record.sandbox_id, reason, "rolled back migration")
+            }
+            Ok(ReleaseOutcome::NotHeld) => warn!(
                 sandbox_id = %record.sandbox_id,
                 "the claim was no longer ours to release"
             ),
+            // The commit had landed after all, and the guest it named is the
+            // one just torn down. Parking the record hands the sandbox back to
+            // the origin, which still holds the paused state; leaving the
+            // tombstone would fence every node out of a sandbox nobody runs.
+            Ok(ReleaseOutcome::AlreadyCommitted) => {
+                match self
+                    .coordinator
+                    .abandon_evacuation(&record.sandbox_id)
+                    .await
+                {
+                    Ok(true) => warn!(
+                        sandbox_id = %record.sandbox_id,
+                        reason,
+                        "the handover had been recorded after all; parked the record again so \
+                         the origin can reclaim the sandbox"
+                    ),
+                    Ok(false) => warn!(
+                        sandbox_id = %record.sandbox_id,
+                        "discarded a restore the record still names; the sandbox stays fenced \
+                         until the tombstone is reconciled"
+                    ),
+                    Err(error) => warn!(
+                        sandbox_id = %record.sandbox_id,
+                        error = %error,
+                        "discarded a restore the record still names and could not park it; the \
+                         sandbox stays fenced until the tombstone is reconciled"
+                    ),
+                }
+            }
             Err(error) => warn!(
                 sandbox_id = %record.sandbox_id,
                 error = %error,
@@ -892,6 +1063,62 @@ mod tests {
         );
         assert!(steps.calls().is_empty());
     }
+
+    /// The renewal arm that has to tell this node's own completed handover from
+    /// a rival's. A renewal racing the commit is how this state is reached, and
+    /// getting the tie-break backwards either surrenders a lease that is still
+    /// ours or keeps renewing one a rival has taken.
+    #[tokio::test]
+    async fn a_renewal_tells_this_nodes_own_handover_from_a_rivals() {
+        let f = fixture().await;
+        let destination = MobilityCoordinator::new(f.store.clone(), "node-b");
+        destination.claim(&f.sandbox_id).await.expect("claim");
+        assert!(destination.complete(&f.sandbox_id).await.expect("complete"));
+
+        let ttl = Duration::from_millis(300);
+        let saga = saga(
+            f.store.clone(),
+            "node-b",
+            Arc::new(RecordingSteps::default()),
+            ttl,
+        );
+        let (guardian, mut lease) = saga.guard_claim(f.sandbox_id);
+
+        // Several renewals against this node's own tombstone.
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert_eq!(
+            lease.lost_now(),
+            None,
+            "a renewal that finds our own handover has not lost anything"
+        );
+
+        // The same state naming somebody else is a loss, and a final one.
+        let record = f
+            .store
+            .get(&f.sandbox_id)
+            .await
+            .expect("get")
+            .expect("record");
+        let taken = record.transitioned_to(MobilityState::Evacuated {
+            to_node_id: "node-c".to_string(),
+            at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after the epoch")
+                .as_millis() as u64,
+        });
+        f.store.upsert(&taken).await.expect("overwrite");
+
+        let lost = tokio::time::timeout(Duration::from_secs(2), lease.lost())
+            .await
+            .expect("a handover to another node must be reported as a loss");
+        assert_eq!(
+            lost,
+            LeaseLost::Taken {
+                by: "node-c".to_string()
+            }
+        );
+        guardian.release();
+    }
 }
 
 #[cfg(test)]
@@ -1119,6 +1346,440 @@ mod lost_claim_tests {
         }
 
         async fn remove(&self, sandbox_id: &SandboxId) -> Result<()> {
+            self.inner.remove(sandbox_id).await
+        }
+    }
+}
+
+/// The commit's own failure modes: a write whose answer went missing, and a
+/// read that never became a write.
+///
+/// These are the paths where a wrong compensation is unrecoverable rather than
+/// merely wasteful, because `Evacuated` is terminal and no other code in the
+/// tree can clear it.
+#[cfg(test)]
+mod ambiguous_commit_tests {
+    use super::*;
+    use crate::orchestrator::mobility::record::{
+        LocalMobilityStore, MobilityGeneration, MobilityRecord, MobilityState, MobilityStore,
+        MobilityWrite,
+    };
+    use crate::orchestrator::store::SandboxMetadata;
+    use crate::snapshot::{ArtifactReach, SnapshotRuntimeVersions};
+    use crate::types::SandboxId;
+    use crate::virtualization::VirtualizationMode;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    async fn seeded() -> (
+        LocalMobilityStore,
+        SandboxId,
+        MigrationFingerprint,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalMobilityStore::open(dir.path().join("mobility"))
+            .await
+            .expect("store");
+        let metadata = SandboxMetadata {
+            runtime_versions: SnapshotRuntimeVersions {
+                kernel_version: "vmlinux-6.1.175".to_string(),
+                firecracker_version: "1.15.1".to_string(),
+                envd_version: "0.5.15".to_string(),
+                tools_drive_version: "0.1.0".to_string(),
+            },
+            virtualization_mode: VirtualizationMode::Kvm,
+            ..SandboxMetadata::default()
+        };
+        let record = MobilityRecord::for_paused(
+            &metadata,
+            "node-a",
+            "x86_64",
+            Some("{}".to_string()),
+            4096,
+            ArtifactReach::ClusterShared,
+            Some("snap-1".to_string()),
+        );
+        let fingerprint = record.fingerprint.clone();
+        store.upsert(&record).await.expect("seed");
+        (store, metadata.id, fingerprint, dir)
+    }
+
+    /// Reports what the saga did to the destination's guest.
+    #[derive(Default)]
+    struct GuestSteps {
+        arm: Option<Arc<AtomicBool>>,
+        discarded: Arc<AtomicBool>,
+        released_origin: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl MigrationSteps for GuestSteps {
+        async fn restore(&self, _record: &MobilityRecord) -> Result<()> {
+            // The guest is live from here on, which is what makes everything
+            // after this a decision about a running sandbox.
+            if let Some(arm) = &self.arm {
+                arm.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+
+        async fn discard_restored(&self, _record: &MobilityRecord) -> Result<()> {
+            self.discarded.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn release_origin_state(&self, _record: &MobilityRecord) -> Result<()> {
+            self.released_origin.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn saga_over<S: MobilityStore + 'static>(
+        store: S,
+        steps: Arc<GuestSteps>,
+        ttl: Duration,
+    ) -> MigrationSaga<S> {
+        let coordinator = Arc::new(MobilityCoordinator::new(store, "node-b").with_claim_ttl(ttl));
+        MigrationSaga::new(coordinator, steps).with_claim_ttl(ttl)
+    }
+
+    /// The classic ambiguous RPC failure: the store applied the write and the
+    /// reply was lost on the way back. Treating that as a lost claim discards
+    /// the only live guest and leaves a tombstone naming the node that threw it
+    /// away — the origin keeps its paused copy and is fenced off from it, with
+    /// nothing in the protocol able to clear an `Evacuated` record. The sandbox
+    /// is then unrunnable everywhere.
+    #[tokio::test]
+    async fn an_ambiguous_commit_whose_write_landed_completes_the_migration() {
+        let (store, sandbox_id, fingerprint, _dir) = seeded().await;
+        let steps = Arc::new(GuestSteps::default());
+        let saga = saga_over(
+            CommitReplyLost {
+                inner: store.clone(),
+                dropped_reply: AtomicBool::new(false),
+            },
+            Arc::clone(&steps),
+            Duration::from_secs(30),
+        );
+
+        let outcome = saga
+            .migrate(&sandbox_id, &fingerprint, &[], &[], &MoveCancel::new())
+            .await
+            .expect("migrate");
+
+        assert_eq!(
+            outcome,
+            MigrationOutcome::Migrated,
+            "the write landed, so the handover stands"
+        );
+        assert!(
+            !steps.discarded.load(Ordering::SeqCst),
+            "the record names this node, so its guest is the sandbox and must not be torn down"
+        );
+        assert!(
+            steps.released_origin.load(Ordering::SeqCst),
+            "the origin's copy is the second one now"
+        );
+        assert!(
+            matches!(
+                store.get(&sandbox_id).await.expect("get").expect("record").state,
+                MobilityState::Evacuated { ref to_node_id, .. } if to_node_id == "node-b"
+            ),
+            "the record must still name this node"
+        );
+    }
+
+    /// A read that failed sent nothing, so the record is untouched and
+    /// unwinding is safe. Conflating it with a lost reply would keep guests
+    /// alive on a node that never took the sandbox.
+    #[tokio::test]
+    async fn a_commit_whose_read_never_reached_the_store_rolls_back() {
+        let (store, sandbox_id, fingerprint, _dir) = seeded().await;
+        let unreachable = Arc::new(AtomicBool::new(false));
+        let steps = Arc::new(GuestSteps {
+            arm: Some(Arc::clone(&unreachable)),
+            ..GuestSteps::default()
+        });
+        let saga = saga_over(
+            UnreadableOnceArmed {
+                inner: store.clone(),
+                armed: Arc::clone(&unreachable),
+            },
+            Arc::clone(&steps),
+            Duration::from_secs(30),
+        );
+
+        match saga
+            .migrate(&sandbox_id, &fingerprint, &[], &[], &MoveCancel::new())
+            .await
+            .expect("migrate")
+        {
+            MigrationOutcome::RolledBack { reason } => assert!(
+                reason.contains("could not be recorded"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("a write that never went out must roll back, got {other:?}"),
+        }
+        assert!(
+            steps.discarded.load(Ordering::SeqCst),
+            "nothing was recorded, so the guest here is the second copy"
+        );
+    }
+
+    /// When the store stops answering, neither outcome can be ruled out. The
+    /// guest stays: it is the only state consistent with both a record that
+    /// names this node and one that does not, and discarding it is the half of
+    /// that guess nothing can undo.
+    #[tokio::test]
+    async fn an_unsettled_commit_keeps_the_guest_rather_than_discarding_it() {
+        let (store, sandbox_id, fingerprint, _dir) = seeded().await;
+        let steps = Arc::new(GuestSteps::default());
+        let saga = saga_over(
+            SilentAfterTheCommit {
+                inner: store.clone(),
+                attempted_commit: Arc::new(AtomicBool::new(false)),
+            },
+            Arc::clone(&steps),
+            Duration::from_secs(30),
+        );
+
+        match saga
+            .migrate(&sandbox_id, &fingerprint, &[], &[], &MoveCancel::new())
+            .await
+            .expect("migrate")
+        {
+            MigrationOutcome::Unresolved { reason } => assert!(
+                reason.contains("neither confirmed nor ruled out"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("an unreadable store must leave the move unsettled, got {other:?}"),
+        }
+        assert!(
+            !steps.discarded.load(Ordering::SeqCst),
+            "discarding is the losing move if the record already names this node"
+        );
+        assert!(
+            !steps.released_origin.load(Ordering::SeqCst),
+            "the origin's copy is what makes the sandbox recoverable at all"
+        );
+    }
+
+    /// A store that wedges the commit rather than failing it holds the write
+    /// open past the point the guardian gives the claim up, and the origin then
+    /// resumes a sandbox that is live here. Losing the lease outranks finishing
+    /// the handover, so the guest goes.
+    #[tokio::test]
+    async fn losing_the_lease_while_the_commit_hangs_discards_the_guest() {
+        let (store, sandbox_id, fingerprint, _dir) = seeded().await;
+        let wedged = Arc::new(AtomicBool::new(false));
+        let steps = Arc::new(GuestSteps {
+            arm: Some(Arc::clone(&wedged)),
+            ..GuestSteps::default()
+        });
+        let saga = saga_over(
+            WedgedUntilDiscarded {
+                inner: store.clone(),
+                armed: Arc::clone(&wedged),
+                discarded: Arc::clone(&steps.discarded),
+            },
+            Arc::clone(&steps),
+            Duration::from_millis(300),
+        );
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            saga.migrate(&sandbox_id, &fingerprint, &[], &[], &MoveCancel::new()),
+        )
+        .await
+        .expect("the saga must give up on a wedged commit before the origin takes over")
+        .expect("migrate");
+
+        match outcome {
+            MigrationOutcome::RolledBack { reason } => assert!(
+                reason.contains("lost while recording the handover"),
+                "unexpected reason: {reason}"
+            ),
+            other => panic!("a lost lease must unwind the handover, got {other:?}"),
+        }
+        assert!(
+            steps.discarded.load(Ordering::SeqCst),
+            "the origin is free to resume once the claim lapses, so this guest cannot stay"
+        );
+        assert_eq!(
+            store
+                .get(&sandbox_id)
+                .await
+                .expect("get")
+                .expect("record")
+                .state,
+            MobilityState::Parked,
+            "once the store answers again the claim goes back, leaving the origin the only owner"
+        );
+    }
+
+    /// Applies the commit and then loses the reply, once.
+    struct CommitReplyLost {
+        inner: LocalMobilityStore,
+        dropped_reply: AtomicBool,
+    }
+
+    #[async_trait]
+    impl MobilityStore for CommitReplyLost {
+        async fn upsert(&self, record: &MobilityRecord) -> Result<MobilityWrite> {
+            self.inner.upsert(record).await
+        }
+
+        async fn compare_and_set(
+            &self,
+            expected: Option<MobilityGeneration>,
+            record: &MobilityRecord,
+        ) -> Result<MobilityWrite> {
+            let applied = self.inner.compare_and_set(expected, record).await?;
+            if matches!(record.state, MobilityState::Evacuated { .. })
+                && !self.dropped_reply.swap(true, Ordering::SeqCst)
+            {
+                anyhow::bail!("connection reset while reading the reply");
+            }
+            Ok(applied)
+        }
+
+        async fn get(&self, sandbox_id: &SandboxId) -> Result<Option<MobilityRecord>> {
+            self.inner.get(sandbox_id).await
+        }
+
+        async fn list(&self) -> Result<Vec<MobilityRecord>> {
+            self.inner.list().await
+        }
+
+        async fn remove(&self, sandbox_id: &SandboxId) -> Result<()> {
+            self.inner.remove(sandbox_id).await
+        }
+    }
+
+    /// Stops answering reads once the guest is up, so the commit's own read is
+    /// the call that fails.
+    struct UnreadableOnceArmed {
+        inner: LocalMobilityStore,
+        armed: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl MobilityStore for UnreadableOnceArmed {
+        async fn upsert(&self, record: &MobilityRecord) -> Result<MobilityWrite> {
+            self.inner.upsert(record).await
+        }
+
+        async fn compare_and_set(
+            &self,
+            expected: Option<MobilityGeneration>,
+            record: &MobilityRecord,
+        ) -> Result<MobilityWrite> {
+            self.inner.compare_and_set(expected, record).await
+        }
+
+        async fn get(&self, sandbox_id: &SandboxId) -> Result<Option<MobilityRecord>> {
+            if self.armed.load(Ordering::SeqCst) {
+                anyhow::bail!("the mobility store is unreachable");
+            }
+            self.inner.get(sandbox_id).await
+        }
+
+        async fn list(&self) -> Result<Vec<MobilityRecord>> {
+            self.inner.list().await
+        }
+
+        async fn remove(&self, sandbox_id: &SandboxId) -> Result<()> {
+            self.inner.remove(sandbox_id).await
+        }
+    }
+
+    /// Fails the commit write and then every read after it, which is what an
+    /// outage that starts mid-handover looks like.
+    struct SilentAfterTheCommit {
+        inner: LocalMobilityStore,
+        attempted_commit: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl MobilityStore for SilentAfterTheCommit {
+        async fn upsert(&self, record: &MobilityRecord) -> Result<MobilityWrite> {
+            self.inner.upsert(record).await
+        }
+
+        async fn compare_and_set(
+            &self,
+            expected: Option<MobilityGeneration>,
+            record: &MobilityRecord,
+        ) -> Result<MobilityWrite> {
+            if matches!(record.state, MobilityState::Evacuated { .. }) {
+                self.attempted_commit.store(true, Ordering::SeqCst);
+                anyhow::bail!("connection reset while reading the reply");
+            }
+            self.inner.compare_and_set(expected, record).await
+        }
+
+        async fn get(&self, sandbox_id: &SandboxId) -> Result<Option<MobilityRecord>> {
+            if self.attempted_commit.load(Ordering::SeqCst) {
+                anyhow::bail!("the mobility store is unreachable");
+            }
+            self.inner.get(sandbox_id).await
+        }
+
+        async fn list(&self) -> Result<Vec<MobilityRecord>> {
+            self.inner.list().await
+        }
+
+        async fn remove(&self, sandbox_id: &SandboxId) -> Result<()> {
+            self.inner.remove(sandbox_id).await
+        }
+    }
+
+    /// Answers nothing at all from the moment the guest is up until the moment
+    /// the destination gives it back, which is what a black-holed connection
+    /// does — to a renewal exactly as much as to a write. Hanging rather than
+    /// failing is the point: an error would be reported and acted on.
+    struct WedgedUntilDiscarded {
+        inner: LocalMobilityStore,
+        armed: Arc<AtomicBool>,
+        discarded: Arc<AtomicBool>,
+    }
+
+    impl WedgedUntilDiscarded {
+        async fn wedge(&self) {
+            while self.armed.load(Ordering::SeqCst) && !self.discarded.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl MobilityStore for WedgedUntilDiscarded {
+        async fn upsert(&self, record: &MobilityRecord) -> Result<MobilityWrite> {
+            self.wedge().await;
+            self.inner.upsert(record).await
+        }
+
+        async fn compare_and_set(
+            &self,
+            expected: Option<MobilityGeneration>,
+            record: &MobilityRecord,
+        ) -> Result<MobilityWrite> {
+            self.wedge().await;
+            self.inner.compare_and_set(expected, record).await
+        }
+
+        async fn get(&self, sandbox_id: &SandboxId) -> Result<Option<MobilityRecord>> {
+            self.wedge().await;
+            self.inner.get(sandbox_id).await
+        }
+
+        async fn list(&self) -> Result<Vec<MobilityRecord>> {
+            self.wedge().await;
+            self.inner.list().await
+        }
+
+        async fn remove(&self, sandbox_id: &SandboxId) -> Result<()> {
+            self.wedge().await;
             self.inner.remove(sandbox_id).await
         }
     }

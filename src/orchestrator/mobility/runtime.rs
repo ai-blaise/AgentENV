@@ -27,12 +27,20 @@ use std::sync::Arc;
 
 use tracing::{debug, warn};
 
-use super::claim::{MobilityCoordinator, ResumeFence};
+use super::claim::{MobilityCoordinator, ReleaseOutcome, ResumeFence};
 use super::evacuation::{plan_evacuation, DestinationCandidate, EvacuationPlan};
-use super::record::{MobilityRecord, MobilityState, MobilityStore};
+use super::record::{MobilityRecord, MobilityState, MobilityStore, MobilityWrite};
 use crate::orchestrator::store::SandboxMetadata;
 use crate::snapshot::ArtifactReach;
 use crate::types::SandboxId;
+
+/// How many times a snapshot commit re-reads a record it lost the race to
+/// write.
+///
+/// Each retry only races one other transition — a claim, a release, a commit —
+/// so a handful is plenty. A record being rewritten faster than that is not a
+/// race this call can win, and it is not worth holding a pause path open for.
+const COMMIT_RECORD_ATTEMPTS: usize = 4;
 
 /// The host facts every record on this node shares.
 #[derive(Clone, Debug)]
@@ -201,21 +209,121 @@ impl<S: MobilityStore> MobilityRuntime<S> {
         sandbox_id: &SandboxId,
         snapshot_id: &crate::snapshot::SnapshotId,
     ) {
-        let Ok(Some(record)) = self.coordinator.store().get(sandbox_id).await else {
-            // No record means mobility was enabled after the pause, or the
-            // sandbox is not paused. Either way there is nothing to update,
-            // and inventing a record here would claim a paused sandbox this
-            // node never wrote down.
-            return;
-        };
-        let committed = record.committed_to(snapshot_id.to_string());
-        if let Err(error) = self.coordinator.store().upsert(&committed).await {
-            warn!(
-                %sandbox_id,
-                error = %error,
-                "published a paused sandbox but could not record it as movable"
-            );
+        for _ in 0..COMMIT_RECORD_ATTEMPTS {
+            let record = match self.coordinator.store().get(sandbox_id).await {
+                Ok(Some(record)) => record,
+                // No record means mobility was enabled after the pause, or the
+                // sandbox is not paused. Either way there is nothing to update,
+                // and inventing a record here would claim a paused sandbox this
+                // node never wrote down.
+                Ok(None) => return,
+                Err(error) => {
+                    warn!(
+                        %sandbox_id,
+                        error = %error,
+                        "published a paused sandbox but could not read its record to make it movable"
+                    );
+                    return;
+                }
+            };
+            if matches!(record.state, MobilityState::Evacuated { .. }) {
+                // The sandbox belongs to another node now. Advertising its old
+                // record as movable would offer a sandbox this one no longer
+                // has.
+                return;
+            }
+            let committed = record.committed_to(snapshot_id.to_string());
+            // Conditional on what was read, not an unconditional upsert:
+            // `committed_to` carries the state along with the snapshot, so a
+            // claim landing between the read and the write would be overwritten
+            // with the parked state this node saw — freeing a sandbox another
+            // node is already restoring.
+            match self
+                .coordinator
+                .store()
+                .compare_and_set(Some(record.generation), &committed)
+                .await
+            {
+                Ok(MobilityWrite::Applied) => return,
+                // Something moved the record on. Re-read, so the snapshot is
+                // recorded on top of that transition instead of erasing it.
+                Ok(MobilityWrite::Superseded) => continue,
+                Err(error) => {
+                    warn!(
+                        %sandbox_id,
+                        error = %error,
+                        "published a paused sandbox but could not record it as movable"
+                    );
+                    return;
+                }
+            }
         }
+        warn!(
+            %sandbox_id,
+            "published a paused sandbox but lost every race to record it as movable; it stays \
+             unmovable until it is published again"
+        );
+    }
+
+    /// Parks tombstones that name this node for sandboxes it is not running.
+    ///
+    /// An `Evacuated` record is terminal by design — it is what answers a late
+    /// claimant with "already gone, and to whom" — so a wrong one is
+    /// unclearable by every other path in this module, and it fences even the
+    /// origin out of a sandbox whose paused state the origin still holds. A
+    /// handover whose commit landed but whose guest was then torn down leaves
+    /// exactly that, and only the node the tombstone names can tell it apart
+    /// from a sandbox that really did arrive.
+    ///
+    /// `live_here` is the sandboxes this node is actually holding. Anything
+    /// else a tombstone names never arrived, and parking the record gives the
+    /// sandbox back to its origin. Returns what was handed back.
+    pub async fn reconcile_evacuation_tombstones(
+        &self,
+        live_here: &std::collections::HashSet<SandboxId>,
+    ) -> Vec<SandboxId> {
+        let records = match self.coordinator.store().list().await {
+            Ok(records) => records,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "failed to read mobility records; orphaned tombstones stay fenced"
+                );
+                return Vec::new();
+            }
+        };
+        let mut reclaimed = Vec::new();
+        for record in records {
+            let MobilityState::Evacuated { ref to_node_id, .. } = record.state else {
+                continue;
+            };
+            if to_node_id != self.node_id() || live_here.contains(&record.sandbox_id) {
+                continue;
+            }
+            match self
+                .coordinator
+                .abandon_evacuation(&record.sandbox_id)
+                .await
+            {
+                Ok(true) => {
+                    warn!(
+                        sandbox_id = %record.sandbox_id,
+                        "parked a tombstone for a handover that never ran here; the origin can \
+                         reclaim the sandbox"
+                    );
+                    reclaimed.push(record.sandbox_id);
+                }
+                // The record moved on under us, which is somebody else's
+                // decision and a better answer than this one.
+                Ok(false) => {}
+                Err(error) => warn!(
+                    sandbox_id = %record.sandbox_id,
+                    error = %error,
+                    "failed to park an orphaned tombstone; the sandbox stays fenced"
+                ),
+            }
+        }
+        reclaimed
     }
 
     /// Gives back a claim this node took for a resume that then failed.
@@ -226,10 +334,19 @@ impl<S: MobilityStore> MobilityRuntime<S> {
     /// a TTL, and blocks this node from retrying.
     pub async fn release_local_claim(&self, sandbox_id: &SandboxId) {
         match self.coordinator.release(sandbox_id).await {
-            Ok(true) => debug!(%sandbox_id, "released a claim taken for a resume that failed"),
+            Ok(ReleaseOutcome::Released) => {
+                debug!(%sandbox_id, "released a claim taken for a resume that failed")
+            }
             // Not ours any more, or never recorded. Either way there is
             // nothing to give back.
-            Ok(false) => {}
+            Ok(ReleaseOutcome::NotHeld) => {}
+            // A local resume never commits a handover, so this record was
+            // written by a migration onto this node. Undoing it is not this
+            // path's business.
+            Ok(ReleaseOutcome::AlreadyCommitted) => warn!(
+                %sandbox_id,
+                "a resume failed on a sandbox this node is recorded as having taken over"
+            ),
             Err(error) => warn!(
                 %sandbox_id,
                 error = %error,
@@ -824,5 +941,182 @@ mod forget_tests {
             store.get(&sandbox_id).await.expect("get").is_none(),
             "this node's own claim must not block its own cleanup"
         );
+    }
+}
+
+/// The two record transitions that have to survive a concurrent one: recording
+/// a snapshot commit, and clearing a tombstone that nothing else can clear.
+#[cfg(test)]
+mod reconciliation_tests {
+    use super::*;
+    use crate::orchestrator::mobility::record::{
+        LocalMobilityStore, MobilityGeneration, MobilityRecord,
+    };
+    use crate::orchestrator::store::SandboxMetadata;
+    use crate::snapshot::{SnapshotId, SnapshotRuntimeVersions};
+    use crate::virtualization::VirtualizationMode;
+    use async_trait::async_trait;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn facts() -> NodeMobilityFacts {
+        NodeMobilityFacts {
+            cpu_architecture: "x86_64".to_string(),
+            cluster_cpu_config: Arc::new(std::sync::RwLock::new(Some("{}".to_string()))),
+            memory_page_size: 4096,
+            artifact_reach: ArtifactReach::ClusterShared,
+        }
+    }
+
+    fn metadata() -> SandboxMetadata {
+        SandboxMetadata {
+            runtime_versions: SnapshotRuntimeVersions {
+                kernel_version: "vmlinux-6.1.175".to_string(),
+                firecracker_version: "1.15.1".to_string(),
+                envd_version: "0.5.15".to_string(),
+                tools_drive_version: "0.1.0".to_string(),
+            },
+            virtualization_mode: VirtualizationMode::Kvm,
+            ..SandboxMetadata::default()
+        }
+    }
+
+    async fn seeded(node_id: &str) -> (LocalMobilityStore, SandboxId, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalMobilityStore::open(dir.path().join("mobility"))
+            .await
+            .expect("store");
+        let metadata = metadata();
+        let record = MobilityRecord::for_paused(
+            &metadata,
+            node_id,
+            "x86_64",
+            Some("{}".to_string()),
+            4096,
+            ArtifactReach::ClusterShared,
+            None,
+        );
+        store.upsert(&record).await.expect("seed");
+        (store, metadata.id, dir)
+    }
+
+    /// Recording a snapshot commit carries the record's state along with it, so
+    /// an unconditional write puts back whatever state the read saw. A claim
+    /// landing in that window would be erased and the sandbox freed while
+    /// another node is restoring it — two live copies, from a bookkeeping
+    /// write.
+    #[tokio::test]
+    async fn a_claim_landing_while_a_snapshot_is_recorded_survives_it() {
+        let (store, sandbox_id, _dir) = seeded("node-a").await;
+        let racing = ClaimLandsAfterTheRead {
+            inner: store.clone(),
+            injected: AtomicBool::new(false),
+        };
+        let runtime = MobilityRuntime::new(
+            Arc::new(MobilityCoordinator::new(racing, "node-a")),
+            facts(),
+        );
+
+        runtime
+            .record_committed(&sandbox_id, &SnapshotId::generate())
+            .await;
+
+        let record = store.get(&sandbox_id).await.expect("get").expect("record");
+        assert!(
+            matches!(record.state, MobilityState::Claimed { ref by_node_id, .. } if by_node_id == "node-b"),
+            "the claim must survive a snapshot being recorded, got {:?}",
+            record.state
+        );
+        assert!(
+            record.snapshot_id.is_some(),
+            "and the snapshot has to land too, or the sandbox stays unmovable"
+        );
+    }
+
+    /// A tombstone naming a node that is not running the sandbox fences every
+    /// node out of it, the origin included, and `Evacuated` is terminal for
+    /// every other path here. The named node is the one that can tell a
+    /// handover that arrived from one that did not.
+    #[tokio::test]
+    async fn a_tombstone_for_a_handover_that_never_ran_here_is_parked_again() {
+        let (store, sandbox_id, _dir) = seeded("node-a").await;
+        let destination = MobilityCoordinator::new(store.clone(), "node-b");
+        destination.claim(&sandbox_id).await.expect("claim");
+        destination.complete(&sandbox_id).await.expect("complete");
+
+        let runtime = MobilityRuntime::new(
+            Arc::new(MobilityCoordinator::new(store.clone(), "node-b")),
+            facts(),
+        );
+
+        assert!(
+            runtime
+                .reconcile_evacuation_tombstones(&HashSet::from([sandbox_id]))
+                .await
+                .is_empty(),
+            "a sandbox that really is running here must keep its tombstone"
+        );
+        assert_eq!(
+            runtime
+                .reconcile_evacuation_tombstones(&HashSet::new())
+                .await,
+            vec![sandbox_id],
+            "a handover that never arrived has to be handed back"
+        );
+        assert_eq!(
+            MobilityCoordinator::new(store.clone(), "node-a")
+                .claim_for_local_resume(&sandbox_id)
+                .await
+                .expect("fence"),
+            ResumeFence::Allowed,
+            "the origin still holds the paused state and must be able to reclaim it"
+        );
+    }
+
+    /// A record that is claimed between the read and the write, which is what a
+    /// destination taking the sandbox looks like from inside one node.
+    struct ClaimLandsAfterTheRead {
+        inner: LocalMobilityStore,
+        injected: AtomicBool,
+    }
+
+    #[async_trait]
+    impl MobilityStore for ClaimLandsAfterTheRead {
+        async fn upsert(&self, record: &MobilityRecord) -> anyhow::Result<MobilityWrite> {
+            self.inner.upsert(record).await
+        }
+
+        async fn compare_and_set(
+            &self,
+            expected: Option<MobilityGeneration>,
+            record: &MobilityRecord,
+        ) -> anyhow::Result<MobilityWrite> {
+            self.inner.compare_and_set(expected, record).await
+        }
+
+        async fn get(&self, sandbox_id: &SandboxId) -> anyhow::Result<Option<MobilityRecord>> {
+            let record = self.inner.get(sandbox_id).await?;
+            if let Some(read) = &record {
+                if !self.injected.swap(true, Ordering::SeqCst) {
+                    let claimed = read.transitioned_to(MobilityState::Claimed {
+                        by_node_id: "node-b".to_string(),
+                        at_unix_ms: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .expect("clock after the epoch")
+                            .as_millis() as u64,
+                    });
+                    self.inner.upsert(&claimed).await?;
+                }
+            }
+            Ok(record)
+        }
+
+        async fn list(&self) -> anyhow::Result<Vec<MobilityRecord>> {
+            self.inner.list().await
+        }
+
+        async fn remove(&self, sandbox_id: &SandboxId) -> anyhow::Result<()> {
+            self.inner.remove(sandbox_id).await
+        }
     }
 }

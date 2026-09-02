@@ -16,7 +16,9 @@ use super::proxy::{build_proxy_client, ProxyClient};
 use crate::api_key::ApiKey;
 use crate::image::ImageResolver;
 use crate::observability::ObservabilityService;
-use crate::orchestrator::Orchestrator;
+#[cfg(test)]
+use crate::orchestrator::AdmissionRejectReason;
+use crate::orchestrator::{Orchestrator, OrchestratorError};
 use crate::snapshot::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
 use crate::template::TemplateBuilder;
@@ -36,6 +38,15 @@ pub struct ApiImpl {
     sandbox_proxy_domains: Vec<String>,
     api_key: ApiKey,
     proxy_timeouts: crate::api::proxy::ProxyTimeouts,
+    /// A capacity refusal to answer creates with, in place of the node's own
+    /// admission gate.
+    ///
+    /// That gate is a process-wide singleton built from global config, so no
+    /// test can put a node at its real limits. The wire shape of this refusal
+    /// is a contract the gateway keys its create retries on, and only a
+    /// response the node itself produced can pin it.
+    #[cfg(test)]
+    forced_admission_refusal: Option<(AdmissionRejectReason, std::time::Duration)>,
 }
 
 impl ApiImpl {
@@ -48,16 +59,47 @@ impl ApiImpl {
         sandbox_proxy_domains: Vec<String>,
         api_key: ApiKey,
     ) -> Self {
+        let proxy_timeouts = crate::api::proxy::ProxyTimeouts::default();
         Self {
             orchestrator,
             snapshot_manager,
             template_builder,
             image_resolver,
             observability,
-            proxy_client: build_proxy_client(),
+            proxy_client: build_proxy_client(proxy_timeouts.connect),
             sandbox_proxy_domains,
             api_key,
-            proxy_timeouts: crate::api::proxy::ProxyTimeouts::default(),
+            proxy_timeouts,
+            #[cfg(test)]
+            forced_admission_refusal: None,
+        }
+    }
+
+    /// Makes creates answer with the capacity refusal `reason` describes.
+    #[cfg(test)]
+    pub(crate) fn refusing_creates(
+        mut self,
+        reason: AdmissionRejectReason,
+        retry_after: std::time::Duration,
+    ) -> Self {
+        self.forced_admission_refusal = Some((reason, retry_after));
+        self
+    }
+
+    /// The refusal a create should answer with without asking the orchestrator.
+    fn forced_admission_refusal(&self) -> Option<OrchestratorError> {
+        #[cfg(test)]
+        {
+            self.forced_admission_refusal.map(|(reason, retry_after)| {
+                OrchestratorError::AdmissionRejected {
+                    reason,
+                    retry_after,
+                }
+            })
+        }
+        #[cfg(not(test))]
+        {
+            None
         }
     }
 
@@ -72,6 +114,9 @@ impl ApiImpl {
         mut self,
         proxy_timeouts: crate::api::proxy::ProxyTimeouts,
     ) -> Self {
+        // The connect deadline lives in the connector, so it is fixed when the
+        // client is built rather than read per request.
+        self.proxy_client = build_proxy_client(proxy_timeouts.connect);
         self.proxy_timeouts = proxy_timeouts;
         self
     }
@@ -119,6 +164,18 @@ impl ApiImpl {
             current = source.source();
         }
         Self::error(500, message)
+    }
+
+    /// Maps an orchestrator failure to the body of a 500.
+    ///
+    /// `models::Error::from` picks a code from what the failure means, which is
+    /// right wherever a matching response variant exists — and wrong the moment
+    /// the only variant left is the 500, because the body would then contradict
+    /// the status the client reads it under.
+    fn server_error(err: OrchestratorError) -> models::Error {
+        let mut error = models::Error::from(err);
+        error.code = 500;
+        error
     }
 
     fn repository_error(err: &RepositoryError) -> models::Error {

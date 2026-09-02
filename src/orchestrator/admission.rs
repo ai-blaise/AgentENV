@@ -458,6 +458,59 @@ mod tests {
         Some(OrchestratorMetrics::default())
     }
 
+    /// The reason is the label on `agentenv_admission_rejected_total` and the
+    /// word a client branches on, so a collapsed or reworded set costs the
+    /// operator the only signal that says which limit fired — during the
+    /// capacity event the metric exists for.
+    #[test]
+    fn every_reject_reason_has_its_own_stable_label() {
+        let expected = [
+            (AdmissionRejectReason::SandboxCount, "sandbox_count"),
+            (
+                AdmissionRejectReason::StartingSandboxCount,
+                "starting_sandbox_count",
+            ),
+            (AdmissionRejectReason::AllocatedCpu, "allocated_cpu"),
+            (AdmissionRejectReason::AllocatedMemory, "allocated_memory"),
+            (
+                AdmissionRejectReason::SandboxCountIncludingPaused,
+                "sandbox_count_including_paused",
+            ),
+            (AdmissionRejectReason::NetworkSlots, "network_slots"),
+        ];
+
+        for (reason, label) in expected {
+            assert_eq!(reason.as_str(), label);
+            assert_eq!(reason.to_string(), label, "Display must be the label");
+        }
+
+        let labels: std::collections::HashSet<&str> =
+            expected.iter().map(|(_, label)| *label).collect();
+        assert_eq!(
+            labels.len(),
+            expected.len(),
+            "two reasons sharing a label merge two limits into one metric series"
+        );
+    }
+
+    /// Retry-After reaches the client as seconds, and zero would tell a client
+    /// to retry immediately against the node that just refused it.
+    #[test]
+    fn retry_after_is_the_configured_seconds_with_a_one_second_floor() {
+        let mut cfg = config();
+        cfg.retry_after_secs = 7;
+        assert_eq!(
+            AdmissionController::new(cfg.clone()).retry_after(),
+            Duration::from_secs(7)
+        );
+
+        cfg.retry_after_secs = 0;
+        assert_eq!(
+            AdmissionController::new(cfg).retry_after(),
+            Duration::from_secs(1)
+        );
+    }
+
     #[tokio::test]
     async fn disabled_controller_admits_everything() {
         let mut cfg = config();

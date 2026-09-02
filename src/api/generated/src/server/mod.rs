@@ -627,6 +627,66 @@ where
                                                       })).await.unwrap()?;
                                                   response.body(Body::from(body_content))
                                                 },
+                                                apis::sandboxes::SandboxesColdPostResponse::Status503_NodeAtCapacity
+                                                    {
+                                                        body,
+                                                        retry_after,
+                                                        x_agentenv_refusal_reason
+                                                    }
+                                                => {
+                                                    if let Some(retry_after) = retry_after {
+                                                    let retry_after = match header::IntoHeaderValue(retry_after).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling retry_after header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("retry-after"),
+                                                          retry_after
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_agentenv_refusal_reason) = x_agentenv_refusal_reason {
+                                                    let x_agentenv_refusal_reason = match header::IntoHeaderValue(x_agentenv_refusal_reason).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_refusal_reason header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-refusal-reason"),
+                                                          x_agentenv_refusal_reason
+                                                      );
+                                                    }
+                                                    }
+                                                  let mut response = response.status(503);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
                                                 apis::sandboxes::SandboxesColdPostResponse::Status500_ServerError
                                                     (body)
                                                 => {
@@ -939,6 +999,66 @@ where
                                                     (body)
                                                 => {
                                                   let mut response = response.status(400);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesPostResponse::Status503_NodeAtCapacity
+                                                    {
+                                                        body,
+                                                        retry_after,
+                                                        x_agentenv_refusal_reason
+                                                    }
+                                                => {
+                                                    if let Some(retry_after) = retry_after {
+                                                    let retry_after = match header::IntoHeaderValue(retry_after).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling retry_after header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("retry-after"),
+                                                          retry_after
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_agentenv_refusal_reason) = x_agentenv_refusal_reason {
+                                                    let x_agentenv_refusal_reason = match header::IntoHeaderValue(x_agentenv_refusal_reason).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_refusal_reason header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-refusal-reason"),
+                                                          x_agentenv_refusal_reason
+                                                      );
+                                                    }
+                                                    }
+                                                  let mut response = response.status(503);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
                                                     response_headers.insert(
@@ -1870,6 +1990,66 @@ where
                                                     (body)
                                                 => {
                                                   let mut response = response.status(401);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesSandboxIdForkPostResponse::Status503_NodeAtCapacity
+                                                    {
+                                                        body,
+                                                        retry_after,
+                                                        x_agentenv_refusal_reason
+                                                    }
+                                                => {
+                                                    if let Some(retry_after) = retry_after {
+                                                    let retry_after = match header::IntoHeaderValue(retry_after).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling retry_after header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("retry-after"),
+                                                          retry_after
+                                                      );
+                                                    }
+                                                    }
+                                                    if let Some(x_agentenv_refusal_reason) = x_agentenv_refusal_reason {
+                                                    let x_agentenv_refusal_reason = match header::IntoHeaderValue(x_agentenv_refusal_reason).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling x_agentenv_refusal_reason header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("x-agentenv-refusal-reason"),
+                                                          x_agentenv_refusal_reason
+                                                      );
+                                                    }
+                                                    }
+                                                  let mut response = response.status(503);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
                                                     response_headers.insert(

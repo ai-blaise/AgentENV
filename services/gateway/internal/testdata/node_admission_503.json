@@ -1,9 +1,9 @@
 {
   "status": 503,
   "headers": {
+    "content-type": "application/json",
     "retry-after": "2",
-    "x-agentenv-refusal-reason": "node_at_capacity",
-    "content-type": "application/json"
+    "x-agentenv-refusal-reason": "node_at_capacity"
   },
   "body": {
     "code": 503,

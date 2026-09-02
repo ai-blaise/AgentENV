@@ -21,6 +21,12 @@ pub enum SandboxesColdPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Node at capacity
+    Status503_NodeAtCapacity {
+        body: models::Error,
+        retry_after: Option<i32>,
+        x_agentenv_refusal_reason: Option<String>,
+    },
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -52,6 +58,12 @@ pub enum SandboxesPostResponse {
     Status401_AuthenticationError(models::Error),
     /// Bad request
     Status400_BadRequest(models::Error),
+    /// Node at capacity
+    Status503_NodeAtCapacity {
+        body: models::Error,
+        retry_after: Option<i32>,
+        x_agentenv_refusal_reason: Option<String>,
+    },
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -140,6 +152,12 @@ pub enum SandboxesSandboxIdForkPostResponse {
     Status404_NotFound(models::Error),
     /// Authentication error
     Status401_AuthenticationError(models::Error),
+    /// Node at capacity
+    Status503_NodeAtCapacity {
+        body: models::Error,
+        retry_after: Option<i32>,
+        x_agentenv_refusal_reason: Option<String>,
+    },
     /// Server error
     Status500_ServerError(models::Error),
 }

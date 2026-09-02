@@ -34,6 +34,9 @@ pub trait P2pTransport: Send + Sync {
     /// happens afterwards, on content this call has already materialised — so
     /// the peer is free to offer something arbitrarily large, and only the
     /// caller knows what size the thing it asked for could legitimately be.
+    /// An artifact this node already holds is bounded on the same terms: the
+    /// caller declared what it is willing to write, and that does not change
+    /// with where the bytes came from.
     async fn fetch(
         &self,
         descriptor: &P2pArtifactDescriptor,

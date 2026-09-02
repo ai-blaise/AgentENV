@@ -86,6 +86,64 @@ pub enum ClaimOutcome {
     Superseded,
 }
 
+/// Why a handover could not be recorded.
+///
+/// The two are not interchangeable, and treating them as one is how a sandbox
+/// is lost: a read that failed touched nothing, so its caller is free to
+/// unwind, while a conditional write whose reply never arrived may well have
+/// applied. Unwinding on the second discards the only live copy of a sandbox
+/// the record now says lives here, and `Evacuated` is terminal.
+#[derive(Debug)]
+pub enum CommitFailure {
+    /// The record could not be read, so no write was attempted.
+    NeverSent(anyhow::Error),
+    /// The write went out and its outcome is unknown.
+    Ambiguous(anyhow::Error),
+}
+
+impl CommitFailure {
+    /// The underlying store error, whichever side of the write it came from.
+    pub fn error(&self) -> &anyhow::Error {
+        match self {
+            Self::NeverSent(error) | Self::Ambiguous(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for CommitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:#}", self.error())
+    }
+}
+
+/// What the record says about a handover this node may have committed.
+///
+/// Only the node that sent the commit can ask this and get an answer: no other
+/// node writes this node's id into an `Evacuated` state, so finding it there is
+/// proof the write applied, whatever the reply said.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitStanding {
+    /// The record names this node as the sandbox's home.
+    Committed,
+    /// The claim is still this node's, so no commit has applied yet.
+    StillClaimed,
+    /// Somebody else owns the sandbox, or nobody does.
+    Lost { detail: String },
+}
+
+/// What happened when a claim was given back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReleaseOutcome {
+    /// The claim is back and the sandbox is parked again.
+    Released,
+    /// Not this node's claim to give back: taken, already given back, or never
+    /// recorded. A write that lost its race lands here too, because the record
+    /// moved on without us either way.
+    NotHeld,
+    /// This node's own completed handover, which a release must not undo.
+    AlreadyCommitted,
+}
+
 /// Whether the origin may resume a paused sandbox itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResumeFence {
@@ -190,30 +248,52 @@ impl<S: MobilityStore> MobilityCoordinator<S> {
     /// else's claim is exactly the resurrection the generation order exists to
     /// prevent, and it would be worse here: it would invite a second claimant
     /// in while the first is still working.
-    pub async fn release(&self, sandbox_id: &SandboxId) -> Result<bool> {
+    pub async fn release(&self, sandbox_id: &SandboxId) -> Result<ReleaseOutcome> {
         let Some(record) = self.store.get(sandbox_id).await? else {
-            return Ok(false);
+            return Ok(ReleaseOutcome::NotHeld);
         };
+        // Answered before the claim check, and separately from it: a caller
+        // unwinding an ambiguous commit needs to tell "somebody else has it"
+        // from "we finished, and the reply is what went missing".
+        if let MobilityState::Evacuated { to_node_id, .. } = &record.state {
+            if to_node_id == &self.node_id {
+                return Ok(ReleaseOutcome::AlreadyCommitted);
+            }
+        }
         if !self.holds_claim(&record) {
-            return Ok(false);
+            return Ok(ReleaseOutcome::NotHeld);
         }
         let released = record.transitioned_to(MobilityState::Parked);
-        Ok(matches!(
-            self.store
+        Ok(
+            match self
+                .store
                 .compare_and_set(Some(record.generation), &released)
-                .await?,
-            MobilityWrite::Applied
-        ))
+                .await?
+            {
+                MobilityWrite::Applied => ReleaseOutcome::Released,
+                MobilityWrite::Superseded => ReleaseOutcome::NotHeld,
+            },
+        )
     }
 
     /// Marks the handover finished, with this node as the new home.
-    pub async fn complete(&self, sandbox_id: &SandboxId) -> Result<bool> {
+    ///
+    /// The error side distinguishes a write that never went out from one whose
+    /// answer was lost, because only the caller can compensate and the two call
+    /// for opposite responses. See [`CommitFailure`].
+    pub async fn complete(&self, sandbox_id: &SandboxId) -> Result<bool, CommitFailure> {
         self.complete_at(sandbox_id, SystemTime::now()).await
     }
 
-    async fn complete_at(&self, sandbox_id: &SandboxId, now: SystemTime) -> Result<bool> {
-        let Some(record) = self.store.get(sandbox_id).await? else {
-            return Ok(false);
+    async fn complete_at(
+        &self,
+        sandbox_id: &SandboxId,
+        now: SystemTime,
+    ) -> Result<bool, CommitFailure> {
+        let record = match self.store.get(sandbox_id).await {
+            Ok(Some(record)) => record,
+            Ok(None) => return Ok(false),
+            Err(error) => return Err(CommitFailure::NeverSent(error)),
         };
         if !self.holds_claim(&record) {
             return Ok(false);
@@ -224,9 +304,69 @@ impl<S: MobilityStore> MobilityCoordinator<S> {
         });
         // Conditional too: the commit is the point of no return, and it must
         // not overwrite a rival that took the claim while this node restored.
+        match self
+            .store
+            .compare_and_set(Some(record.generation), &evacuated)
+            .await
+        {
+            Ok(MobilityWrite::Applied) => Ok(true),
+            Ok(MobilityWrite::Superseded) => Ok(false),
+            Err(error) => Err(CommitFailure::Ambiguous(error)),
+        }
+    }
+
+    /// Whether a commit this node sent actually landed.
+    ///
+    /// The record is the only witness left after a lost reply, and it is a
+    /// sufficient one: this node's id appears in an `Evacuated` state only
+    /// because this node's own `complete` put it there.
+    pub async fn commit_standing(&self, sandbox_id: &SandboxId) -> Result<CommitStanding> {
+        let Some(record) = self.store.get(sandbox_id).await? else {
+            return Ok(CommitStanding::Lost {
+                detail: "the record is gone".to_string(),
+            });
+        };
+        Ok(match &record.state {
+            MobilityState::Evacuated { to_node_id, .. } if to_node_id == &self.node_id => {
+                CommitStanding::Committed
+            }
+            MobilityState::Evacuated { to_node_id, .. } => CommitStanding::Lost {
+                detail: format!("the sandbox moved to {to_node_id}"),
+            },
+            MobilityState::Claimed { by_node_id, .. } if by_node_id == &self.node_id => {
+                CommitStanding::StillClaimed
+            }
+            MobilityState::Claimed { by_node_id, .. } => CommitStanding::Lost {
+                detail: format!("the claim is held by {by_node_id}"),
+            },
+            MobilityState::Parked => CommitStanding::Lost {
+                detail: "the claim was given back".to_string(),
+            },
+        })
+    }
+
+    /// Hands back a sandbox this node is recorded as holding but does not have.
+    ///
+    /// A tombstone is terminal by design — it is what answers a late claimant
+    /// with "already gone, and to whom" — which also makes a wrong one
+    /// unclearable: it fences every node out of a sandbox whose origin still
+    /// holds the paused state. Only the node the tombstone names may park it
+    /// again, because only that node can tell "moved here and running" from
+    /// "never arrived".
+    pub async fn abandon_evacuation(&self, sandbox_id: &SandboxId) -> Result<bool> {
+        let Some(record) = self.store.get(sandbox_id).await? else {
+            return Ok(false);
+        };
+        let MobilityState::Evacuated { to_node_id, .. } = &record.state else {
+            return Ok(false);
+        };
+        if to_node_id != &self.node_id {
+            return Ok(false);
+        }
+        let parked = record.transitioned_to(MobilityState::Parked);
         Ok(matches!(
             self.store
-                .compare_and_set(Some(record.generation), &evacuated)
+                .compare_and_set(Some(record.generation), &parked)
                 .await?,
             MobilityWrite::Applied
         ))
@@ -535,11 +675,17 @@ mod tests {
             .expect("claim");
 
         let interloper = coordinator(f.store.clone(), "node-c");
-        assert!(!interloper.release(&f.sandbox_id).await.expect("release"));
+        assert_eq!(
+            interloper.release(&f.sandbox_id).await.expect("release"),
+            ReleaseOutcome::NotHeld
+        );
         assert!(!interloper.complete(&f.sandbox_id).await.expect("complete"));
 
         let claimant = coordinator(f.store.clone(), "node-b");
-        assert!(claimant.release(&f.sandbox_id).await.expect("release"));
+        assert_eq!(
+            claimant.release(&f.sandbox_id).await.expect("release"),
+            ReleaseOutcome::Released
+        );
         assert_eq!(
             coordinator(f.store.clone(), "node-a")
                 .claim_for_local_resume(&f.sandbox_id)
@@ -547,6 +693,69 @@ mod tests {
                 .expect("fence"),
             ResumeFence::Allowed,
             "a released sandbox is available again"
+        );
+    }
+
+    /// A release that finds this node's own completed handover must say so
+    /// rather than report "not ours". The caller asking is one unwinding an
+    /// ambiguous commit, and the answer decides whether the sandbox moved.
+    #[tokio::test]
+    async fn releasing_a_completed_handover_is_reported_rather_than_undone() {
+        let f = fixture().await;
+        let destination = coordinator(f.store.clone(), "node-b");
+        destination.claim(&f.sandbox_id).await.expect("claim");
+        assert!(destination.complete(&f.sandbox_id).await.expect("complete"));
+
+        assert_eq!(
+            destination.release(&f.sandbox_id).await.expect("release"),
+            ReleaseOutcome::AlreadyCommitted
+        );
+        assert!(
+            matches!(
+                f.store.get(&f.sandbox_id).await.expect("get").expect("record").state,
+                MobilityState::Evacuated { ref to_node_id, .. } if to_node_id == "node-b"
+            ),
+            "a release must not undo a commit that stands"
+        );
+    }
+
+    /// Only the node a tombstone names may park it again. Anyone else doing so
+    /// would resurrect a sandbox that really did move.
+    #[tokio::test]
+    async fn only_the_named_destination_may_park_its_own_tombstone() {
+        let f = fixture().await;
+        let destination = coordinator(f.store.clone(), "node-b");
+        destination.claim(&f.sandbox_id).await.expect("claim");
+        destination.complete(&f.sandbox_id).await.expect("complete");
+
+        assert!(
+            !coordinator(f.store.clone(), "node-c")
+                .abandon_evacuation(&f.sandbox_id)
+                .await
+                .expect("abandon"),
+            "a bystander must not clear a tombstone naming another node"
+        );
+        assert!(matches!(
+            f.store
+                .get(&f.sandbox_id)
+                .await
+                .expect("get")
+                .expect("record")
+                .state,
+            MobilityState::Evacuated { .. }
+        ));
+
+        assert!(destination
+            .abandon_evacuation(&f.sandbox_id)
+            .await
+            .expect("abandon"));
+        assert_eq!(
+            coordinator(f.store.clone(), "node-a")
+                .claim_for_local_resume(&f.sandbox_id)
+                .await
+                .expect("fence"),
+            ResumeFence::Allowed,
+            "the origin still holds the paused state and must be able to reclaim it"
         );
         assert!(
             matches!(
