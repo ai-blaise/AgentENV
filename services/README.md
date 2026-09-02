@@ -99,6 +99,9 @@ General config notes:
 - `scheduler.binding_ttl` must be a duration string such as `"30s"` in JSON config files.
 - `scheduler.report_ttl` controls how long an observed node heartbeat stays healthy.
 - `scheduler.binding_ttl` controls how long sandbox-to-node bindings survive without a fresh `RecordAssignment` or heartbeat roster refresh.
+- `scheduler.reconcile_grace` is how recently a binding must have been written for a heartbeat reconcile to leave it alone when the node's roster omits it; it covers the gap between a node collecting its roster and the scheduler acting on it, during which a newly placed sandbox is bound but in no roster yet. Unset, it is the smaller of `10s` and half of `scheduler.binding_ttl`. An explicit value must be shorter than `scheduler.binding_ttl` and, when `scheduler.heartbeat_interval` is set, at least two intervals long; both relations are checked at config load and again when the binding store is built.
+- `scheduler.heartbeat_interval` is the interval nodes are expected to report at. It is used only to validate the TTLs and grace above against it at startup: `scheduler.report_ttl` and `scheduler.binding_ttl` must be at least three intervals, `scheduler.reconcile_grace` at least two. Unset, those checks are skipped; the scheduler still re-checks the binding-TTL relation on every heartbeat against the interval each node reports.
+- `scheduler.schedule_health_gate` (default `true`) excludes nodes whose last heartbeat is older than `scheduler.report_ttl`, or that report themselves unhealthy or draining, from placement. Setting it to `false` restores placement on any discovered node regardless of heartbeat age.
 - `scheduler.redis_addr` selects Redis-backed sandbox binding storage when set; when empty, the scheduler uses the in-memory binding store. It accepts `host:port`, a comma-separated list of cluster seeds (`host1:6379,host2:6379,host3:6379`), or a Redis URL such as `redis://[:password@]host:6379/db`.
 
   Whether to speak the cluster protocol is asked of the server rather than inferred from the address, so a single-seed cluster works and a misconfiguration fails at startup rather than on the first `MOVED`. Bindings are keyed by sandbox id and node indexes by node id, each with its own hash tag, so they shard across the cluster instead of piling into one slot — the read path that every proxied request takes is a single key in a single slot.
@@ -106,6 +109,8 @@ General config notes:
 - `scheduler.artifact_store_capacity` controls how many distinct P2P artifact keys the in-memory artifact index keeps before LRU eviction; defaults to `1000000`.
 - `scheduler.artifact_lookup_node_limit` controls how many node IDs a P2P artifact lookup returns; values `<= 0` return all matching nodes.
 - `SCHEDULER_BINDING_TTL=<duration>` overrides `scheduler.binding_ttl` from the environment.
+- `SCHEDULER_RECONCILE_GRACE=<duration>` overrides `scheduler.reconcile_grace` from the environment.
+- `SCHEDULER_HEARTBEAT_INTERVAL=<duration>` overrides `scheduler.heartbeat_interval` from the environment.
 - `SCHEDULER_REDIS_ADDR=<addr>` overrides `scheduler.redis_addr` from the environment.
 - `SCHEDULER_ARTIFACT_STORE_CAPACITY=<count>` overrides `scheduler.artifact_store_capacity` from the environment.
 - `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT=<count>` overrides `scheduler.artifact_lookup_node_limit` from the environment.
@@ -137,6 +142,9 @@ All fields are optional. Omitting a field (or setting the whole block to `null`)
 | `max_cpu_allocated_percent` | uint32 | Maximum allocated-CPU-to-physical-CPU ratio; can exceed 100 when overcommit is allowed |
 | `max_memory_used_percent` | uint32 | Maximum observed memory usage (0–100) |
 | `max_memory_allocated_percent` | uint32 | Maximum allocated-memory-to-physical-memory ratio; can exceed 100 when overcommit is allowed |
+| `max_sandbox_count_including_paused` | uint32 | Maximum sandbox count over the active set plus paused sandboxes. Paused sandboxes have released their VM-side CPU and memory but still hold persisted state on the node |
+| `max_allocated_cpu_including_paused` | uint32 | Maximum allocated CPU, in cores, over the active set plus paused sandboxes |
+| `max_allocated_memory_bytes_including_paused` | uint64 | Maximum allocated memory, in bytes, over the active set plus paused sandboxes |
 
 Example:
 
@@ -158,6 +166,8 @@ When all nodes are filtered out, the scheduler returns `Unavailable` to the call
 - `gateway.scheduler_addr` points to the primary scheduler. The gateway uses it for scheduling, assignment writes, node listing, node detail resolution, and P2P scheduler APIs.
 - `gateway.query_only_scheduler_addr` optionally points to a query-only scheduler. When set, sandbox `LookupNode` routing uses this client; when unset, gateway falls back to `gateway.scheduler_addr`.
 - `gateway.request_timeout` must be a duration string such as `"30s"` in JSON config files.
+- `gateway.debug_mode` (default `false`) enables debug-only behaviour such as exposing the backend node id on proxied responses. `GATEWAY_DEBUG_MODE=<bool>` overrides it from the environment.
+- `gateway.max_idle_conns_per_host` bounds the pooled idle upstream connections the gateway keeps per node; zero uses the gateway default.
 - `gateway.request_timeout` applies to regular proxied HTTP requests. Streaming requests and WebSocket connections reuse the client context and are not cut off by this timeout.
 - `gateway.forward_response_size` only limits how much of a successful `POST /sandboxes` response the gateway buffers while extracting a sandbox ID for `RecordAssignment`; it is not a global response-size cap for all proxied traffic.
 - Cluster list requests (`GET /sandboxes`, `GET /v2/sandboxes`) fan out to every scheduler node and merge results in the gateway. Direct requests to a backend node remain node-scoped.
@@ -168,6 +178,25 @@ When all nodes are filtered out, the scheduler returns `Unavailable` to the call
 - `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR=<addr>` overrides `gateway.query_only_scheduler_addr` from the environment.
 - `gateway.sandbox_proxy_domains` enables host-based sandbox data-plane routing for `{port}-{sandboxID}.{domain}` URLs. Domains are normalized to lowercase, deduplicated, and must be valid DNS names. Sandbox IDs used in host routes must be lowercase RFC 952/1123 DNS labels, and the full `{port}-{sandboxID}` label must be at most 63 characters.
 - `GATEWAY_SANDBOX_PROXY_DOMAINS=<domain>[,<domain>...]` overrides `gateway.sandbox_proxy_domains` from the environment.
+- `gateway.max_in_flight_creates` bounds how many `POST /sandboxes` / `POST /sandboxes-cold` placements one gateway carries at once; creates beyond it are refused immediately with `503` and `x-agentenv-refusal-reason: gateway_shed`. Zero uses the gateway default (512). Only creates are shed; management-plane requests such as `/templates` and `/snapshots` are never counted against it.
+- `gateway.max_schedule_retries` bounds how many further nodes a create is offered to after one refuses it for capacity. Zero uses the gateway default (2, so three attempts); a negative value gives every create a single attempt.
+- `GATEWAY_MAX_IN_FLIGHT_CREATES=<count>` and `GATEWAY_MAX_SCHEDULE_RETRIES=<count>` override those two keys from the environment.
+
+### Create refusals
+
+A refused create is a `503` carrying `x-agentenv-refusal-reason`, so a client can tell the refusals apart and respond to each correctly:
+
+| Reason | Origin | Meaning |
+|---|---|---|
+| `node_at_capacity` | node | The node's admission gate refused this create. The gateway re-places it on another node up to `gateway.max_schedule_retries` times; a client sees this reason only when every attempt ended that way. |
+| `fleet_exhausted` | gateway | The scheduler had no eligible node left to offer. Capacity has to change before a retry can succeed. |
+| `gateway_shed` | gateway | The gateway declined before placing anything because it is already at `gateway.max_in_flight_creates`. The fleet may be fine; slow down. |
+
+The gateway retries a create only on `503` **with** `node_at_capacity`. A `503` without that reason — a node mid-shutdown, a proxy in front of it, an older node — is the node's own answer and is returned to the client unchanged. Non-create requests are never retried on another node: a `503` to a `DELETE` is an answer, and re-running the `DELETE` elsewhere is not.
+
+### Schedule hints
+
+`POST /sandboxes` and `POST /sandboxes-cold` bodies are parsed into a `ScheduleRequestHint` (cpu, memory, images, metadata) that travels with the `Schedule` RPC. No shipped strategy reads it yet: placement is not aware of the requested resources or images, and `scheduler.node_resource_limit` filters on node heartbeats, not on the request. The hint is kept so a resource- or image-aware strategy can land without a wire change.
 
 Logging format defaults to `auto`:
 

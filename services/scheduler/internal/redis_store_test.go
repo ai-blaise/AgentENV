@@ -512,8 +512,22 @@ func assertRedisIndexTTLWithin(t *testing.T, store *RedisBindingStore, key strin
 func TestNewRedisBindingStoreWithOptionsValidatesGrace(t *testing.T) {
 	addr := startRedisServerForTest(t)
 
-	if _, err := NewRedisBindingStoreWithOptions(addr, BindingStoreOptions{BindingTTL: 5 * time.Second}); err == nil {
-		t.Fatalf("a 5s binding ttl with the %s default grace was accepted", defaultReconcileGracePeriod)
+	if _, err := NewRedisBindingStoreWithOptions(addr, BindingStoreOptions{
+		BindingTTL:     5 * time.Second,
+		ReconcileGrace: 5 * time.Second,
+	}); err == nil {
+		t.Fatal("an explicit grace equal to the binding ttl was accepted")
+	}
+
+	derived, err := NewRedisBindingStoreWithOptions(addr, BindingStoreOptions{BindingTTL: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("a 5s binding ttl with the grace unset was refused: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = derived.Close()
+	})
+	if derived.reconcileGrace != 2500*time.Millisecond {
+		t.Fatalf("reconcile grace = %s, want half the 5s ttl", derived.reconcileGrace)
 	}
 
 	store, err := NewRedisBindingStoreWithOptions(addr, BindingStoreOptions{
@@ -529,5 +543,59 @@ func TestNewRedisBindingStoreWithOptionsValidatesGrace(t *testing.T) {
 	})
 	if store.reconcileGrace != 20*time.Second {
 		t.Fatalf("reconcile grace = %s, want 20s", store.reconcileGrace)
+	}
+}
+
+// redisRecordedAtMs reads the stamp the Lua write script put on a binding.
+func redisRecordedAtMs(t *testing.T, store *RedisBindingStore, sandboxID string) int64 {
+	t.Helper()
+	raw, err := store.client.Get(context.Background(), store.bindingKey(sandboxID)).Bytes()
+	if err != nil {
+		t.Fatalf("read raw redis binding %s failed: %v", sandboxID, err)
+	}
+	var record redisBindingRecord
+	if err := json.Unmarshal(raw, &record); err != nil {
+		t.Fatalf("binding value for %s is not JSON: %v; raw=%q", sandboxID, err, raw)
+	}
+	return record.RecordedAtMs
+}
+
+// TestRedisRefreshBySameOwnerKeepsTheRecordedAtStamp pins the Lua side of the
+// invariant TestReconcileGraceDoesNotRestampOnRefresh pins in Go: a refresh by
+// the owner keeps the establishment stamp, a rebind to another node takes a new
+// one. The script stamps from redis TIME, so the stamp is read back rather
+// than reasoned about, and the sleeps only have to clear its millisecond
+// granularity. The same-owner branch of the script had no test before this;
+// with it removed every reconcile grace restarted on every heartbeat.
+func TestRedisRefreshBySameOwnerKeepsTheRecordedAtStamp(t *testing.T) {
+	store := newRedisBindingStoreForTest(t, time.Minute)
+	nodeA := Node{ID: "node-a", Endpoint: "http://node-a"}
+	nodeB := Node{ID: "node-b", Endpoint: "http://node-b"}
+
+	store.Record("sbx-1", nodeA, time.Now())
+	established := redisRecordedAtMs(t, store, "sbx-1")
+	if established == 0 {
+		t.Fatal("the write did not stamp recorded_at_ms")
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	store.Record("sbx-1", nodeA, time.Now())
+	if got := redisRecordedAtMs(t, store, "sbx-1"); got != established {
+		t.Fatalf("a same-owner Record restamped recorded_at_ms from %d to %d", established, got)
+	}
+
+	// The heartbeat path refreshes through the same script.
+	time.Sleep(20 * time.Millisecond)
+	if err := store.ReconcileNode(nodeA, []string{"sbx-1"}, time.Now()); err != nil {
+		t.Fatalf("ReconcileNode: %v", err)
+	}
+	if got := redisRecordedAtMs(t, store, "sbx-1"); got != established {
+		t.Fatalf("a same-owner roster refresh restamped recorded_at_ms from %d to %d", established, got)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	store.Record("sbx-1", nodeB, time.Now())
+	if got := redisRecordedAtMs(t, store, "sbx-1"); got <= established {
+		t.Fatalf("a rebind to another node kept the old stamp %d (got %d)", established, got)
 	}
 }

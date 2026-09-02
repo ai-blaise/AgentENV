@@ -6,7 +6,9 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -198,12 +200,15 @@ func newCutoverTestServer(t *testing.T, client schedulerv1.SchedulerClient) http
 
 // The cutover path is the default for every ordinary sandbox request, and it
 // holds the whole response in memory. Without a ceiling one large upstream
-// body is a memory vector on the busiest path in the process.
+// body is a memory vector on the busiest path in the process. The ceiling is
+// set well below the body here so the overflow is actually exercised.
 func TestALargeResponseIsNotHeldInMemoryByTheCutoverPath(t *testing.T) {
 	const limit = 64 * 1024
 	body := bytes.Repeat([]byte("x"), limit*4)
 
+	var hits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
 	}))
@@ -211,7 +216,7 @@ func TestALargeResponseIsNotHeldInMemoryByTheCutoverPath(t *testing.T) {
 
 	var lookups atomic.Int32
 	client := &countingLookupClient{endpoint: upstream.URL, lookups: &lookups}
-	server := newTestServer(t, client, 5*time.Second, int64(len(body))+1, func(o *ServerOptions) {
+	server := newTestServer(t, client, 5*time.Second, limit, func(o *ServerOptions) {
 		o.BindingCacheTTL = time.Minute
 	})
 	handler := authenticatedTestHandler(server)
@@ -229,6 +234,164 @@ func TestALargeResponseIsNotHeldInMemoryByTheCutoverPath(t *testing.T) {
 	}
 	if recorder.Body.Len() != len(body) {
 		t.Fatalf("body truncated: got %d bytes, want %d", recorder.Body.Len(), len(body))
+	}
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("upstream executed %d times, want 1", got)
+	}
+}
+
+// A response that outgrows the cutover buffer used to be handed back to the
+// direct path, which asked the upstream again — so a POST whose output was
+// large ran twice, and the client learned only the second outcome. The
+// upstream is asked once; what it says is streamed from where the buffer left
+// off, headers and status as captured.
+func TestAnOverflowingResponseIsExecutedUpstreamExactlyOnce(t *testing.T) {
+	const limit = 64 * 1024
+	output := bytes.Repeat([]byte("y"), limit*3)
+
+	var hits atomic.Int32
+	var bodies []string
+	var mu sync.Mutex
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		received, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(received))
+		mu.Unlock()
+		w.Header().Set("X-Upstream-Marker", "ran")
+		w.Header().Set("Content-Length", strconv.Itoa(len(output)))
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write(output)
+	}))
+	defer upstream.Close()
+
+	var lookups atomic.Int32
+	client := &countingLookupClient{endpoint: upstream.URL, lookups: &lookups}
+	server := newTestServer(t, client, 5*time.Second, limit)
+	handler := authenticatedTestHandler(server)
+
+	request := httptest.NewRequest(http.MethodPost, "/append", strings.NewReader("append-one-line"))
+	request.Header.Set(headerSandboxID, "00000000-0000-7000-8000-0000000000dd")
+	request.Header.Set(headerTargetPort, "8000")
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, request)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("upstream executed %d times, want 1; bodies received per execution: %q", got, bodies)
+	}
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want the upstream's 202 as captured", recorder.Code)
+	}
+	if got := recorder.Header().Get("X-Upstream-Marker"); got != "ran" {
+		t.Fatalf("captured headers must be committed with the spill, got marker %q", got)
+	}
+	// The upstream's Content-Length describes the whole stream, and the whole
+	// stream is what the client gets; it must not be rewritten to the prefix.
+	if got := recorder.Header().Get("Content-Length"); got != strconv.Itoa(len(output)) {
+		t.Fatalf("Content-Length = %q, want %d", got, len(output))
+	}
+	if !bytes.Equal(recorder.Body.Bytes(), output) {
+		t.Fatalf("body delivered %d bytes, want the upstream's %d intact", recorder.Body.Len(), len(output))
+	}
+}
+
+// Spilling commits exactly once — status, headers, then the held prefix — and
+// everything after streams through, including headers the proxy adds late.
+func TestASpilledResponseCommitsOnceAndStreamsTheRest(t *testing.T) {
+	sink := httptest.NewRecorder()
+	buffered := newBoundedBufferedResponse(8, sink)
+	buffered.Header().Set("X-Captured", "1")
+	buffered.WriteHeader(http.StatusCreated)
+
+	if _, err := buffered.Write([]byte("12345")); err != nil {
+		t.Fatal(err)
+	}
+	if buffered.spilled || sink.Body.Len() != 0 {
+		t.Fatal("a body within the limit must stay buffered")
+	}
+	if _, err := buffered.Write([]byte("6789")); err != nil {
+		t.Fatal(err)
+	}
+	if !buffered.spilled {
+		t.Fatal("crossing the limit must spill")
+	}
+	if _, err := buffered.Write([]byte("tail")); err != nil {
+		t.Fatal(err)
+	}
+	buffered.Header().Set("X-Late", "trailer")
+	buffered.Flush()
+
+	if sink.Code != http.StatusCreated {
+		t.Fatalf("committed status = %d, want 201", sink.Code)
+	}
+	if sink.Header().Get("X-Captured") != "1" {
+		t.Fatal("captured headers must be committed with the spill")
+	}
+	if got := sink.Body.String(); got != "123456789tail" {
+		t.Fatalf("body = %q, want the prefix then the rest in order", got)
+	}
+	if sink.Header().Get("X-Late") != "trailer" {
+		t.Fatal("headers added after the spill must land on the real writer")
+	}
+	if !sink.Flushed {
+		t.Fatal("a flush after the spill must reach the real writer")
+	}
+}
+
+// A disown on the direct path must invalidate the cached binding no matter how
+// the request named its sandbox. A host-routed request carries the id only in
+// the Host label, so the response side cannot recover it from headers and has
+// to be told.
+func TestADirectPathDisownInvalidatesTheBindingHoweverItWasRouted(t *testing.T) {
+	const domain = "sbx.example.com"
+	for _, tc := range []struct {
+		name    string
+		prepare func(r *http.Request)
+	}{
+		{
+			name: "header-routed",
+			prepare: func(r *http.Request) {
+				r.Header.Set(headerSandboxID, "sandboxa")
+				r.Header.Set(headerTargetPort, "8000")
+			},
+		},
+		{
+			name: "host-routed",
+			prepare: func(r *http.Request) {
+				r.Host = "8000-sandboxa." + domain
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set(headerSandboxDisowned, "1")
+				http.Error(w, "sandbox not found", http.StatusNotFound)
+			}))
+			defer upstream.Close()
+
+			var lookups atomic.Int32
+			client := &countingLookupClient{endpoint: upstream.URL, lookups: &lookups}
+			server := newTestServer(t, client, 5*time.Second, 1<<20,
+				withSandboxProxyDomains(domain),
+				func(o *ServerOptions) { o.BindingCacheTTL = time.Minute },
+			)
+			handler := authenticatedTestHandler(server)
+
+			// Server-sent events are long-lived, which keeps them off the
+			// buffered cutover path and on the direct one.
+			for i := 0; i < 2; i++ {
+				request := httptest.NewRequest(http.MethodGet, "/events", nil)
+				request.Header.Set("Accept", "text/event-stream")
+				tc.prepare(request)
+				handler.ServeHTTP(httptest.NewRecorder(), request)
+			}
+
+			if got := lookups.Load(); got != 2 {
+				t.Fatalf("underlying lookups = %d, want 2: the disown must have dropped the cached binding", got)
+			}
+		})
 	}
 }
 

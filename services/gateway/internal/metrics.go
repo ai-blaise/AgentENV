@@ -23,12 +23,11 @@ var (
 		},
 		[]string{"reason"},
 	)
-	gatewayScheduleRetriesTotal = promauto.NewCounterVec(
+	gatewayScheduleRetriesTotal = promauto.NewCounter(
 		prometheus.CounterOpts{
 			Name: "agentenv_gateway_schedule_retries_total",
-			Help: "Creates re-placed after a node refused them, by refusing node.",
+			Help: "Creates re-placed after a node refused them.",
 		},
-		[]string{"node_id"},
 	)
 	gatewayHTTPDuration = promauto.NewHistogramVec(
 		prometheus.HistogramOpts{
@@ -104,6 +103,8 @@ func (r *statusRecorder) statusCode() int {
 	}
 	return r.status
 }
+
+func (r *statusRecorder) statusWritten() bool { return r.status != 0 }
 
 func (r *statusRecorder) setRouteSource(source routeSource) {
 	r.routeSource = source
@@ -184,6 +185,15 @@ func gatewayMethodLabel(method string) string {
 	}
 }
 
+// statusReporter is what a response writer has to expose for the metrics to
+// label it honestly. The buffered writers on the reschedule and cutover paths
+// implement it too: an attempt a node refused is a 5xx, not "other", and the
+// difference is the whole point of the upstream duration metric.
+type statusReporter interface {
+	statusCode() int
+	statusWritten() bool
+}
+
 // httpStatusLabel derives the status bucket for a recorded response. ctx must
 // be the inbound request context (r.Context()): its cancellation means the
 // client disconnected, not that the gateway timed out (an upstream timeout is
@@ -191,14 +201,14 @@ func gatewayMethodLabel(method string) string {
 // So when no status was written and ctx was cancelled, it reports
 // "client_closed" (nginx-style 499) instead of counting the request as 2xx.
 func httpStatusLabel(w http.ResponseWriter, ctx context.Context) string {
-	recorder, ok := w.(*statusRecorder)
+	reporter, ok := w.(statusReporter)
 	if !ok {
 		return "other"
 	}
-	if recorder.status == 0 && errors.Is(ctx.Err(), context.Canceled) {
+	if !reporter.statusWritten() && errors.Is(ctx.Err(), context.Canceled) {
 		return "client_closed"
 	}
-	status := recorder.statusCode()
+	status := reporter.statusCode()
 	switch {
 	case status >= 100 && status < 200:
 		return "1xx"
@@ -254,8 +264,12 @@ func gatewayRouteLabel(path string) string {
 // recordGatewayScheduleRetry counts creates a node refused and the gateway
 // re-placed. A non-zero rate is the admission gate working; a rate close to
 // the create rate means the fleet is saturated rather than merely unbalanced.
-func recordGatewayScheduleRetry(nodeID string) {
-	gatewayScheduleRetriesTotal.WithLabelValues(nodeID).Inc()
+// Both signals are rates of the whole, so the counter carries no labels: a
+// per-node label would grow one series per refusing node per gateway, fastest
+// during exactly the capacity incident it is meant to explain. Which node
+// refused is in the debug log beside the retry.
+func recordGatewayScheduleRetry() {
+	gatewayScheduleRetriesTotal.Inc()
 }
 
 // recordGatewayRefusal counts creates the gateway refused, by reason. The

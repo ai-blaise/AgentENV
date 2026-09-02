@@ -1,8 +1,12 @@
 package scheduler
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"agentenv/services/shared/config"
 
 	dto "github.com/prometheus/client_model/go"
 )
@@ -329,21 +333,35 @@ func TestReconcileKeepsBindingRecordedAfterRoster(t *testing.T) {
 // TestReconcileGraceDoesNotRestampOnRefresh pins that recordedAt marks when a
 // binding was established, not when it was last refreshed. Restamping on every
 // heartbeat would extend the grace to every deletion, indefinitely.
+//
+// The omission has to land where a correct store and a restamping one
+// disagree. Established at base, the true grace ends at base+10s; refreshed
+// through base+5s, a restamped one would end at base+15s. An omission at
+// base+12s is outside the first and inside the second. Its previous timing,
+// base+16s, was outside both, so a store that restamped passed it too.
 func TestReconcileGraceDoesNotRestampOnRefresh(t *testing.T) {
 	store := NewInMemoryBindingStore(time.Minute)
 	node := Node{ID: "node-a", Endpoint: "http://node-a"}
 	base := time.Unix(500, 0)
+	lastRefresh := base.Add(5 * time.Second)
+	omission := base.Add(defaultReconcileGracePeriod + 2*time.Second)
+	if !omission.After(base.Add(defaultReconcileGracePeriod)) || !omission.Before(lastRefresh.Add(defaultReconcileGracePeriod)) {
+		t.Fatal("the omission must fall outside the true grace and inside the restamped one")
+	}
 
 	store.Record("sbx-1", node, base)
 	// Repeated heartbeats keep the binding alive and in the roster.
 	for i := 1; i <= 5; i++ {
 		store.ReconcileNode(node, []string{"sbx-1"}, base.Add(time.Duration(i)*time.Second))
 	}
+	if got := store.bindings["sbx-1"].recordedAt; !got.Equal(base) {
+		t.Fatalf("a same-owner refresh moved recordedAt from %s to %s", base, got)
+	}
 
 	// The binding was established well outside the grace window, so the first
 	// roster that omits it is authoritative even though it was just refreshed.
-	store.ReconcileNode(node, nil, base.Add(defaultReconcileGracePeriod+6*time.Second))
-	if _, ok, _ := store.Get("sbx-1", base.Add(defaultReconcileGracePeriod+6*time.Second)); ok {
+	store.ReconcileNode(node, nil, omission)
+	if _, ok, _ := store.Get("sbx-1", omission); ok {
 		t.Fatal("refresh restamped recordedAt, so the grace window never expires")
 	}
 }
@@ -504,9 +522,10 @@ func TestValidateReconcileGraceRejectsGraceAtOrPastBindingTTL(t *testing.T) {
 // against, including one retry of the heartbeat that carries the roster.
 func TestValidateReconcileGraceRejectsGraceShorterThanReportingWindow(t *testing.T) {
 	const interval = 5 * time.Second
-	// Written out rather than derived from minReconcileGraceHeartbeats. Deriving
-	// it makes the test agree with whatever the constant says, so weakening the
-	// constant — the direction that removes the protection — keeps it green.
+	// Written out rather than derived from config.MinReconcileGraceHeartbeats.
+	// Deriving it makes the test agree with whatever the constant says, so
+	// weakening the constant — the direction that removes the protection —
+	// keeps it green.
 	const minimum = 10 * time.Second
 
 	if err := ValidateReconcileGrace(time.Minute, minimum-time.Millisecond, interval); err == nil {
@@ -543,15 +562,66 @@ func TestBindingStoreOptionsAcceptShippedDefaults(t *testing.T) {
 	}
 }
 
-// TestNewInMemoryBindingStoreWithOptionsRejectsUnusableGrace covers a caller
-// that lowers the binding TTL and leaves the grace alone, which is how the two
-// end up crossed in practice.
-func TestNewInMemoryBindingStoreWithOptionsRejectsUnusableGrace(t *testing.T) {
-	store, err := NewInMemoryBindingStoreWithOptions(BindingStoreOptions{BindingTTL: 5 * time.Second})
+// TestBindingStoreOptionsDeriveTheGraceFromAShortTTL covers a caller that
+// lowers the binding TTL and leaves the grace alone, which is how the two used
+// to end up crossed: the 10s default was substituted blindly and then refused
+// for reaching a 10s TTL, over a key the caller never set. The grace now
+// follows the TTL down, and only a grace someone actually wrote is refused.
+func TestBindingStoreOptionsDeriveTheGraceFromAShortTTL(t *testing.T) {
+	for _, tc := range []struct {
+		ttl  time.Duration
+		want time.Duration
+	}{
+		{ttl: 30 * time.Second, want: defaultReconcileGracePeriod},
+		{ttl: 20 * time.Second, want: defaultReconcileGracePeriod},
+		{ttl: 10 * time.Second, want: 5 * time.Second},
+		{ttl: 5 * time.Second, want: 2500 * time.Millisecond},
+	} {
+		store, err := NewInMemoryBindingStoreWithOptions(BindingStoreOptions{BindingTTL: tc.ttl})
+		if err != nil {
+			t.Fatalf("a %s binding ttl with the grace unset was refused: %v", tc.ttl, err)
+		}
+		if store.reconcileGrace != tc.want {
+			t.Fatalf("ttl %s: reconcile grace = %s, want %s", tc.ttl, store.reconcileGrace, tc.want)
+		}
+	}
+
+	store, err := NewInMemoryBindingStoreWithOptions(BindingStoreOptions{
+		BindingTTL:     10 * time.Second,
+		ReconcileGrace: 10 * time.Second,
+	})
 	if err == nil {
-		t.Fatalf("a 5s binding ttl with the %s default grace was accepted", defaultReconcileGracePeriod)
+		t.Fatal("an explicit grace equal to the binding ttl was accepted")
 	}
 	if store != nil {
 		t.Fatal("a rejected configuration still returned a store")
+	}
+}
+
+// TestAShortBindingTTLBootsWithoutAnExplicitGrace walks the path the scheduler
+// binary takes: load a config that sets only binding_ttl, then build the store
+// from the same three fields createBindingStore passes. A config that loads
+// but cannot build its store is a crashloop on upgrade, which is what a 10s
+// TTL used to be.
+func TestAShortBindingTTLBootsWithoutAnExplicitGrace(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, []byte(`{"scheduler":{"binding_ttl":"10s"}}`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := config.LoadScheduler(path, false)
+	if err != nil {
+		t.Fatalf("a 10s binding ttl failed to load: %v", err)
+	}
+
+	store, err := NewInMemoryBindingStoreWithOptions(BindingStoreOptions{
+		BindingTTL:        cfg.Scheduler.BindingTTL,
+		ReconcileGrace:    cfg.Scheduler.ReconcileGrace,
+		HeartbeatInterval: cfg.Scheduler.HeartbeatInterval,
+	})
+	if err != nil {
+		t.Fatalf("a config that loaded could not build its store: %v", err)
+	}
+	if store.reconcileGrace != 5*time.Second {
+		t.Fatalf("reconcile grace = %s, want half the 10s ttl", store.reconcileGrace)
 	}
 }

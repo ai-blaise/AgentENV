@@ -129,3 +129,37 @@ func TestSkewNewSchedulerAlwaysAdvertisesDigestSupport(t *testing.T) {
 		t.Fatal("a new scheduler must advertise digest support unconditionally")
 	}
 }
+
+// Completeness protects the empty roster and nothing else. A non-empty roster
+// is reconciled whatever the flag says, because nodes that predate the flag
+// never set it and their departed sandboxes must still be reaped at heartbeat
+// latency rather than binding-TTL latency. The consequence, pinned here so a
+// change to it is a decision rather than an accident: a node that is still
+// discovering what it holds must send an empty roster, never a partial one.
+// The proto and RosterIncomplete both say so.
+func TestNonEmptyIncompleteRosterStillReapsUnlistedBindings(t *testing.T) {
+	service, store := skewService(t)
+
+	seed := readyHeartbeat("node-a")
+	seed.SandboxIds = []string{"s1", "s2", "s3", "s4", "s5"}
+	if _, err := service.Heartbeat(context.Background(), seed); err != nil {
+		t.Fatalf("seed heartbeat: %v", err)
+	}
+
+	partial := readyHeartbeat("node-a")
+	partial.SandboxIds = []string{"s1", "s2"}
+	partial.RosterComplete = false
+	if _, err := service.Heartbeat(context.Background(), partial); err != nil {
+		t.Fatalf("partial heartbeat: %v", err)
+	}
+	for _, sandboxID := range []string{"s1", "s2"} {
+		if _, ok, _ := store.Get(sandboxID, time.Now()); !ok {
+			t.Fatalf("%s was listed and must survive", sandboxID)
+		}
+	}
+	for _, sandboxID := range []string{"s3", "s4", "s5"} {
+		if _, ok, _ := store.Get(sandboxID, time.Now()); ok {
+			t.Fatalf("%s was omitted from a non-empty roster and must be reaped, completeness notwithstanding", sandboxID)
+		}
+	}
+}

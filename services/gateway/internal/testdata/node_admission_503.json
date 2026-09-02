@@ -1,0 +1,12 @@
+{
+  "status": 503,
+  "headers": {
+    "retry-after": "2",
+    "x-agentenv-refusal-reason": "node_at_capacity",
+    "content-type": "application/json"
+  },
+  "body": {
+    "code": 503,
+    "message": "node at capacity (sandbox_count); retry after 2s"
+  }
+}

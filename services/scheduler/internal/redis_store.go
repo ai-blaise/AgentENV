@@ -320,10 +320,8 @@ func (s *RedisBindingStore) RecordBatch(assignments []BindingAssignment, _ time.
 	values := make([]string, len(assignments))
 	for i, assignment := range assignments {
 		sandboxID := strings.TrimSpace(assignment.SandboxID)
-		node := assignment.Node
-		node.ID = strings.TrimSpace(node.ID)
-		node.Endpoint = strings.TrimSpace(node.Endpoint)
-		if sandboxID == "" || node.ID == "" || node.Endpoint == "" {
+		node, ok := normalizeBindingNode(assignment.Node)
+		if sandboxID == "" || !ok {
 			continue
 		}
 		value, err := marshalRedisNode(node)

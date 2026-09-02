@@ -7,8 +7,9 @@ import (
 )
 
 // Reasons a create was refused, sent as a header so a client can tell them
-// apart. All three are 503, but they call for different responses: back off,
-// retry later, or slow down.
+// apart. All are 503, but they call for different responses: back off, retry
+// later, or slow down. The node speaks the same header and vocabulary, so one
+// name covers a refusal wherever it originated.
 const (
 	headerRefusalReason = "x-agentenv-refusal-reason"
 
@@ -19,6 +20,11 @@ const (
 	// already has more creates in flight than it will carry. The fleet may be
 	// fine; the client should slow down.
 	refusalGatewayShed = "gateway_shed"
+	// refusalNodeAtCapacity is the node's, not the gateway's: its admission
+	// gate refused this create. It is the one refusal the gateway answers by
+	// placing elsewhere, so a client sees it only when every attempt ended
+	// that way.
+	refusalNodeAtCapacity = "node_at_capacity"
 )
 
 // defaultMaxInFlightCreates bounds concurrent create placements per gateway.

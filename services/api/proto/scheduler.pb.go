@@ -1485,6 +1485,12 @@ type HeartbeatRequest struct {
 	// once startup recovery has finished; until then the scheduler must not
 	// treat an empty roster as "this node owns nothing" and delete its bindings.
 	//
+	// That is the only protection it gives. A non-empty roster is reconciled
+	// whatever this says: bindings it omits are deleted once past the grace,
+	// because nodes that predate this field never set it and their departed
+	// sandboxes must still be reaped. A node still discovering what it holds
+	// must send an empty roster, never a partial one.
+	//
 	// Absent (false) is the conservative reading, so an older node talking to a
 	// newer scheduler never triggers the wipe.
 	RosterComplete bool `protobuf:"varint,10,opt,name=roster_complete,json=rosterComplete,proto3" json:"roster_complete,omitempty"`

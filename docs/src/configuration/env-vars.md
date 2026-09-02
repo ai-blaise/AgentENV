@@ -104,5 +104,7 @@ These variables apply to both the gateway and scheduler processes.
 | `SCHEDULER_STRATEGY` | `round_robin` | Node selection strategy for new sandboxes: `round_robin` or `random` |
 | `SCHEDULER_REDIS_ADDR` | unset | Redis address for persistent sandbox-to-node bindings (for example, `redis:6379`). Unset = in-memory bindings, lost on scheduler restart. |
 | `SCHEDULER_BINDING_TTL` | `30s` | How long a sandbox-to-node binding is kept without a confirming heartbeat. Accepts Go duration strings (for example, `1m`). |
+| `SCHEDULER_RECONCILE_GRACE` | smaller of `10s` and half `SCHEDULER_BINDING_TTL` | How recently a binding must have been written for a heartbeat reconcile to leave it alone when the node's roster omits it. Must be shorter than the binding TTL. |
+| `SCHEDULER_HEARTBEAT_INTERVAL` | unset | The interval nodes are expected to heartbeat at. Set only to have the TTLs and grace validated against it at startup; unset skips those checks. |
 | `SCHEDULER_ARTIFACT_STORE_CAPACITY` | `1000000` | Maximum number of P2P artifact entries held in the scheduler's in-memory index |
 | `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT` | `0` | Maximum number of nodes checked per P2P artifact lookup. `0` means no limit. |

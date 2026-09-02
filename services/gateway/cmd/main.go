@@ -158,6 +158,8 @@ func main() {
 		QueryOnlySchedulerClient: queryOnlySchedulerClient,
 		MaxIdleConnsPerHost:      cfg.Gateway.MaxIdleConnsPerHost,
 		BindingCacheTTL:          cfg.Gateway.BindingCacheTTL,
+		MaxInFlightCreates:       cfg.Gateway.MaxInFlightCreates,
+		MaxScheduleRetries:       cfg.Gateway.MaxScheduleRetries,
 	})
 	if err != nil {
 		logger.Fatal("init gateway server failed", zap.Error(err))

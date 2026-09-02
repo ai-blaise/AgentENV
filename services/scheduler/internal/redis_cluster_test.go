@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -197,7 +199,7 @@ func startRedisClusterForTest(t *testing.T, masters int) []string {
 	addrs := make([]string, 0, masters)
 	clients := make([]*redis.Client, 0, masters)
 	for i := 0; i < masters; i++ {
-		port := freePort(t)
+		port := freeClusterPort(t)
 		dir := t.TempDir()
 		var output bytes.Buffer
 		cmd := exec.Command(bin,
@@ -226,7 +228,7 @@ func startRedisClusterForTest(t *testing.T, masters int) []string {
 		addr := net.JoinHostPort("127.0.0.1", port)
 		client := redis.NewClient(&redis.Options{Addr: addr})
 		t.Cleanup(func() { _ = client.Close() })
-		waitForRedis(t, client, &output)
+		waitForRedis(t, client, cmd, &output)
 		addrs = append(addrs, addr)
 		clients = append(clients, client)
 	}
@@ -284,21 +286,45 @@ func startRedisClusterForTest(t *testing.T, masters int) []string {
 	}
 }
 
-func freePort(t *testing.T) string {
+// clusterBusPortOffset is the fixed distance Redis puts between a cluster
+// node's client port and its bus port.
+const clusterBusPortOffset = 10000
+
+// freeClusterPort picks a client port whose bus port also fits below 65535
+// and is also free.
+//
+// Asking the kernel for any free port does not work here: on macOS the
+// ephemeral range starts at 49152, so most of what it hands out puts the bus
+// port past the top of the port space and redis-server refuses to start. The
+// port is drawn from a range with room above it and both ends are probed,
+// which leaves the usual bind-and-release window; the caller's readiness wait
+// reports a lost race as a startup failure with the server's own output.
+func freeClusterPort(t *testing.T) string {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("allocate port: %v", err)
+	const low, high = 20000, 40000
+	for attempt := 0; attempt < 50; attempt++ {
+		port := low + rand.Intn(high-low)
+		client, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)))
+		if err != nil {
+			continue
+		}
+		bus, err := net.Listen("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port+clusterBusPortOffset)))
+		_ = client.Close()
+		if err != nil {
+			continue
+		}
+		_ = bus.Close()
+		return strconv.Itoa(port)
 	}
-	defer listener.Close()
-	_, port, err := net.SplitHostPort(listener.Addr().String())
-	if err != nil {
-		t.Fatalf("parse listener addr: %v", err)
-	}
-	return port
+	t.Fatal("no free cluster port pair found")
+	return ""
 }
 
-func waitForRedis(t *testing.T, client *redis.Client, output *bytes.Buffer) {
+// waitForRedis blocks until the server answers PING. On failure the process is
+// reaped before its output is read: exec copies stdout and stderr into the
+// buffer from its own goroutine until Wait returns, so reading earlier races
+// that copy.
+func waitForRedis(t *testing.T, client *redis.Client, cmd *exec.Cmd, output *bytes.Buffer) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
@@ -310,5 +336,9 @@ func waitForRedis(t *testing.T, client *redis.Client, output *bytes.Buffer) {
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
+	_ = cmd.Wait()
 	t.Fatalf("redis-server did not become ready; output: %s", output.String())
 }

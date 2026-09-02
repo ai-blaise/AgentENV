@@ -189,6 +189,18 @@ var (
 	)
 )
 
+// schedulerStaleReportTotal counts heartbeats rejected because the same node
+// process had already had a newer one applied. The usual source is a heartbeat
+// the node gave up on at its deadline that was delivered anyway; a steady rate
+// on one node means its heartbeats regularly outlive that deadline.
+var schedulerStaleReportTotal = promauto.NewCounterVec(
+	prometheus.CounterOpts{
+		Name: "agentenv_scheduler_stale_report_total",
+		Help: "Heartbeats rejected because a newer report from the same node process had already been applied.",
+	},
+	[]string{"node_id"},
+)
+
 // schedulerSandboxEventsLostTotal counts lifecycle events a node reported
 // emitting that never arrived. A persistently non-zero rate means the
 // scheduler's short-term view of that node is running behind reality.

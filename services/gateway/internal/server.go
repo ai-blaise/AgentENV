@@ -60,6 +60,10 @@ type ServerOptions struct {
 	// MaxInFlightCreates bounds concurrent create placements. Zero uses
 	// defaultMaxInFlightCreates.
 	MaxInFlightCreates int
+	// MaxScheduleRetries bounds how many further nodes a create is offered to
+	// after one refuses it. Zero uses defaultMaxScheduleRetries; a negative
+	// value gives every create a single attempt.
+	MaxScheduleRetries int
 }
 
 // defaultMaxIdleConnsPerHost is sized for a gateway fronting a handful of nodes
@@ -93,10 +97,13 @@ type Server struct {
 	bindingCache *CachingSchedulerClient
 	// createLimiter bounds concurrent create placements so a burst cannot
 	// multiply into scheduler load through the reschedule loop.
-	createLimiter  *createLimiter
-	apiKey         []byte
-	requestTimeout time.Duration
-	maxRespSize    int64
+	createLimiter *createLimiter
+	// maxScheduleRetries is how many times one create may be re-placed after a
+	// node refuses it. See defaultMaxScheduleRetries for why it is bounded.
+	maxScheduleRetries int
+	apiKey             []byte
+	requestTimeout     time.Duration
+	maxRespSize        int64
 	// debugMode, when true, enables debug-only behaviors such as exposing
 	// the backend node id on proxied responses via the x-agentenv-node-id
 	// header. Off by default; toggled via GatewayConfig.DebugMode.
@@ -134,6 +141,8 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		},
 		upstreamTransport:   upstreamTransport,
 		bindingCache:        bindingCache,
+		createLimiter:       newCreateLimiter(options.MaxInFlightCreates),
+		maxScheduleRetries:  scheduleRetryBound(options.MaxScheduleRetries),
 		requestTimeout:      options.RequestTimeout,
 		maxRespSize:         options.MaxResponseSize,
 		apiKey:              []byte(options.APIKey),
@@ -275,7 +284,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		node = resp.GetNode()
-	} else {
+	} else if isScheduledCreateRequest(r) {
 		hint, err := buildScheduleHint(r)
 		if err != nil {
 			// this only happens it cannot read request body, so the request cannot continue
@@ -291,8 +300,15 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		// admission decision is authoritative over the scheduler's stale
 		// capacity view, so a rejection must steer the placement rather than
 		// surface as a failure. Everything from here to the upstream call is
-		// therefore run in a loop, bounded by maxScheduleAttempts.
+		// therefore run in a loop, bounded by maxScheduleRetries.
 		s.proxyScheduledCreate(w, r, routingCtx, hint, routeSource, hostRoute, longLived)
+		return
+	} else {
+		// Anything else without a sandbox is management-plane traffic —
+		// templates, snapshots, builds — that merely needs some node. It is
+		// not a create, so it is neither shed nor retried: a 503 to a DELETE
+		// is the node's answer, and re-running the DELETE elsewhere is not.
+		s.proxyManagementRequest(w, r, routingCtx, routeSource, longLived)
 		return
 	}
 
@@ -319,6 +335,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	options := proxyRequestOptions{
 		recordAssignment: shouldRecordAssignment(r, routeSource, hasSandbox),
 		hostRoute:        hostRoute,
+		sandboxID:        sandboxID,
 		flushImmediately: longLived,
 	}
 
@@ -403,7 +420,7 @@ func (s *Server) proxyScheduledCreate(
 			return
 		}
 
-		lastAttempt := attempt+1 >= maxScheduleAttempts || !bodyIsReplayable
+		lastAttempt := attempt >= s.maxScheduleRetries || !bodyIsReplayable
 		upstreamCtx, cancelUpstream := requestContextForProxy(r, routingCtx, longLived)
 		proxyReq := r.Clone(upstreamCtx)
 		if bodyIsReplayable {
@@ -422,22 +439,68 @@ func (s *Server) proxyScheduledCreate(
 			return
 		}
 
-		buffered := newBufferedResponse()
+		// Bounded for the same reason the cutover buffer is: a create response
+		// is small, but the bound is what makes that an assumption the gateway
+		// can survive being wrong about.
+		buffered := newBoundedBufferedResponse(s.maxRespSize, w)
 		s.proxyRequest(buffered, proxyReq, r.Context(), upstreamURL, node, options)
 		cancelUpstream()
 
-		if !retryableRejection(buffered.status) {
+		if buffered.spilled {
+			return
+		}
+		if !retryableRejection(buffered.status, buffered.header) {
 			buffered.replay(w)
 			return
 		}
 
-		recordGatewayScheduleRetry(node.GetNodeId())
+		recordGatewayScheduleRetry()
 		s.logger.Debug("node refused create; rescheduling",
 			zap.String("node_id", node.GetNodeId()),
 			zap.Int("attempt", attempt+1),
 		)
 		excluded = append(excluded, node.GetNodeId())
 	}
+}
+
+// proxyManagementRequest forwards a sandbox-less, non-create request to
+// whichever node the scheduler picks, once.
+//
+// Nothing here is retried. Only a create is safe to offer to a second node
+// after the first said no; a management request that a node refused has been
+// answered, and that answer belongs to the client.
+func (s *Server) proxyManagementRequest(
+	w http.ResponseWriter,
+	r *http.Request,
+	routingCtx context.Context,
+	routeSource routeSource,
+	longLived bool,
+) {
+	rpcStart := time.Now()
+	resp, err := s.scheduler.Schedule(routingCtx, &schedulerv1.ScheduleRequest{})
+	recordGatewaySchedulerRPC("Schedule", rpcStart, err)
+	if err != nil {
+		s.writeSchedulerError(w, err)
+		return
+	}
+	node := resp.GetNode()
+
+	upstreamURL, err := joinUpstream(
+		node.GetEndpoint(),
+		upstreamTargetPath(routeSource, r.URL.Path),
+		upstreamTargetEscapedPath(routeSource, requestEscapedPath(r)),
+		r.URL.RawQuery,
+	)
+	if err != nil {
+		http.Error(w, "invalid upstream endpoint", http.StatusBadGateway)
+		return
+	}
+
+	upstreamCtx, cancelUpstream := requestContextForProxy(r, routingCtx, longLived)
+	defer cancelUpstream()
+	s.proxyRequest(w, r.Clone(upstreamCtx), r.Context(), upstreamURL, node, proxyRequestOptions{
+		flushImmediately: longLived,
+	})
 }
 
 func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
@@ -461,6 +524,11 @@ func (s *Server) writeSchedulerError(w http.ResponseWriter, err error) {
 type proxyRequestOptions struct {
 	recordAssignment bool
 	hostRoute        *hostRoute
+	// sandboxID is the sandbox the request was routed by, however it was
+	// named. A host-routed request carries it only in the Host label and a
+	// control-plane request only in the path, so the response side cannot
+	// recover it from headers.
+	sandboxID        string
 	flushImmediately bool
 	// onDisown fires when the node says it does not have this sandbox, so a
 	// caller that can retry elsewhere knows to.
@@ -518,7 +586,9 @@ func (s *Server) proxyRequest(
 			// returned cost a scheduler round trip; the node now says which it
 			// is, and only a real disown invalidates.
 			if isSandboxDisowned(resp) {
-				if sandboxID, ok := sandboxIDFromHeaders(proxyReq.Header); ok {
+				if options.sandboxID != "" {
+					s.bindingCache.Invalidate(options.sandboxID)
+				} else if sandboxID, ok := sandboxIDFromHeaders(proxyReq.Header); ok {
 					s.bindingCache.Invalidate(sandboxID)
 				}
 				if options.onDisown != nil {
@@ -741,19 +811,32 @@ func flushInterval(flushImmediately bool) time.Duration {
 	return 0
 }
 
-func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
+// isScheduledCreateRequest reports whether a sandbox-less request creates a
+// sandbox. These are the only requests the placement loop is for: the only
+// ones a node may refuse for capacity, and the only ones safe to offer to a
+// second node after the first said no.
+func isScheduledCreateRequest(r *http.Request) bool {
 	if r.Method != http.MethodPost {
 		return false
 	}
-	path := strings.TrimRight(r.URL.Path, "/")
-	if !hasSandbox {
-		return path == "/sandboxes" || path == "/sandboxes-cold"
+	switch strings.TrimRight(r.URL.Path, "/") {
+	case "/sandboxes", "/sandboxes-cold":
+		return true
+	default:
+		return false
 	}
-	if routeSource != routeSourcePath {
+}
+
+func shouldRecordAssignment(r *http.Request, routeSource routeSource, hasSandbox bool) bool {
+	if !hasSandbox {
+		return isScheduledCreateRequest(r)
+	}
+	if r.Method != http.MethodPost || routeSource != routeSourcePath {
 		return false
 	}
 
 	// Fork is routed by the source sandbox but creates child sandbox assignments.
+	path := strings.TrimRight(r.URL.Path, "/")
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	return len(parts) == 3 && parts[0] == "sandboxes" && strings.TrimSpace(parts[1]) != "" && parts[2] == "fork"
 }

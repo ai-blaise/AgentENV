@@ -602,3 +602,197 @@ func TestIncarnationSupersedesTreatsEmptyAsUnknown(t *testing.T) {
 		t.Fatal("an incarnation must not supersede itself")
 	}
 }
+
+// Within one incarnation, reports are ordered by the stamp the node put on
+// them. Arrival order is not send order: a heartbeat the node gave up on at its
+// deadline is still delivered, by which time a newer one may have been applied,
+// and applying the old one afterwards would reconcile a roster the node has
+// moved past.
+func TestHeartbeatRejectsAnOlderReportFromTheSameIncarnation(t *testing.T) {
+	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, 30*time.Second)
+	instance := "0199a000-0000-7000-8000-000000000001"
+	now := time.Unix(100, 0)
+
+	beat := func(instance string, reportedAt int64, count uint32, at time.Time) error {
+		_, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+			NodeId:            "node-a",
+			ClusterId:         "cluster-1",
+			ServiceInstanceId: instance,
+			Snapshot:          &schedulerv1.NodeSnapshot{ReportedAtUnixMs: reportedAt, SandboxCount: count},
+		}, at)
+		return err
+	}
+	count := func() uint32 {
+		return registry.PeekObserved("node-a").GetSandboxCount()
+	}
+
+	if err := beat(instance, 2000, 2, now); err != nil {
+		t.Fatalf("first report: %v", err)
+	}
+	if err := beat(instance, 1000, 999, now); !errors.Is(err, ErrStaleReport) {
+		t.Fatalf("an older report was applied: err = %v", err)
+	}
+	if got := count(); got != 2 {
+		t.Fatalf("the older report overwrote the applied snapshot: count = %d", got)
+	}
+
+	// A retried heartbeat is the same report, not an older one.
+	if err := beat(instance, 2000, 3, now); err != nil {
+		t.Fatalf("a repeated report was refused: %v", err)
+	}
+	if err := beat(instance, 2500, 4, now); err != nil {
+		t.Fatalf("a newer report was refused: %v", err)
+	}
+	if got := count(); got != 4 {
+		t.Fatalf("count = %d, want the newest report's 4", got)
+	}
+
+	// A restart is a new incarnation, and its stamps are not ordered against
+	// the old one's.
+	if err := beat("0199b000-0000-7000-8000-000000000002", 100, 5, now); err != nil {
+		t.Fatalf("a newer incarnation with an older stamp was refused: %v", err)
+	}
+	if got := count(); got != 5 {
+		t.Fatalf("count = %d, want the new incarnation's 5", got)
+	}
+}
+
+// A node that does not stamp its snapshots has nothing to order by and is never
+// refused. The scheduler stamps the view it serves of such a snapshot with its
+// own clock, and that stamp must not be what a later report is measured against.
+func TestHeartbeatOrderingIgnoresUnstampedReports(t *testing.T) {
+	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, 30*time.Second)
+	now := time.Unix(100, 0)
+	beat := func(reportedAt int64) error {
+		_, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+			NodeId:            "node-a",
+			ClusterId:         "cluster-1",
+			ServiceInstanceId: "svc-a",
+			Snapshot:          &schedulerv1.NodeSnapshot{ReportedAtUnixMs: reportedAt},
+		}, now)
+		return err
+	}
+
+	if err := beat(0); err != nil {
+		t.Fatalf("unstamped: %v", err)
+	}
+	if err := beat(0); err != nil {
+		t.Fatalf("unstamped again: %v", err)
+	}
+	// The served view carries the scheduler's stamp, which is far later than
+	// this node-side value; it must not be compared against it.
+	if err := beat(1000); err != nil {
+		t.Fatalf("a stamped report after unstamped ones was refused: %v", err)
+	}
+	if err := beat(0); err != nil {
+		t.Fatalf("an unstamped report after a stamped one was refused: %v", err)
+	}
+}
+
+// The ordering fence lapses with the report TTL. A node whose clock stepped
+// backwards would otherwise be refused for as long as the step, and its
+// bindings would expire under it; once its applied record has gone stale the
+// next report is taken as the new baseline.
+func TestHeartbeatOrderingLapsesWithTheReportTTL(t *testing.T) {
+	const ttl = 30 * time.Second
+	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, ttl)
+	start := time.Unix(100, 0)
+	beat := func(reportedAt int64, at time.Time) error {
+		_, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+			NodeId:            "node-a",
+			ClusterId:         "cluster-1",
+			ServiceInstanceId: "svc-a",
+			Snapshot:          &schedulerv1.NodeSnapshot{ReportedAtUnixMs: reportedAt},
+		}, at)
+		return err
+	}
+
+	if err := beat(2000, start); err != nil {
+		t.Fatalf("first report: %v", err)
+	}
+	if err := beat(1000, start.Add(ttl)); !errors.Is(err, ErrStaleReport) {
+		t.Fatalf("an older report inside the ttl was applied: err = %v", err)
+	}
+	if err := beat(1000, start.Add(ttl+time.Millisecond)); err != nil {
+		t.Fatalf("an older report after the ttl lapsed was still refused: %v", err)
+	}
+}
+
+// Unregister is an incarnation's last word. Deleting its record used to delete
+// the fence with it, so any heartbeat at all re-registered the node — including
+// the departing process's own, still in flight behind the unregister.
+func TestUnregisterFencesTheDepartedIncarnation(t *testing.T) {
+	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL)
+	older := "0199a000-0000-7000-8000-000000000001"
+	newer := "0199b000-0000-7000-8000-000000000002"
+	newest := "0199c000-0000-7000-8000-000000000003"
+	beat := func(instance string) error {
+		_, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+			NodeId:            "node-a",
+			ClusterId:         "cluster-1",
+			ServiceInstanceId: instance,
+			Snapshot:          &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+		}, time.Now())
+		return err
+	}
+
+	if err := beat(newer); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := registry.UnregisterObserved("node-a", newer); err != nil {
+		t.Fatalf("unregister: %v", err)
+	}
+
+	if err := beat(older); !errors.Is(err, ErrStaleIncarnation) {
+		t.Fatalf("a superseded incarnation re-registered after unregister: err = %v", err)
+	}
+	if err := beat(newer); !errors.Is(err, ErrStaleIncarnation) {
+		t.Fatalf("the departed incarnation's own late heartbeat re-registered it: err = %v", err)
+	}
+	if _, health := registry.PeekObservedHealth("node-a"); health.Seen {
+		t.Fatal("a fenced heartbeat left the node observed")
+	}
+
+	// A restart mints a newer incarnation, and that one comes back.
+	if err := beat(newest); err != nil {
+		t.Fatalf("a newer incarnation was locked out after unregister: %v", err)
+	}
+	if got, ok := registry.ObservedIncarnation("node-a"); !ok || got != Incarnation(newest) {
+		t.Fatalf("observed incarnation = %q, %v; want %q", got, ok, newest)
+	}
+	if _, ok := registry.departed["node-a"]; ok {
+		t.Fatal("the fence outlived the incarnation that cleared it")
+	}
+}
+
+// The fence is bounded by fleet size: a node that leaves discovery takes its
+// fence with it, exactly as its observed record goes.
+func TestDiscoveryDroppingANodeDropsItsDepartureFence(t *testing.T) {
+	registry := NewAtomicNodeRegistry([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, defaultObservedReportTTL)
+	older := "0199a000-0000-7000-8000-000000000001"
+	newer := "0199b000-0000-7000-8000-000000000002"
+	beat := func(instance string) error {
+		_, _, err := registry.Heartbeat(&schedulerv1.HeartbeatRequest{
+			NodeId:            "node-a",
+			ClusterId:         "cluster-1",
+			ServiceInstanceId: instance,
+		}, time.Now())
+		return err
+	}
+
+	if err := beat(newer); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := registry.UnregisterObserved("node-a", newer); err != nil {
+		t.Fatalf("unregister: %v", err)
+	}
+	registry.Set(nil, nil)
+	if _, ok := registry.departed["node-a"]; ok {
+		t.Fatal("a node discovery dropped kept its fence")
+	}
+
+	registry.Set([]Node{{ID: "node-a", Endpoint: "http://node-a"}}, nil)
+	if err := beat(older); err != nil {
+		t.Fatalf("a node re-added to discovery was still fenced: %v", err)
+	}
+}

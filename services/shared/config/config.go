@@ -214,6 +214,13 @@ type GatewayConfig struct {
 	// being re-resolved. Zero uses the gateway default; it must stay well below
 	// scheduler.binding_ttl.
 	BindingCacheTTL time.Duration `json:"binding_cache_ttl"`
+	// MaxInFlightCreates bounds concurrent create placements per gateway. Zero
+	// uses the gateway default.
+	MaxInFlightCreates int `json:"max_in_flight_creates"`
+	// MaxScheduleRetries bounds how many further nodes a create is offered to
+	// after one refuses it. Zero uses the gateway default; a negative value
+	// gives every create a single attempt.
+	MaxScheduleRetries int `json:"max_schedule_retries"`
 }
 
 func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
@@ -228,6 +235,8 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		DebugMode              *bool           `json:"debug_mode"`
 		MaxIdleConnsPerHost    *int            `json:"max_idle_conns_per_host"`
 		BindingCacheTTL        json.RawMessage `json:"binding_cache_ttl"`
+		MaxInFlightCreates     *int            `json:"max_in_flight_creates"`
+		MaxScheduleRetries     *int            `json:"max_schedule_retries"`
 	}
 
 	parsed := wire{}
@@ -266,6 +275,12 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.MaxIdleConnsPerHost != nil {
 		g.MaxIdleConnsPerHost = *parsed.MaxIdleConnsPerHost
+	}
+	if parsed.MaxInFlightCreates != nil {
+		g.MaxInFlightCreates = *parsed.MaxInFlightCreates
+	}
+	if parsed.MaxScheduleRetries != nil {
+		g.MaxScheduleRetries = *parsed.MaxScheduleRetries
 	}
 	if len(bytes.TrimSpace(parsed.BindingCacheTTL)) > 0 {
 		d, err := parseSchedulerDuration(parsed.BindingCacheTTL, "gateway.binding_cache_ttl")
@@ -389,12 +404,23 @@ func overrideWithEnv(cfg *Config) error {
 		cfg.Gateway.SandboxProxyDomains = splitCommaSeparated(v)
 	}
 
-	if v := strings.TrimSpace(os.Getenv("SCHEDULER_BINDING_TTL")); v != "" {
+	for _, override := range []struct {
+		key    string
+		target *time.Duration
+	}{
+		{"SCHEDULER_BINDING_TTL", &cfg.Scheduler.BindingTTL},
+		{"SCHEDULER_RECONCILE_GRACE", &cfg.Scheduler.ReconcileGrace},
+		{"SCHEDULER_HEARTBEAT_INTERVAL", &cfg.Scheduler.HeartbeatInterval},
+	} {
+		v := strings.TrimSpace(os.Getenv(override.key))
+		if v == "" {
+			continue
+		}
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return fmt.Errorf("invalid SCHEDULER_BINDING_TTL %q: %w", v, err)
+			return fmt.Errorf("invalid %s %q: %w", override.key, v, err)
 		}
-		cfg.Scheduler.BindingTTL = d
+		*override.target = d
 	}
 
 	if v := strings.TrimSpace(os.Getenv("SCHEDULER_ARTIFACT_STORE_CAPACITY")); v != "" {
@@ -429,6 +455,22 @@ func overrideWithEnv(cfg *Config) error {
 		cfg.Gateway.DebugMode = b
 	}
 
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_MAX_IN_FLIGHT_CREATES")); v != "" {
+		limit, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid GATEWAY_MAX_IN_FLIGHT_CREATES %q: %w", v, err)
+		}
+		cfg.Gateway.MaxInFlightCreates = limit
+	}
+
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_MAX_SCHEDULE_RETRIES")); v != "" {
+		retries, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("invalid GATEWAY_MAX_SCHEDULE_RETRIES %q: %w", v, err)
+		}
+		cfg.Gateway.MaxScheduleRetries = retries
+	}
+
 	return nil
 }
 
@@ -448,10 +490,13 @@ func (c *Config) applyDefaults() {
 	if strings.TrimSpace(c.Scheduler.MetricsListenAddr) == "" {
 		c.Scheduler.MetricsListenAddr = ":9101"
 	}
-	if c.Scheduler.ReportTTL <= 0 {
+	// Exactly zero is unset. A negative duration is an explicit value — the
+	// operator wrote it, or a template rendered it — and is left for validate
+	// to refuse rather than silently replaced with the default.
+	if c.Scheduler.ReportTTL == 0 {
 		c.Scheduler.ReportTTL = 30 * time.Second
 	}
-	if c.Scheduler.BindingTTL <= 0 {
+	if c.Scheduler.BindingTTL == 0 {
 		c.Scheduler.BindingTTL = 30 * time.Second
 	}
 	if strings.TrimSpace(c.Scheduler.Discovery.Mode) == "" {
@@ -497,7 +542,17 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		if c.Scheduler.BindingTTL <= 0 {
 			return errors.New("scheduler.binding_ttl must be greater than zero")
 		}
+		if c.Scheduler.HeartbeatInterval < 0 {
+			return errors.New("scheduler.heartbeat_interval must not be negative")
+		}
 		if err := validateSchedulerTTLOrdering(c.Scheduler); err != nil {
+			return err
+		}
+		// Checked here as well as when the store is built, so a bad relation
+		// is a config error at load time rather than a store failure at
+		// startup — including for a query-only scheduler, which builds the
+		// same store from the same config and never reconciles with it.
+		if _, err := CheckReconcileGrace(c.Scheduler.BindingTTL, c.Scheduler.ReconcileGrace, c.Scheduler.HeartbeatInterval); err != nil {
 			return err
 		}
 		if schedulerQueryOnly {
@@ -574,6 +629,108 @@ func MinTTLForHeartbeatInterval(interval time.Duration) time.Duration {
 		return 0
 	}
 	return time.Duration(minHeartbeatsBeforeExpiry) * interval
+}
+
+// DefaultReconcileGrace is how recently a binding must have been written for a
+// heartbeat reconcile to leave it alone even when the reporting node's roster
+// omits it, when scheduler.reconcile_grace is unset.
+//
+// The window it has to cover is roster collection through heartbeat apply, and
+// it has to cover it with margin rather than merely reach it: a binding one
+// tick older than the grace is deleted while its sandbox is still running, with
+// no migration, no error and nothing in a log. Nothing in the request path can
+// measure that margin, which is why the relations below are checked at load
+// time and again when the store is built, and why every reconcile delete and
+// retention is counted per node.
+const DefaultReconcileGrace = 10 * time.Second
+
+// MinReconcileGraceHeartbeats is the smallest number of reporting intervals a
+// grace period may span.
+//
+// One interval covers a report that lands first time and nothing else. When the
+// report carrying a roster is dropped, the next roster is collected a full
+// interval later, so a binding written just after the first collection is that
+// much older by the time a delete is considered. Two intervals is the smallest
+// bound that still holds across one retry.
+const MinReconcileGraceHeartbeats = 2
+
+// ResolveReconcileGrace returns the grace a store built from these timings
+// runs with: the configured one when set, otherwise the default, capped at
+// half the binding TTL.
+//
+// The cap is what lets a short binding TTL be configured without also writing
+// a grace. Substituting the default blindly made binding_ttl at or below 10s
+// fail the grace-below-TTL relation at startup — over a key the operator had
+// never written — and a deployment that had booted before the relation was
+// checked crashlooped on upgrade. Half the TTL always satisfies that relation.
+// The interval relation is still checked when an interval is configured, and
+// CheckReconcileGrace names the derivation when it is the derived value that
+// fails it.
+func ResolveReconcileGrace(bindingTTL time.Duration, reconcileGrace time.Duration) time.Duration {
+	if reconcileGrace != 0 {
+		return reconcileGrace
+	}
+	if bindingTTL > 0 && bindingTTL/2 < DefaultReconcileGrace {
+		return bindingTTL / 2
+	}
+	return DefaultReconcileGrace
+}
+
+// ValidateReconcileGrace checks the timing relations the grace period depends on
+// but that nothing states or measures.
+//
+// heartbeatInterval is the interval nodes are expected to report at. Zero means
+// no expectation is configured, which is the shipped case, and leaves the
+// grace-versus-interval relation unchecked because there is nothing to check
+// it against.
+func ValidateReconcileGrace(bindingTTL time.Duration, reconcileGrace time.Duration, heartbeatInterval time.Duration) error {
+	if bindingTTL <= 0 {
+		return fmt.Errorf("scheduler.binding_ttl (%s) must be greater than zero", bindingTTL)
+	}
+	if reconcileGrace < 0 {
+		return fmt.Errorf("scheduler.reconcile_grace (%s) must not be negative", reconcileGrace)
+	}
+	if reconcileGrace >= bindingTTL {
+		return fmt.Errorf(
+			"scheduler.reconcile_grace (%s) must be shorter than scheduler.binding_ttl (%s); "+
+				"a grace that reaches the ttl protects a binding for longer than one ttl, "+
+				"so a sandbox created and deleted inside a single ttl can only be reaped by expiry",
+			reconcileGrace, bindingTTL,
+		)
+	}
+	if heartbeatInterval <= 0 {
+		return nil
+	}
+	minimum := time.Duration(MinReconcileGraceHeartbeats) * heartbeatInterval
+	if reconcileGrace < minimum {
+		return fmt.Errorf(
+			"scheduler.reconcile_grace (%s) must be at least %d heartbeat intervals (%s); "+
+				"a shorter grace deletes bindings written while the reporting node was still collecting the roster that omits them",
+			reconcileGrace, MinReconcileGraceHeartbeats, minimum,
+		)
+	}
+	return nil
+}
+
+// CheckReconcileGrace resolves the grace and validates it, and returns the
+// value a store should run with.
+//
+// When the grace was derived rather than written, the error says so and names
+// the derivation: the relation that failed is between two keys the operator
+// set, and an error citing a third they never wrote sends them to the wrong
+// knob.
+func CheckReconcileGrace(bindingTTL time.Duration, reconcileGrace time.Duration, heartbeatInterval time.Duration) (time.Duration, error) {
+	grace := ResolveReconcileGrace(bindingTTL, reconcileGrace)
+	if err := ValidateReconcileGrace(bindingTTL, grace, heartbeatInterval); err != nil {
+		if reconcileGrace == 0 {
+			return 0, fmt.Errorf(
+				"scheduler.reconcile_grace is unset and defaults to %s, the smaller of %s and half of scheduler.binding_ttl: %w",
+				grace, DefaultReconcileGrace, err,
+			)
+		}
+		return 0, err
+	}
+	return grace, nil
 }
 
 // validateSchedulerTTLOrdering checks the timing relations the control plane

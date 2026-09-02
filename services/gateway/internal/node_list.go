@@ -9,6 +9,10 @@ import (
 	schedulerv1 "agentenv/services/api/proto"
 )
 
+// nodeStatusToString renders a scheduler status in the HTTP API's NodeStatus
+// vocabulary (src/api/openapi.yml), which is what a generated client parses.
+// The proto's LINGERING is the API's "draining": the internal name describes
+// the mechanism, the wire name describes what an operator sees.
 func nodeStatusToString(status schedulerv1.NodeStatus) string {
 	switch status {
 	case schedulerv1.NodeStatus_NODE_STATUS_READY:
@@ -17,6 +21,8 @@ func nodeStatusToString(status schedulerv1.NodeStatus) string {
 		return "connecting"
 	case schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY:
 		return "unhealthy"
+	case schedulerv1.NodeStatus_NODE_STATUS_LINGERING:
+		return "draining"
 	default:
 		return "unspecified"
 	}

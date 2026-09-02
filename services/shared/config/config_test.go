@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -662,5 +663,268 @@ func TestValidateSchedulerTTLOrdering(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+func writeSchedulerConfig(t *testing.T, scheduler string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "config.json")
+	content := fmt.Sprintf(`{"scheduler": {%s, "nodes": [{"id": "node-a", "endpoint": "http://node-a:8000"}]}}`, scheduler)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+	return path
+}
+
+// A negative duration is an explicit value, not an absent one. It used to be
+// replaced with the 30s default before validation ran, so validate's
+// greater-than-zero checks were unreachable from a file or the environment and
+// an operator's typo booted a healthy scheduler on numbers the config did not
+// say. Zero stays the unset marker.
+func TestLoadRejectsNegativeSchedulerTTLs(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "binding ttl", body: `"binding_ttl": "-5s"`, want: "scheduler.binding_ttl must be greater than zero"},
+		{name: "report ttl", body: `"report_ttl": "-1h"`, want: "scheduler.report_ttl must be greater than zero"},
+		{name: "reconcile grace", body: `"reconcile_grace": "-1s"`, want: "scheduler.reconcile_grace (-1s) must not be negative"},
+		{name: "heartbeat interval", body: `"heartbeat_interval": "-5s"`, want: "scheduler.heartbeat_interval must not be negative"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(writeSchedulerConfig(t, tc.body), "scheduler")
+			if err == nil {
+				t.Fatal("a negative duration loaded")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want it to contain %q", err, tc.want)
+			}
+		})
+	}
+
+	cfg, err := Load(writeSchedulerConfig(t, `"binding_ttl": "0s"`), "scheduler")
+	if err != nil {
+		t.Fatalf("an explicit zero must still read as unset: %v", err)
+	}
+	if cfg.Scheduler.BindingTTL != 30*time.Second {
+		t.Fatalf("binding ttl = %s, want the 30s default for an explicit zero", cfg.Scheduler.BindingTTL)
+	}
+}
+
+func TestLoadRejectsNegativeSchedulerBindingTTLEnv(t *testing.T) {
+	t.Setenv("SCHEDULER_BINDING_TTL", "-5s")
+
+	_, err := Load("", "scheduler")
+	if err == nil {
+		t.Fatal("a negative SCHEDULER_BINDING_TTL loaded")
+	}
+	if !strings.Contains(err.Error(), "scheduler.binding_ttl must be greater than zero") {
+		t.Fatalf("error = %q, want the greater-than-zero refusal", err)
+	}
+}
+
+// The grace relations used to be checked only when the binding store was built,
+// so a config that passed Load died at startup as a store error, and did so in
+// the query-only scheduler too, which never reconciles. Load checks them now,
+// in both modes, naming the config keys.
+func TestLoadRejectsMisorderedReconcileGrace(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "grace at or past the binding ttl",
+			body: `"binding_ttl": "30s", "reconcile_grace": "40s"`,
+			want: "scheduler.reconcile_grace (40s) must be shorter than scheduler.binding_ttl (30s)",
+		},
+		{
+			name: "grace shorter than two heartbeat intervals",
+			body: `"binding_ttl": "30s", "heartbeat_interval": "5s", "reconcile_grace": "6s"`,
+			want: "scheduler.reconcile_grace (6s) must be at least 2 heartbeat intervals (10s)",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := writeSchedulerConfig(t, tc.body)
+			_, err := LoadScheduler(path, false)
+			if err == nil {
+				t.Fatal("a misordered grace loaded")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %q, want it to contain %q", err, tc.want)
+			}
+
+			queryOnly := writeSchedulerConfig(t, tc.body+`, "redis_addr": "127.0.0.1:6379"`)
+			if _, err := LoadScheduler(queryOnly, true); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("query-only load: err = %v, want it to contain %q", err, tc.want)
+			}
+		})
+	}
+}
+
+// Setting only binding_ttl must load, whatever the value, because the grace
+// follows it down. A 10s TTL with the grace unset used to be refused for
+// reaching the 10s default the operator never wrote.
+func TestLoadDerivesTheReconcileGraceFromAShortBindingTTL(t *testing.T) {
+	cfg, err := LoadScheduler(writeSchedulerConfig(t, `"binding_ttl": "10s"`), false)
+	if err != nil {
+		t.Fatalf("a 10s binding ttl with the grace unset was refused: %v", err)
+	}
+	if cfg.Scheduler.ReconcileGrace != 0 {
+		t.Fatalf("reconcile grace = %s in the loaded config, want it left unset for the store to derive", cfg.Scheduler.ReconcileGrace)
+	}
+	grace, err := CheckReconcileGrace(cfg.Scheduler.BindingTTL, cfg.Scheduler.ReconcileGrace, cfg.Scheduler.HeartbeatInterval)
+	if err != nil {
+		t.Fatalf("the derived grace failed its own check: %v", err)
+	}
+	if grace != 5*time.Second {
+		t.Fatalf("derived grace = %s, want half the ttl", grace)
+	}
+}
+
+func TestResolveReconcileGrace(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		ttl   time.Duration
+		grace time.Duration
+		want  time.Duration
+	}{
+		{name: "explicit grace is kept", ttl: 30 * time.Second, grace: 12 * time.Second, want: 12 * time.Second},
+		{name: "default fits under a long ttl", ttl: 30 * time.Second, want: DefaultReconcileGrace},
+		{name: "default fits exactly at twice its length", ttl: 20 * time.Second, want: DefaultReconcileGrace},
+		{name: "a short ttl halves", ttl: 10 * time.Second, want: 5 * time.Second},
+		{name: "a very short ttl halves", ttl: 3 * time.Second, want: 1500 * time.Millisecond},
+		{name: "an unset ttl takes the default", want: DefaultReconcileGrace},
+		{name: "a negative grace is not unset", ttl: 30 * time.Second, grace: -time.Second, want: -time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ResolveReconcileGrace(tc.ttl, tc.grace); got != tc.want {
+				t.Fatalf("ResolveReconcileGrace(%s, %s) = %s, want %s", tc.ttl, tc.grace, got, tc.want)
+			}
+		})
+	}
+}
+
+// When the grace was derived and the derivation fails the interval relation,
+// the error has to say the grace was derived: the operator wrote binding_ttl
+// and heartbeat_interval, and an error citing a third key sends them to the
+// wrong knob.
+func TestCheckReconcileGraceNamesTheDerivationWhenUnset(t *testing.T) {
+	_, err := CheckReconcileGrace(16*time.Second, 0, 5*time.Second)
+	if err == nil {
+		t.Fatal("an 8s derived grace against a 5s interval was accepted")
+	}
+	for _, want := range []string{
+		"scheduler.reconcile_grace is unset and defaults to 8s",
+		"half of scheduler.binding_ttl",
+		"must be at least 2 heartbeat intervals (10s)",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %q, want it to contain %q", err, want)
+		}
+	}
+
+	_, err = CheckReconcileGrace(16*time.Second, 8*time.Second, 5*time.Second)
+	if err == nil || strings.Contains(err.Error(), "is unset") {
+		t.Fatalf("an explicit grace must be refused as written, got %v", err)
+	}
+}
+
+func TestLoadAppliesSchedulerReconcileGraceAndHeartbeatIntervalEnv(t *testing.T) {
+	t.Setenv("SCHEDULER_RECONCILE_GRACE", "12s")
+	t.Setenv("SCHEDULER_HEARTBEAT_INTERVAL", "5s")
+
+	cfg, err := Load("", "scheduler")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Scheduler.ReconcileGrace != 12*time.Second {
+		t.Fatalf("reconcile grace = %s, want 12s", cfg.Scheduler.ReconcileGrace)
+	}
+	if cfg.Scheduler.HeartbeatInterval != 5*time.Second {
+		t.Fatalf("heartbeat interval = %s, want 5s", cfg.Scheduler.HeartbeatInterval)
+	}
+}
+
+func TestLoadRejectsInvalidSchedulerReconcileGraceEnv(t *testing.T) {
+	t.Setenv("SCHEDULER_RECONCILE_GRACE", "12")
+
+	_, err := Load("", "scheduler")
+	if err == nil || !strings.Contains(err.Error(), "invalid SCHEDULER_RECONCILE_GRACE") {
+		t.Fatalf("err = %v, want the env parse refusal", err)
+	}
+}
+
+func TestLoadRejectsInvalidSchedulerHeartbeatIntervalEnv(t *testing.T) {
+	t.Setenv("SCHEDULER_HEARTBEAT_INTERVAL", "five")
+
+	_, err := Load("", "scheduler")
+	if err == nil || !strings.Contains(err.Error(), "invalid SCHEDULER_HEARTBEAT_INTERVAL") {
+		t.Fatalf("err = %v, want the env parse refusal", err)
+	}
+}
+
+func TestLoadParsesGatewayPlacementBounds(t *testing.T) {
+	tmpDir := t.TempDir()
+	path := filepath.Join(tmpDir, "config.json")
+	content := `{
+		"gateway": {
+			"max_in_flight_creates": 64,
+			"max_schedule_retries": -1
+		}
+	}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+
+	cfg, err := Load(path, "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.MaxInFlightCreates != 64 {
+		t.Fatalf("expected max_in_flight_creates 64, got %d", cfg.Gateway.MaxInFlightCreates)
+	}
+	if cfg.Gateway.MaxScheduleRetries != -1 {
+		t.Fatalf("expected max_schedule_retries -1, got %d", cfg.Gateway.MaxScheduleRetries)
+	}
+}
+
+func TestLoadLeavesGatewayPlacementBoundsUnsetByDefault(t *testing.T) {
+	cfg, err := Load("", "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.MaxInFlightCreates != 0 || cfg.Gateway.MaxScheduleRetries != 0 {
+		t.Fatalf("expected zero (gateway default) bounds, got creates=%d retries=%d",
+			cfg.Gateway.MaxInFlightCreates, cfg.Gateway.MaxScheduleRetries)
+	}
+}
+
+func TestLoadAppliesGatewayPlacementBoundsEnv(t *testing.T) {
+	t.Setenv("GATEWAY_MAX_IN_FLIGHT_CREATES", "128")
+	t.Setenv("GATEWAY_MAX_SCHEDULE_RETRIES", "1")
+
+	cfg, err := Load("", "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.MaxInFlightCreates != 128 {
+		t.Fatalf("expected max_in_flight_creates 128 from env, got %d", cfg.Gateway.MaxInFlightCreates)
+	}
+	if cfg.Gateway.MaxScheduleRetries != 1 {
+		t.Fatalf("expected max_schedule_retries 1 from env, got %d", cfg.Gateway.MaxScheduleRetries)
+	}
+}
+
+func TestLoadRejectsInvalidGatewayPlacementBoundsEnv(t *testing.T) {
+	t.Setenv("GATEWAY_MAX_SCHEDULE_RETRIES", "two")
+	if _, err := Load("", "gateway"); err == nil {
+		t.Fatal("expected load to fail for non-integer GATEWAY_MAX_SCHEDULE_RETRIES")
+	}
+	t.Setenv("GATEWAY_MAX_SCHEDULE_RETRIES", "")
+	t.Setenv("GATEWAY_MAX_IN_FLIGHT_CREATES", "many")
+	if _, err := Load("", "gateway"); err == nil {
+		t.Fatal("expected load to fail for non-integer GATEWAY_MAX_IN_FLIGHT_CREATES")
 	}
 }

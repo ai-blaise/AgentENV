@@ -16,6 +16,12 @@ import (
 // structured fields and then restored so the full body remains available for
 // the upstream request.
 // It only returns error when it's a fatal error and the request cannot be proceeded.
+//
+// The hint is advisory and, today, aspirational: it is carried to the
+// scheduler, but no shipped strategy reads it — placement is not yet aware of
+// the requested cpu, memory or images. It is kept, and its field number is
+// reserved history, so a strategy that does read it can land without a wire
+// change.
 func buildScheduleHint(r *http.Request) (*schedulerv1.ScheduleRequestHint, error) {
 	if r.Method != http.MethodPost {
 		return nil, nil

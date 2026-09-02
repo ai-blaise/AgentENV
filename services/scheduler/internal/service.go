@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +50,9 @@ type Service struct {
 	ttlOrderingWarned *nodeWarnSet
 	// eventLoss turns silently dropped lifecycle event batches into a number.
 	eventLoss *eventLossTracker
+	// nodeLocks serialises the per-node writes a heartbeat or unregister
+	// makes, so they land in the order the registry admitted them.
+	nodeLocks stripedMutex
 	// sweepMu guards lastSweep, which paces the departed-node sweep.
 	sweepMu   sync.Mutex
 	lastSweep time.Time
@@ -313,7 +317,7 @@ func (s *Service) validateAssignment(sandboxID string, protoNode *schedulerv1.No
 			zap.String("node_id", node.ID),
 			zap.String("endpoint", node.Endpoint),
 		)
-		return Node{}, status.Error(codes.InvalidArgument, "node is not in scheduler node list")
+		return Node{}, status.Error(codes.InvalidArgument, NodeNotInRegistryMessage)
 	}
 	return node, nil
 }
@@ -386,21 +390,38 @@ func (s *Service) RecordAssignment(_ context.Context, req *schedulerv1.RecordAss
 	return &schedulerv1.RecordAssignmentResponse{}, nil
 }
 
-func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest) (*schedulerv1.HeartbeatResponse, error) {
+func (s *Service) Heartbeat(ctx context.Context, req *schedulerv1.HeartbeatRequest) (*schedulerv1.HeartbeatResponse, error) {
 	nodeID := strings.TrimSpace(req.GetNodeId())
 	serviceInstanceID := strings.TrimSpace(req.GetServiceInstanceId())
 	if nodeID == "" || serviceInstanceID == "" {
 		return nil, status.Error(codes.InvalidArgument, "node_id and service_instance_id are required")
 	}
 
+	// The registry decides which of a node's reports is newest; the lock makes
+	// the store see them in that order. Without it two heartbeats can both be
+	// admitted and then reconcile in the other order, applying a roster the
+	// node has already moved past. Unregister takes the same lock for the
+	// same reason.
+	unlock := s.nodeLocks.lock(nodeID)
+	defer unlock()
+
+	// A caller that has already given up is not waiting for this, and a
+	// heartbeat it timed out on is by now the older of two reports. The
+	// registry orders those on their own stamp regardless; this only saves
+	// applying one that is known to be abandoned.
+	if err := ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+
 	now := time.Now()
+	previous, seen := s.nodes.ObservedIncarnation(nodeID)
 	node, cpuConfigJSON, err := s.nodes.Heartbeat(req, now)
 	if err != nil {
 		if errors.Is(err, ErrNodeNotInRegistry) {
 			s.logger.Warn("scheduler rejected observed registration for unknown node",
 				zap.String("node_id", nodeID),
 			)
-			return nil, status.Error(codes.InvalidArgument, "node is not in scheduler node list")
+			return nil, status.Error(codes.InvalidArgument, NodeNotInRegistryMessage)
 		}
 		if errors.Is(err, ErrStaleIncarnation) {
 			// A live node retrying will send its current incarnation and
@@ -412,11 +433,32 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 			schedulerStaleIncarnationTotal.WithLabelValues(nodeID).Inc()
 			return nil, status.Error(codes.FailedPrecondition, "service instance has been superseded")
 		}
+		if errors.Is(err, ErrStaleReport) {
+			// A newer report from this same process has already been applied,
+			// so this one has nothing to add and a stale roster to subtract.
+			// It is almost always a heartbeat the node gave up on at its
+			// deadline, so nothing is listening for the reply. A node that is
+			// listening resends in full on any failure, which is the right
+			// response.
+			s.logger.Debug("scheduler rejected a heartbeat older than the one already applied",
+				zap.String("node_id", nodeID),
+				zap.Int64("reported_at_unix_ms", req.GetSnapshot().GetReportedAtUnixMs()),
+			)
+			schedulerStaleReportTotal.WithLabelValues(nodeID).Inc()
+			return nil, status.Error(codes.FailedPrecondition, "a newer report from this service instance has already been applied")
+		}
 		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
 	}
 	// The heartbeat is the authoritative count, so anything the ledger was
 	// carrying for this node is now either included in it or lost.
 	s.ledger.Reset(nodeID)
+	// A new incarnation counts its events from zero. The tracker also infers a
+	// restart from a total that went backwards, but a process that emits more
+	// than its predecessor did before its first heartbeat would not be caught
+	// that way, and the credit left behind would mask real loss.
+	if seen && previous != Incarnation(serviceInstanceID) {
+		s.eventLoss.restarted(nodeID)
+	}
 
 	s.pruneDepartedNodes()
 
@@ -580,6 +622,26 @@ func (s *Service) resolveRoster(
 	return cached, RosterIncomplete, false
 }
 
+// heartbeatStripes is how many locks per-node writes are spread across. A
+// collision only serialises two nodes' heartbeats that happened to overlap,
+// which costs a store round trip, and the array is fixed so there is nothing to
+// sweep when nodes leave.
+const heartbeatStripes = 256
+
+// stripedMutex hands out a mutex per key, with a bounded number of mutexes.
+type stripedMutex struct {
+	locks [heartbeatStripes]sync.Mutex
+}
+
+// lock acquires the stripe for key and returns the matching unlock.
+func (m *stripedMutex) lock(key string) func() {
+	hash := fnv.New32a()
+	hash.Write([]byte(key))
+	stripe := &m.locks[hash.Sum32()%heartbeatStripes]
+	stripe.Lock()
+	return stripe.Unlock
+}
+
 // nodeWarnSet remembers which nodes a condition has already been reported for.
 //
 // The conditions it guards are configuration rather than events: once true for
@@ -667,13 +729,32 @@ func (s *Service) ReportSandboxEvent(_ context.Context, req *schedulerv1.ReportS
 	if nodeID == "" {
 		return nil, status.Error(codes.InvalidArgument, "node_id is required")
 	}
-	// Only nodes the scheduler knows about may move its placement view.
+	// Only nodes the scheduler knows about may move its placement view. The
+	// batch is lost either way — the node's sender has no requeue — but an
+	// error is something its log shows and an operator can act on, where the
+	// success this used to answer with was indistinguishable from delivery.
 	if _, known := s.nodes.Resolve(nodeID); !known {
-		s.logger.Debug("scheduler ignored sandbox events from unknown node",
+		s.logger.Debug("scheduler rejected sandbox events from unknown node",
 			zap.String("node_id", nodeID),
 			zap.Int("event_count", len(req.GetEvents())),
 		)
-		return &schedulerv1.ReportSandboxEventResponse{}, nil
+		return nil, status.Error(codes.InvalidArgument, NodeNotInRegistryMessage)
+	}
+	// The same fence Heartbeat and UnregisterNode apply: a batch from a
+	// process that has since been replaced describes sandboxes the live
+	// process's next heartbeat already accounts for, and folding it in
+	// over-counts the node until that heartbeat resets the ledger. A newer
+	// incarnation than the one on record passes — its first heartbeat may
+	// simply not have arrived yet — as does a node that reports none.
+	incoming := Incarnation(strings.TrimSpace(req.GetServiceInstanceId()))
+	if current, seen := s.nodes.ObservedIncarnation(nodeID); seen && current.Supersedes(incoming) {
+		s.logger.Debug("scheduler rejected sandbox events from a superseded node process",
+			zap.String("node_id", nodeID),
+			zap.String("service_instance_id", string(incoming)),
+			zap.Int("event_count", len(req.GetEvents())),
+		)
+		schedulerStaleIncarnationTotal.WithLabelValues(nodeID).Inc()
+		return nil, status.Error(codes.FailedPrecondition, "service instance has been superseded")
 	}
 
 	s.ledger.Apply(nodeID, req.GetEvents(), time.Now())
@@ -730,7 +811,7 @@ func (s *Service) RecordP2PArtifact(_ context.Context, req *schedulerv1.RecordP2
 		return nil, status.Error(codes.InvalidArgument, "cluster_id, backend, key, and node_id are required")
 	}
 	if _, ok := s.nodes.Resolve(req.GetNodeId()); !ok {
-		return nil, status.Error(codes.InvalidArgument, "node is not in scheduler node list")
+		return nil, status.Error(codes.InvalidArgument, NodeNotInRegistryMessage)
 	}
 
 	s.artifacts.Record(req.GetClusterId(), req.GetBackend(), req.GetKey(), req.GetNodeId())
@@ -794,6 +875,9 @@ func (s *Service) UnregisterNode(_ context.Context, req *schedulerv1.UnregisterN
 	if nodeID == "" || serviceInstanceID == "" {
 		return nil, status.Error(codes.InvalidArgument, "node_id and service_instance_id are required")
 	}
+
+	unlock := s.nodeLocks.lock(nodeID)
+	defer unlock()
 
 	unregisterErr := s.nodes.UnregisterObserved(nodeID, serviceInstanceID)
 	if unregisterErr != nil {

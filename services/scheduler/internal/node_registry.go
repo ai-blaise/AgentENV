@@ -30,6 +30,9 @@ type NodeRegistry interface {
 	// PeekObservedHealth returns the same snapshot alongside the liveness facts
 	// scheduling needs to decide whether the node should receive new work.
 	PeekObservedHealth(nodeID string) (*schedulerv1.NodeSnapshot, ObservedHealth)
+	// ObservedIncarnation returns the incarnation of the process last heard
+	// from for a node, and whether one has been heard from at all.
+	ObservedIncarnation(nodeID string) (Incarnation, bool)
 	// SampleNodes returns at most `size` schedulable nodes without
 	// materializing the whole fleet. Zero means no bound.
 	SampleNodes(size int, allowLingering bool) []Node
@@ -39,24 +42,47 @@ type NodeRegistry interface {
 var (
 	ErrServiceInstanceMismatch = errors.New("service instance mismatch")
 	// ErrStaleIncarnation rejects a report from a node process that has since
-	// been replaced.
-	ErrStaleIncarnation      = errors.New("node reported a superseded service instance")
-	ErrNodeNotInRegistry     = errors.New("node is not in scheduler node list")
+	// been replaced, or that has already unregistered.
+	ErrStaleIncarnation = errors.New("node reported a superseded service instance")
+	// ErrStaleReport rejects a heartbeat the live node process collected before
+	// one the scheduler has already applied.
+	ErrStaleReport           = errors.New("node reported a snapshot older than the one already applied")
+	ErrNodeNotInRegistry     = errors.New(NodeNotInRegistryMessage)
 	defaultObservedReportTTL = 30 * time.Second
 )
+
+// NodeNotInRegistryMessage is the wire text, sent with codes.InvalidArgument,
+// for a request that names a node id the scheduler's node list does not hold.
+//
+// It is a cross-language contract rather than a log line. The node's reporter,
+// src/observability/reporter.rs, substring-matches it on a rejected heartbeat
+// to raise an error-level log that names AENV_NODE_ID as the knob to check;
+// any other wording degrades that to a generic warning with nothing failing on
+// either side. Every RPC that rejects an unknown node returns this exact
+// string, and TestUnknownNodeRejectionCarriesTheWireMessage pins it.
+const NodeNotInRegistryMessage = "node is not in scheduler node list"
 
 type observedNodeRecord struct {
 	node        *schedulerv1.ObservedNode
 	p2pEndpoint *schedulerv1.P2PEndpoint
 	reportTTL   time.Duration
+	// reportedAtMs is the node's own stamp on the applied snapshot, kept as
+	// sent. The view stamps an unstamped snapshot with the scheduler's clock
+	// for its readers; ordering reports against that would compare two clocks.
+	reportedAtMs int64
 }
 
 type AtomicNodeRegistry struct {
-	mu               sync.RWMutex
-	nodesByID        map[string]Node
-	lingeringIDs     map[string]bool
-	observedTTL      time.Duration
-	observed         map[string]observedNodeRecord
+	mu           sync.RWMutex
+	nodesByID    map[string]Node
+	lingeringIDs map[string]bool
+	observedTTL  time.Duration
+	observed     map[string]observedNodeRecord
+	// departed keeps the incarnation each node last unregistered with, so the
+	// fence on superseded processes outlives the record it used to live on.
+	// An entry is dropped when a strictly newer incarnation registers or when
+	// discovery stops listing the node, so the map is bounded by fleet size.
+	departed         map[string]Incarnation
 	cpuIntersection  map[string]string
 	intersectionSent map[string]bool
 }
@@ -72,6 +98,7 @@ func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeR
 		lingeringIDs:     make(map[string]bool),
 		observedTTL:      ttl,
 		observed:         make(map[string]observedNodeRecord),
+		departed:         make(map[string]Incarnation),
 		cpuIntersection:  make(map[string]string),
 		intersectionSent: make(map[string]bool),
 	}
@@ -179,6 +206,11 @@ func (r *AtomicNodeRegistry) Set(active []Node, lingering []Node) {
 		delete(r.observed, nodeID)
 		delete(r.intersectionSent, nodeID)
 	}
+	for nodeID := range r.departed {
+		if _, ok := byID[nodeID]; !ok {
+			delete(r.departed, nodeID)
+		}
+	}
 	for clusterID := range affectedClusters {
 		r.invalidateIntersectionLocked(clusterID)
 	}
@@ -197,6 +229,7 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 	}
 
 	prevCPU, existed := "", false
+	incoming := Incarnation(strings.TrimSpace(req.GetServiceInstanceId()))
 	if prev, ok := r.observed[req.GetNodeId()]; ok {
 		existed = true
 		// A node process that has already been replaced must not be able to
@@ -206,16 +239,21 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 		//
 		// Equal or unknown incarnations pass: a node that does not report one
 		// must not be locked out, and re-reporting the same one is the normal
-		// case.
-		incoming := Incarnation(strings.TrimSpace(req.GetServiceInstanceId()))
+		// case. Within the same incarnation the reports themselves are then
+		// ordered, so the normal case cannot run backwards either.
 		current := Incarnation(strings.TrimSpace(prev.node.GetServiceInstanceId()))
 		if current.Supersedes(incoming) {
 			return Node{}, "", ErrStaleIncarnation
+		}
+		if current == incoming && r.reportPredatesApplied(prev, req.GetSnapshot(), nowMs) {
+			return Node{}, "", ErrStaleReport
 		}
 		prevCPU = prev.node.GetMachineInfo().GetCpuConfigJson()
 		if machineInfo != nil && machineInfo.CpuConfigJson == "" {
 			machineInfo.CpuConfigJson = prevCPU
 		}
+	} else if tombstone, ok := r.departed[req.GetNodeId()]; ok && fencedByDeparture(tombstone, incoming) {
+		return Node{}, "", ErrStaleIncarnation
 	}
 
 	record := observedNodeRecord{
@@ -230,8 +268,9 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 			LastSeenUnixMs:    nowMs,
 			Snapshot:          cloneSnapshot(req.GetSnapshot()),
 		},
-		p2pEndpoint: cloneP2PEndpoint(req.GetP2PEndpoint()),
-		reportTTL:   r.observedTTL,
+		p2pEndpoint:  cloneP2PEndpoint(req.GetP2PEndpoint()),
+		reportTTL:    r.observedTTL,
+		reportedAtMs: req.GetSnapshot().GetReportedAtUnixMs(),
 	}
 	if record.node.Snapshot.GetReportedAtUnixMs() == 0 {
 		record.node.Snapshot.ReportedAtUnixMs = nowMs
@@ -241,6 +280,7 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 	}
 
 	r.observed[req.GetNodeId()] = record
+	delete(r.departed, req.GetNodeId())
 
 	clusterID := req.GetClusterId()
 	if !existed || (machineInfo != nil && machineInfo.GetCpuConfigJson() != prevCPU) {
@@ -267,6 +307,51 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 		return node, intersection, nil
 	}
 	return node, "", nil
+}
+
+// reportPredatesApplied reports whether a heartbeat from the live process was
+// collected before the one already applied for it.
+//
+// Arrival order is not send order. A heartbeat the node gave up on at its
+// deadline is still delivered and still executed, by which time the node may
+// have sent, and had applied, a newer one. Applying the old one afterwards
+// reconciles a roster the node has moved past — deleting every binding it did
+// not list once past the grace — and caches that roster under its digest for
+// the next elided round. Nothing downstream can tell; only the order here can.
+//
+// The node stamps reported_at_unix_ms when it collects the snapshot, so two
+// reports from one process order by it without comparing clocks across
+// machines, which is the one comparison the rest of this file refuses to make.
+// Zero on either side is a node that does not stamp, and passes. Equal passes:
+// a retried heartbeat is the same report, not an older one.
+//
+// The fence holds only while the applied record is inside the report TTL. A
+// node whose clock stepped backwards would otherwise be refused for as long as
+// the step, and its bindings would expire under it; letting the fence lapse
+// with the record bounds that to one TTL, after which the next report is taken
+// as the new baseline.
+func (r *AtomicNodeRegistry) reportPredatesApplied(prev observedNodeRecord, snapshot *schedulerv1.NodeSnapshot, nowMs int64) bool {
+	incoming := snapshot.GetReportedAtUnixMs()
+	applied := prev.reportedAtMs
+	if incoming == 0 || applied == 0 || incoming >= applied {
+		return false
+	}
+	return nowMs-prev.node.GetLastSeenUnixMs() <= r.observedTTL.Milliseconds()
+}
+
+// fencedByDeparture reports whether an incarnation is locked out by the
+// tombstone its node left on unregister.
+//
+// Unregister is an incarnation's last word, so its own late heartbeat must not
+// resurrect it any more than an older process's may: equal is rejected here
+// where the live fence lets it through. Only a strictly newer incarnation comes
+// back, which is what a restarted node mints. An unknown incarnation on either
+// side cannot be ordered and is never locked out.
+func fencedByDeparture(tombstone Incarnation, incoming Incarnation) bool {
+	if tombstone == "" || incoming == "" {
+		return false
+	}
+	return !incoming.Supersedes(tombstone)
 }
 
 func (r *AtomicNodeRegistry) invalidateIntersectionLocked(clusterID string) {
@@ -444,6 +529,18 @@ func (r *AtomicNodeRegistry) PeekObservedHealth(nodeID string) (*schedulerv1.Nod
 	return cloneSnapshot(snapshot), health
 }
 
+// ObservedIncarnation returns the incarnation of the process last heard from
+// for a node, and whether one has been heard from at all.
+func (r *AtomicNodeRegistry) ObservedIncarnation(nodeID string) (Incarnation, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	record, ok := r.observed[nodeID]
+	if !ok {
+		return "", false
+	}
+	return Incarnation(strings.TrimSpace(record.node.GetServiceInstanceId())), true
+}
+
 func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -458,6 +555,14 @@ func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID
 
 	clusterID := record.node.GetClusterId()
 	delete(r.observed, nodeID)
+	// The record goes, the fence stays. Heartbeat only compares incarnations
+	// against a record, so deleting the record alone reopened the node to any
+	// heartbeat at all — including the departing process's own, still in
+	// flight behind this call, which would re-register a node that has just
+	// said it is gone and re-upsert every binding it just had wiped.
+	if incarnation := Incarnation(strings.TrimSpace(record.node.GetServiceInstanceId())); incarnation != "" {
+		r.departed[nodeID] = incarnation
+	}
 	r.invalidateIntersectionLocked(clusterID)
 	return nil
 }

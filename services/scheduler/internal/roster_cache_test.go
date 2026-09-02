@@ -129,7 +129,8 @@ func TestAHeartbeatWithoutADigestIsAuthoritativeAsBefore(t *testing.T) {
 }
 
 // A node that comes back must be asked for a fresh roster rather than
-// reconciled against what it had before it left.
+// reconciled against what it had before it left. It comes back as a new
+// process, so with a newer incarnation: the one that unregistered is fenced.
 func TestUnregisterForgetsTheCachedRoster(t *testing.T) {
 	service, _ := rosterService(t)
 	roster := []string{"sandbox-1"}
@@ -145,7 +146,9 @@ func TestUnregisterForgetsTheCachedRoster(t *testing.T) {
 		t.Fatalf("unregister: %v", err)
 	}
 
-	response, err := service.Heartbeat(context.Background(), rosterHeartbeat("node-a", digest, nil, false))
+	returned := rosterHeartbeat("node-a", digest, nil, false)
+	returned.ServiceInstanceId = "instance-2"
+	response, err := service.Heartbeat(context.Background(), returned)
 	if err != nil {
 		t.Fatalf("heartbeat after unregister: %v", err)
 	}

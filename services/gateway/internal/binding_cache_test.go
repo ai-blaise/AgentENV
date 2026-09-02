@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -158,5 +159,57 @@ func TestBindingCacheIsBounded(t *testing.T) {
 	cache.mu.Unlock()
 	if size > cache.maxEntries {
 		t.Fatalf("cache holds %d entries, want at most %d", size, cache.maxEntries)
+	}
+}
+
+// A fill reads the scheduler outside the lock, so a lookup that began before
+// a disown can deliver its answer after the invalidation. Installing it would
+// put the binding that was just thrown out back for a full TTL, which is
+// exactly what Invalidate promises does not happen.
+func TestBindingCacheDeclinesAFillThatStraddlesAnInvalidation(t *testing.T) {
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int64
+	delegate := stubSchedulerClient{
+		lookupNodeFunc: func(_ context.Context, _ *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			if calls.Add(1) == 1 {
+				// The answer computed before the move, delivered after it.
+				close(entered)
+				<-release
+				return &schedulerv1.LookupNodeResponse{Node: &schedulerv1.Node{NodeId: "node-old"}}, nil
+			}
+			return &schedulerv1.LookupNodeResponse{Node: &schedulerv1.Node{NodeId: "node-new"}}, nil
+		},
+	}
+	cache := NewCachingSchedulerClient(delegate, time.Minute)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _ = lookup(t, cache, "sbx-1")
+	}()
+	<-entered
+	cache.Invalidate("sbx-1")
+	close(release)
+	wg.Wait()
+
+	resp, err := lookup(t, cache, "sbx-1")
+	if err != nil {
+		t.Fatalf("LookupNode: %v", err)
+	}
+	if got := resp.GetNode().GetNodeId(); got != "node-new" {
+		t.Fatalf("served %q after the invalidation, want a fresh re-resolve to node-new", got)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("scheduler called %d times, want 2: the stale fill must not have been installed", got)
+	}
+
+	// And the fresh answer, which did not straddle anything, is cached.
+	if _, err := lookup(t, cache, "sbx-1"); err != nil {
+		t.Fatalf("LookupNode: %v", err)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("scheduler called %d times, want the fresh fill served from cache", got)
 	}
 }

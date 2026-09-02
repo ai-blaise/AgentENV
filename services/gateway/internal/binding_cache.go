@@ -48,8 +48,14 @@ type CachingSchedulerClient struct {
 	// rather pay the scheduler round trip than ever serve a stale binding.
 	disabled bool
 
-	mu          sync.Mutex
-	entries     map[string]bindingCacheEntry
+	mu      sync.Mutex
+	entries map[string]bindingCacheEntry
+	// gen advances on every Invalidate. A fill reads the scheduler outside the
+	// lock, so a lookup that began before a disown can deliver its answer
+	// after the invalidation and re-install the binding that was just thrown
+	// out. Each fill remembers the generation it started under and declines
+	// to install if that has moved.
+	gen         uint64
 	ttl         time.Duration
 	negativeTTL time.Duration
 	maxEntries  int
@@ -92,7 +98,8 @@ func (c *CachingSchedulerClient) LookupNode(
 		return c.SchedulerClient.LookupNode(ctx, req, opts...)
 	}
 
-	if entry, ok := c.lookup(sandboxID); ok {
+	entry, ok, startGen := c.lookup(sandboxID)
+	if ok {
 		if !entry.found {
 			return nil, status.Error(codes.NotFound, "sandbox assignment not found")
 		}
@@ -106,12 +113,12 @@ func (c *CachingSchedulerClient) LookupNode(
 			node:      resp.GetNode(),
 			found:     true,
 			expiresAt: c.now().Add(c.ttl),
-		})
+		}, startGen)
 	case status.Code(err) == codes.NotFound:
 		c.store(sandboxID, bindingCacheEntry{
 			found:     false,
 			expiresAt: c.now().Add(c.negativeTTL),
-		})
+		}, startGen)
 	default:
 		// Transport and store failures say nothing about the binding, so
 		// caching them would turn a scheduler blip into a routing outage that
@@ -132,26 +139,36 @@ func (c *CachingSchedulerClient) Invalidate(sandboxID string) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.gen++
 	delete(c.entries, sandboxID)
 }
 
-func (c *CachingSchedulerClient) lookup(sandboxID string) (bindingCacheEntry, bool) {
+// lookup returns the live entry for sandboxID, and the invalidation generation
+// a fill for a miss must be stored under.
+func (c *CachingSchedulerClient) lookup(sandboxID string) (bindingCacheEntry, bool, uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	entry, ok := c.entries[sandboxID]
 	if !ok {
-		return bindingCacheEntry{}, false
+		return bindingCacheEntry{}, false, c.gen
 	}
 	if !entry.expiresAt.After(c.now()) {
 		delete(c.entries, sandboxID)
-		return bindingCacheEntry{}, false
+		return bindingCacheEntry{}, false, c.gen
 	}
-	return entry, true
+	return entry, true, c.gen
 }
 
-func (c *CachingSchedulerClient) store(sandboxID string, entry bindingCacheEntry) {
+// store installs a fill that began under startGen. One cache-wide generation
+// is enough because invalidations only fire on disowns, which are rare; the
+// cost of a coincident fill declining is one more scheduler round trip on the
+// next request, and declining is always safe.
+func (c *CachingSchedulerClient) store(sandboxID string, entry bindingCacheEntry, startGen uint64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.gen != startGen {
+		return
+	}
 	if len(c.entries) >= c.maxEntries {
 		c.evictExpiredLocked()
 		// Still full of live entries: skip caching rather than grow without

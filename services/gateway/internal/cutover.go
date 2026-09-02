@@ -79,6 +79,12 @@ func (s *Server) resolveAfterCutover(
 // upload cannot be replayed. Those keep the direct path, where a disown still
 // invalidates the cache — the next request lands correctly, this one does not.
 //
+// The decision to decline is made before the upstream is asked. Once a request
+// has been issued it is never issued again by anyone: a response that outgrows
+// the buffer is streamed to the client from where it stands, forfeiting the
+// cutover for that one response rather than re-running work the node has
+// already done.
+//
 // Reports whether it handled the request.
 func (s *Server) proxyWithCutover(
 	w http.ResponseWriter,
@@ -117,18 +123,19 @@ func (s *Server) proxyWithCutover(
 
 		// Bounded: this is the default path for every ordinary sandbox
 		// request, and an unbounded buffer here means one large upstream
-		// response is a memory vector.
-		buffered := newBoundedBufferedResponse(s.maxRespSize)
+		// response is a memory vector. Past the bound the response spills to
+		// the client rather than being dropped.
+		buffered := newBoundedBufferedResponse(s.maxRespSize, w)
 		disowned := false
 		attemptOptions := options
 		attemptOptions.onDisown = func() { disowned = true }
 		s.proxyRequest(buffered, attemptReq, r.Context(), upstreamURL, current, attemptOptions)
 
-		if buffered.overflowed {
-			// Too large to have held, so there is nothing to replay. Hand the
-			// request back to the direct path, which streams it: correctness
-			// beats following a cutover for a response this size.
-			return false
+		if buffered.spilled {
+			// Already the client's. There is nothing left to decide, and in
+			// particular nothing to hand back to the direct path: the upstream
+			// has executed this request once, which is the only time it may.
+			return true
 		}
 		if !disowned || attempt >= maxCutoverRetries {
 			buffered.replay(w)
