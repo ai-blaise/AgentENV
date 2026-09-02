@@ -9,6 +9,8 @@ resources:
   - role.yaml
   - rolebinding.yaml
   - scheduler-service.yaml
+  - scheduler-headless-service.yaml
+  - redis.yaml
   - scheduler-deployment.yaml
   - gateway-service.yaml
   - gateway-deployment.yaml

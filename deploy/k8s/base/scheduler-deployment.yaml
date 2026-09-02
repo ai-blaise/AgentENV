@@ -5,7 +5,12 @@ metadata:
   labels:
     app.kubernetes.io/name: agentenv-scheduler
 spec:
-  replicas: 1
+  # Safe above one only because the schedulers share the state they used to
+  # each own privately: node capacity and liveness arrive on the Redis node
+  # stream (`node_stream_enabled`), and bindings and paused-sandbox ownership
+  # live in the Redis binding store (`redis_addr`). Without both, a second
+  # replica schedules against its own partial view of the fleet.
+  replicas: 2
   selector:
     matchLabels:
       app.kubernetes.io/name: agentenv-scheduler
@@ -24,6 +29,8 @@ spec:
           args:
             - -config
             - /config/scheduler.json
+            - -mode
+            - replica
           ports:
             - name: grpc
               containerPort: 9090

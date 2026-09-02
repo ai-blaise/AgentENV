@@ -1,0 +1,28 @@
+# Headless companion to agentenv-scheduler.
+#
+# The gateway load-balances scheduler RPCs client-side with round_robin, which
+# spreads over whatever the resolver names. A ClusterIP service names exactly
+# one address -- its VIP -- so round_robin over it is round_robin over one
+# subchannel, and every gateway stays pinned to whichever pod kube-proxy chose.
+# A headless service resolves to every ready pod IP, which is what makes the
+# tier actually scale and what makes losing one replica invisible to clients.
+#
+# The ClusterIP service stays for callers that want a stable VIP and do not
+# balance themselves.
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentenv-scheduler-headless
+  labels:
+    app.kubernetes.io/name: agentenv-scheduler
+spec:
+  clusterIP: None
+  # Named pods must be resolvable before they pass readiness, or a rolling
+  # update would resolve to nothing at the moment every pod is restarting.
+  publishNotReadyAddresses: false
+  selector:
+    app.kubernetes.io/name: agentenv-scheduler
+  ports:
+    - name: grpc
+      port: 9090
+      targetPort: grpc

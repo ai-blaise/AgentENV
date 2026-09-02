@@ -1,0 +1,28 @@
+# Node configuration for the Kubernetes deployment.
+#
+# Deliberately short. `AppConfig` layers environment over file over struct
+# defaults, so anything absent here keeps the shipped default and anything the
+# DaemonSet sets as an environment variable wins over this file. Only settings
+# that are wrong by default *inside the container* belong here.
+#
+# The DaemonSet already sets, and this file must not restate: AENV_NODE_ID,
+# API_ADDR, AENV_VIRTUALIZATION_MODE, AENV_OBSERVABILITY_SCHEDULER_ENDPOINT,
+# AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED, and the ublk daemon paths.
+
+# The host's /var/lib/aenv is mounted at /workspace, so the default home_path of
+# /var/lib/aenv would point at a path inside the container image rather than at
+# the volume -- every sandbox artifact, image layer and paused record would be
+# written to the container's writable layer and lost when the pod restarted.
+home_path = "/workspace"
+
+# [cluster].scheduler_endpoint is not set here on purpose:
+# AENV_OBSERVABILITY_SCHEDULER_ENDPOINT carries it, and confique takes the
+# environment over this file, so naming it here would be a second source of
+# truth for one setting.
+
+[p2p]
+# Off, matching the shipped default. Turning it on in a cluster is the
+# intended end state, but W6 §10 gates that flip on measurements that have not
+# been run; and note that a clustered node now refuses to start if the facade
+# cannot come up, so this is not a flag to flip untested.
+enabled = false

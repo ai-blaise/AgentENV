@@ -1,0 +1,85 @@
+# Shared scheduler state: the binding store and the node stream.
+#
+# Deliberately one ephemeral instance with no persistence. Everything kept here
+# is derived and self-healing on a timescale the system already tolerates:
+# bindings carry a TTL and are rebuilt from the next heartbeat roster reconcile,
+# and the node stream is a bounded `MAXLEN ~` ring whose entries are replaced by
+# the following heartbeat. Losing it costs a reconcile window, not correctness.
+#
+# What it does cost is availability: while it is down, replicas cannot share
+# state, so scheduling degrades to each replica's own view. A deployment that
+# cares should replace this with a real Redis and point `scheduler.redis_addr`
+# at it -- that is the only edit required, on both counts.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentenv-redis
+  labels:
+    app.kubernetes.io/name: agentenv-redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentenv-redis
+  strategy:
+    # Never two Redis pods answering the same Service: a second one would serve
+    # an empty binding store to whichever scheduler resolved to it.
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentenv-redis
+    spec:
+      nodeSelector:
+        kubernetes.io/os: linux
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          args:
+            # No RDB or AOF: persisting derived state buys nothing and a slow
+            # fork on a large keyspace would stall the scheduler's writes.
+            - --save
+            - ""
+            - --appendonly
+            - "no"
+            # Bindings and stream shards are bounded, but an operator raising
+            # binding_ttl or the stream MAXLEN should hit a wall rather than the
+            # node's OOM killer.
+            - --maxmemory
+            - 512mb
+            - --maxmemory-policy
+            - allkeys-lru
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 2
+            periodSeconds: 10
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 640Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentenv-redis
+  labels:
+    app.kubernetes.io/name: agentenv-redis
+spec:
+  selector:
+    app.kubernetes.io/name: agentenv-redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis

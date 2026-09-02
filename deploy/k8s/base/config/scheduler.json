@@ -12,6 +12,8 @@
         "port": 8000,
         "scheme": "http"
       }
-    }
+    },
+    "redis_addr": "agentenv-redis:6379",
+    "node_stream_enabled": true
   }
 }

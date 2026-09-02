@@ -123,6 +123,8 @@ test-unit:
 	bash scripts/tests/verify-capability-runner.sh
 	bash scripts/tests/verify-install-service.sh
 	bash scripts/tests/verify-prestop-drain.sh
+	bash scripts/tests/verify-scheduler-replicas.sh
+	bash scripts/tests/verify-k8s-manifests.sh
 
 test-integration: test-agent-integration test-envd test-ublk
 
