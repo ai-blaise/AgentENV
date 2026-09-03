@@ -256,11 +256,25 @@ impl UblkDeviceManager {
 
     /// Get the global manager instance.
     ///
-    /// Panics if [`init_global`] has not been called.
+    /// Panics if [`init_global`] has not been called. Correct on the guest
+    /// path, which cannot be reached without a manager; use
+    /// [`Self::global_if_initialized`] anywhere that also runs on a node which
+    /// never made one.
     pub fn global() -> &'static Self {
         GLOBAL_MANAGER
             .get()
             .expect("UblkDeviceManager::init_global() must be called before global()")
+    }
+
+    /// The global manager, or `None` on a node that never initialised one.
+    ///
+    /// A mock node starts no guest, so `server.rs` initialises the manager only
+    /// for the Firecracker backend. Shutdown runs on every node, and reaching
+    /// for [`Self::global`] there panicked the shutdown task on a mock node --
+    /// taking the P2P runtime and transport teardown that follows it with it,
+    /// which leaves the catalog's RocksDB lock held.
+    pub fn global_if_initialized() -> Option<&'static Self> {
+        GLOBAL_MANAGER.get()
     }
 
     /// Returns `true` while the node can serve ublk-backed storage.

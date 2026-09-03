@@ -10,7 +10,9 @@
 #   scripts/tests/smoke/mock_node.sh [path/to/server] [port]
 set -euo pipefail
 
-SERVER_BIN="${1:-target/debug/server}"
+# Honours CARGO_TARGET_DIR: the repo's own build harness sets it, and a
+# hard-coded target/debug is why this could not run there at all.
+SERVER_BIN="${1:-${SERVER_BIN:-${CARGO_TARGET_DIR:-target}/debug/server}}"
 PORT="${2:-19000}"
 SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/aenv-mock-smoke.XXXXXX")"
 trap 'kill "${PID:-}" 2>/dev/null || true; rm -rf "$SCRATCH"' EXIT
@@ -60,4 +62,40 @@ for rail in 'sandbox backend is "mock"' 'building a MOCK sandbox' 'image resolve
   grep -q "$rail" "$SCRATCH/server.log" || { echo "missing safety rail in log: $rail" >&2; exit 1; }
 done
 
-echo "mock node OK: sandbox $sandbox_id created and listed; all safety rails logged"
+# Shutdown, because a mock node is the configuration where it broke. The ublk
+# manager is initialised only for the Firecracker backend, and the shutdown path
+# reached for it unconditionally: on every mock node SIGTERM panicked the
+# shutdown task, and the P2P runtime and transport teardown below it never ran,
+# leaving the catalog's RocksDB lock held. The process still went away, so
+# nothing upstream noticed -- the drain and preStop work this repo ships assumes
+# a node stops cleanly, and on a mock node it did not.
+kill -TERM "$PID"
+for _ in $(seq 1 30); do
+  kill -0 "$PID" 2>/dev/null || break
+  sleep 1
+done
+if kill -0 "$PID" 2>/dev/null; then
+  echo "server did not exit within 30s of SIGTERM" >&2
+  exit 1
+fi
+wait "$PID" 2>/dev/null; shutdown_code=$?
+PID=""
+
+if grep -q "panicked" "$SCRATCH/server.log"; then
+  echo "a task panicked during shutdown:" >&2
+  grep -A2 "panicked" "$SCRATCH/server.log" >&2
+  exit 1
+fi
+[ "$shutdown_code" = "0" ] || {
+  echo "server exited $shutdown_code on SIGTERM, want 0" >&2
+  tail -20 "$SCRATCH/server.log" >&2
+  exit 1
+}
+# The last teardown step, so its absence means shutdown stopped early.
+grep -q "shutting down p2p transport" "$SCRATCH/server.log" || {
+  echo "shutdown did not reach the p2p transport; something above it aborted" >&2
+  grep -i "shutting down" "$SCRATCH/server.log" >&2
+  exit 1
+}
+
+echo "mock node OK: sandbox $sandbox_id created and listed; all safety rails logged; clean shutdown"

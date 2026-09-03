@@ -296,9 +296,14 @@ async fn main() -> anyhow::Result<()> {
                     warn!(target: "agentenv", error = %err, "error occurred while shutting down firecracker pool");
                 }
             }
-            info!(target: "agentenv", "shutting down ublk daemon");
-            if let Err(err) = UblkDeviceManager::global().shutdown_daemon().await {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down ublk daemon");
+            // Only a Firecracker node has one -- the initialisation above is
+            // gated the same way. Reaching for it unconditionally panicked this
+            // task on every mock node, and everything below here never ran.
+            if let Some(ublk) = UblkDeviceManager::global_if_initialized() {
+                info!(target: "agentenv", "shutting down ublk daemon");
+                if let Err(err) = ublk.shutdown_daemon().await {
+                    warn!(target: "agentenv", error = %err, "error occurred while shutting down ublk daemon");
+                }
             }
             info!(target: "agentenv", "shutting down overlaybd p2p runtime");
             if let Err(err) = overlaybd_p2p.shutdown().await {
