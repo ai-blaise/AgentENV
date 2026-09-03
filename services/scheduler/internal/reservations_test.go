@@ -305,3 +305,61 @@ func TestLedgerValveFollowsTheReportTTL(t *testing.T) {
 		t.Fatalf("ledger clamp = %d, want the configured 9", service.ledger.maxDelta)
 	}
 }
+
+// A replica that does not own a node's heartbeat still settles its ledger.
+//
+// `TrimBefore` runs only in the Heartbeat handler, and a node's connection is
+// sticky to one replica. The other replica places on that node and reserves,
+// but the node's state reaches it over the node-state stream, which carries no
+// roster and no event counts and so never reaches the ledger. Its reservations
+// could then only die at the ledger TTL, while the streamed snapshot already
+// counted the sandboxes they describe -- so it folded phantoms on top, saw
+// capacity that did not exist, and filtered the node out of its own candidate
+// sets while the owning replica placed on it happily.
+//
+// Settling in `ApplyTo` against the snapshot's own `reported_at_unix_ms` is
+// what fixes it: anything the node reported at or before that stamp is already
+// in the snapshot.
+func TestApplyToSettlesReservationsAgainstTheSnapshotsOwnStamp(t *testing.T) {
+	ledger := NewReservationLedger(time.Minute)
+	placed := time.Unix(10_000, 0)
+
+	// Two placements this replica made and never saw a heartbeat for.
+	ledger.Reserve("node-a", 2, 1<<30, placed)
+	ledger.Reserve("node-a", 2, 1<<30, placed)
+
+	// The node's own snapshot, stamped after both placements and already
+	// counting them, arriving over the stream rather than over Heartbeat.
+	snapshot := baseSnapshot(10, 8, 4<<30)
+	snapshot.ReportedAtUnixMs = placed.Add(time.Second).UnixMilli()
+
+	got := ledger.ApplyTo("node-a", snapshot, placed.Add(2*time.Second))
+
+	if got.GetSandboxCount() != 10 {
+		t.Fatalf("sandbox count = %d, want 10: reservations the snapshot already "+
+			"counts were folded on top of it", got.GetSandboxCount())
+	}
+	if got.GetAllocatedCpu() != 8 || got.GetAllocatedMemoryBytes() != 4<<30 {
+		t.Fatalf("cpu = %d memory = %d, want 8 and 4 GiB: phantom resources on a node "+
+			"that has none", got.GetAllocatedCpu(), got.GetAllocatedMemoryBytes())
+	}
+}
+
+// A placement newer than the snapshot is still counted, or the settle above
+// would throw away the reservations it exists to keep.
+func TestApplyToKeepsReservationsNewerThanTheSnapshot(t *testing.T) {
+	ledger := NewReservationLedger(time.Minute)
+	reported := time.Unix(10_000, 0)
+
+	snapshot := baseSnapshot(10, 8, 4<<30)
+	snapshot.ReportedAtUnixMs = reported.UnixMilli()
+
+	// Placed after the node took its snapshot, so it cannot be in it.
+	ledger.Reserve("node-a", 2, 1<<30, reported.Add(time.Second))
+
+	got := ledger.ApplyTo("node-a", snapshot, reported.Add(2*time.Second))
+	if got.GetSandboxCount() != 11 {
+		t.Fatalf("sandbox count = %d, want 11: a placement the node has not reported "+
+			"yet must still be counted", got.GetSandboxCount())
+	}
+}

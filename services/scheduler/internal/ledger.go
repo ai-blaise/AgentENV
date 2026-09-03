@@ -256,6 +256,21 @@ func (l *ReservationLedger) TrimBefore(nodeID string, cutoff time.Time) int64 {
 	if !ok {
 		return 0
 	}
+	drift := l.trimLocked(node, cutoff)
+	if node.empty() {
+		delete(l.byNodeID, nodeID)
+	}
+	return drift
+}
+
+// trimLocked drops everything a node reported at or before `cutoff`, returning
+// how far the ledger had drifted from what the node itself says.
+//
+// Split out of TrimBefore so ApplyTo can settle against a snapshot that arrived
+// over the node-state stream rather than over this replica's own Heartbeat.
+// Does not remove an emptied node from the map: ApplyTo still needs to read its
+// total afterwards.
+func (l *ReservationLedger) trimLocked(node *nodeLedger, cutoff time.Time) int64 {
 	before := node.total().sandboxCount
 
 	kept := 0
@@ -280,9 +295,6 @@ func (l *ReservationLedger) TrimBefore(nodeID string, cutoff time.Time) int64 {
 	node.reservations = node.reservations[:kept]
 
 	drift := before - node.total().sandboxCount
-	if node.empty() {
-		delete(l.byNodeID, nodeID)
-	}
 	if drift < 0 {
 		drift = -drift
 	}
@@ -335,6 +347,22 @@ func (l *ReservationLedger) ApplyTo(
 	}
 
 	l.mu.Lock()
+	// Settle against the snapshot before folding onto it.
+	//
+	// A reservation is a placement this scheduler made that the node has not
+	// reported yet, so anything older than the snapshot's own timestamp is
+	// already counted in it and adding it again is a phantom. `TrimBefore`
+	// does this from the Heartbeat handler, but a node's connection is sticky
+	// to one replica: the other replica places on that node and reserves, and
+	// its snapshots arrive over the node-state stream, which carries no roster
+	// and no event counts and so never reaches the ledger. Its reservations
+	// could only die at the ledger TTL, and until then it saw capacity that did
+	// not exist and filtered the node out of its own candidate sets.
+	if reportedAt := snapshot.GetReportedAtUnixMs(); reportedAt > 0 {
+		if node, ok := l.byNodeID[nodeID]; ok {
+			l.trimLocked(node, time.UnixMilli(reportedAt))
+		}
+	}
 	node, ok := l.byNodeID[nodeID]
 	var applied nodeDelta
 	if ok {

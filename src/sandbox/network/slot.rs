@@ -1744,6 +1744,12 @@ mod tests {
         assert_eq!(std::mem::size_of::<TunSetIffRequest>(), 40);
 
         let request = tun_set_iff_request("tap0").expect("tap0 fits IFNAMSIZ");
+        // `c_char` is `i8` on x86_64 and `u8` on aarch64, so this cast
+        // reinterprets on one target and is a no-op on the other. clippy only
+        // ever sees the target it is running for, and calls it redundant on
+        // aarch64 -- which is why the gate was green on the x86_64 build host
+        // and red on an arm64 one.
+        #[allow(clippy::unnecessary_cast)]
         let name: Vec<u8> = request.name.iter().map(|byte| *byte as u8).collect();
         assert_eq!(&name[..4], b"tap0");
         assert!(

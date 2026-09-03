@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
 use futures::stream::StreamExt;
+use futures::FutureExt;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
@@ -21,8 +22,8 @@ use crate::sandbox::{
     CheckpointStats, CustomExtensionClient, CustomExtensionParams, EnvdAccessToken,
     FirecrackerPausedState, FirecrackerSandboxFactory, FirecrackerSnapshotManifest,
     FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet, SandboxAccessTokenGenerator,
-    SandboxBackend, SandboxBackendFactory, SandboxForkSpec, SandboxLaunchConfig,
-    SandboxNetworkPolicy, SandboxRuntimeInfo,
+    SandboxBackend, SandboxBackendFactory, SandboxCaptureError, SandboxForkSpec,
+    SandboxLaunchConfig, SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
@@ -54,6 +55,16 @@ type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
 /// more than that means something is re-claiming faster than the caller can
 /// win, and erroring is more useful than waiting.
 const CAPTURE_WAIT_ATTEMPTS: usize = 3;
+
+/// How long one speculative checkpoint may hold its sandbox.
+///
+/// The whole point of a checkpoint is that it is short -- it freezes a running
+/// guest -- so anything near this is already pathological. It exists because
+/// nothing underneath it has a deadline: every Firecracker API call goes
+/// through a client with no request, connect or read timeout, so an
+/// unresponsive VMM parks the caller permanently and takes the sandbox's state
+/// claim with it.
+const CHECKPOINT_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -1298,7 +1309,28 @@ where
         let outcome = match handle {
             Some(handle) => {
                 let mut sandbox = handle.lock().await;
-                sandbox.checkpoint().await
+                // Bounded, and caught. Every Firecracker API call underneath
+                // this goes through a hyper client with no timeout of any kind,
+                // so a VMM that stops answering its socket parks the call for
+                // good -- and this task holds the claim. Without both guards the
+                // restore below is unreachable, the sandbox stays
+                // `Snapshotting`, and nothing clears it: delete waits out
+                // `WAIT_TRANSITION_TIMEOUT` and returns InvalidSandboxState,
+                // pause, snapshot and fork exhaust the capture wait and do the
+                // same. The pattern is `run_memory_control_pass`'s, which bounds
+                // its backend call for this reason.
+                let checkpoint = std::panic::AssertUnwindSafe(sandbox.checkpoint());
+                match tokio::time::timeout(CHECKPOINT_CALL_TIMEOUT, checkpoint.catch_unwind()).await
+                {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(_)) => Err(SandboxCaptureError::recoverable(anyhow::anyhow!(
+                        "the backend panicked during a speculative checkpoint"
+                    ))),
+                    Err(_) => Err(SandboxCaptureError::recoverable(anyhow::anyhow!(
+                        "speculative checkpoint did not finish within {}ms",
+                        CHECKPOINT_CALL_TIMEOUT.as_millis()
+                    ))),
+                }
             }
             None => Ok(CheckpointStats::default()),
         };
@@ -1381,8 +1413,13 @@ where
 
         let mut checkpointed = 0;
         while let Some(joined) = tasks.join_next().await {
-            if matches!(joined, Ok(Some(()))) {
-                checkpointed += 1;
+            match joined {
+                Ok(Some(())) => checkpointed += 1,
+                Ok(None) => {}
+                // A task that panicked outside the guard above, or was aborted.
+                // Reported rather than discarded: its sandbox may still hold the
+                // claim, and silence here is what made that invisible.
+                Err(err) => warn!("a speculative checkpoint task did not finish: {err}"),
             }
         }
         Ok(checkpointed)
