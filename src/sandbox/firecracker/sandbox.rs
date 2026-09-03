@@ -204,6 +204,21 @@ pub struct FirecrackerSandbox {
     /// deliberately is not `mem_snapshot_image_config_path`, which is the ublk
     /// device key and must keep pointing at the image backing the *live* VM.
     mem_snapshot_parent_config_path: Option<PathBuf>,
+    /// The checkpoint directory the next successful capture makes redundant.
+    ///
+    /// A capture adopts its parent's runtime layers into its own directory --
+    /// hard-linked where the filesystem allows and copied otherwise -- and
+    /// rewrites every lower to the new location, so once it succeeds the
+    /// previous checkpoint's directory is referenced by nothing. The live guest
+    /// never read it either: it is still mapping the memory device it booted
+    /// against, which is `mem_snapshot_image_config_path`.
+    ///
+    /// Without this, a sandbox checkpointed on a timer grows its snapshot root
+    /// by one dirty-set delta per interval for its whole life, and the only
+    /// thing that ever reclaimed it was the sandbox dying. Only directories
+    /// this path created are tracked, so a pause's own artifacts are never a
+    /// candidate.
+    superseded_checkpoint_dir: Option<PathBuf>,
     /// Memory-control devices this VM was observed to have, probed once the
     /// VM is live. All-false until then, and all-false forever for a VM that
     /// has none — see [`MemoryControlCapability`].
@@ -722,6 +737,10 @@ impl FirecrackerSandbox {
         match snapshot_result {
             Ok(snapshot) => {
                 self.record_capture_as_chain_parent(&snapshot.0);
+                // The capture adopted whatever the last checkpoint left, so its
+                // directory is spent. Only on the success arm: a failed capture
+                // resumes in place and the next one still diffs against it.
+                self.retire_superseded_checkpoint().await;
                 Ok(snapshot)
             }
             Err(err) => {
@@ -793,10 +812,36 @@ impl FirecrackerSandbox {
         let (mem_image_config_path, layer_bytes) = captured;
         // Only now: the next capture must diff against a layer that exists.
         self.mem_snapshot_parent_config_path = Some(mem_image_config_path);
+        // This checkpoint adopted the previous one's layers, so that directory
+        // is now unreferenced. Retired after the parent pointer moves, never
+        // before: a removal that raced the write it supersedes would take the
+        // layers the new config just linked.
+        self.retire_superseded_checkpoint().await;
+        self.superseded_checkpoint_dir = Some(checkpoint_dir);
         Ok(CheckpointStats {
             layer_bytes,
             freeze,
         })
+    }
+
+    /// Removes the checkpoint directory the latest capture made redundant.
+    ///
+    /// Best effort. A directory left behind costs disk until the sandbox exits
+    /// and its root guard drops; failing the capture over it would trade a
+    /// bounded leak for a lost checkpoint.
+    async fn retire_superseded_checkpoint(&mut self) {
+        let Some(directory) = self.superseded_checkpoint_dir.take() else {
+            return;
+        };
+        if let Err(error) = tokio::fs::remove_dir_all(&directory).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    directory = %directory.display(),
+                    error = %error,
+                    "failed to remove a superseded checkpoint directory"
+                );
+            }
+        }
     }
 
     /// Writes the memory layer and its image config, returning the config path.
@@ -1541,6 +1586,7 @@ impl FirecrackerSandbox {
             mem_ublk_device: None,
             mem_snapshot_image_config_path: None,
             mem_snapshot_parent_config_path,
+            superseded_checkpoint_dir: None,
             mem_control: MemoryControlCapability::default(),
             rootfs_image_config_path: None,
             extra_drive_runtimes: Vec::new(),

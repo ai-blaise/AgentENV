@@ -68,6 +68,27 @@ grep -qE '^[[:space:]]*-[[:space:]]*redis\.yaml[[:space:]]*$' "$kustomization" \
 grep -qE '^[[:space:]]*-[[:space:]]*replica[[:space:]]*$' "$deployment" \
   || fail "the deployment must pass -mode replica; without it node_stream_enabled's default is off"
 
+# The readiness gate publishes fitness only on the named gRPC service, leaving
+# the overall status SERVING so liveness never restarts the tier for a Redis
+# outage. A probe without -service reads that always-SERVING status, so every
+# pod is Ready from process start and the gate does nothing -- silently, and
+# only at more than one replica.
+grep -qE '^[[:space:]]*-[[:space:]]*-service=scheduler\.v1\.Scheduler[[:space:]]*$' "$deployment" \
+  || fail "the readinessProbe must pass -service=scheduler.v1.Scheduler, or the readiness gate is inert"
+python3 - "$deployment" <<'PY_INNER' || exit 1
+import re, sys
+text = open(sys.argv[1]).read()
+readiness = re.search(r'readinessProbe:(.*?)(?=\n {10}[a-zA-Z]|\Z)', text, re.S)
+liveness = re.search(r'livenessProbe:(.*?)(?=\n {10}[a-zA-Z]|\Z)', text, re.S)
+if not readiness or '-service=scheduler.v1.Scheduler' not in readiness.group(1):
+    print("FAIL: -service=scheduler.v1.Scheduler is not inside the readinessProbe", file=sys.stderr)
+    sys.exit(1)
+if liveness and '-service=' in liveness.group(1):
+    print("FAIL: the livenessProbe names a service; gating liveness on fitness restarts the "
+          "whole tier for one Redis outage", file=sys.stderr)
+    sys.exit(1)
+PY_INNER
+
 # round_robin balances over whatever the resolver names, and a ClusterIP service
 # names exactly one address. Dialing it pins every gateway to one pod, so the
 # tier scales and no traffic moves.

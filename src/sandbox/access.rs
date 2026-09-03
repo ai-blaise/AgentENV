@@ -59,16 +59,22 @@ impl SandboxAccessTokenGenerator {
         let seed = resolve_seed(&managed_seed_path, managed_seed_must_exist)?;
 
         // A managed seed is generated per node, so tokens minted on one node
-        // verify nowhere else. Standalone that is invisible; clustered it means
-        // no paused sandbox is portable -- the artifact moves, the token that
-        // opens it does not, and the failure surfaces as an opaque 401 on the
-        // node that adopted it rather than at the node that was misconfigured.
-        // A warning was not enough: nothing downstream can recover from it.
-        if config.cluster.scheduler_endpoint.is_some() {
+        // verify nowhere else. That only matters where a sandbox can move: the
+        // artifact travels, the token that opens it does not, and the failure
+        // surfaces as an opaque 401 on the node that adopted it rather than at
+        // the node that was misconfigured. Nothing downstream recovers from it,
+        // so it is refused at startup where an operator can still act.
+        //
+        // Both conditions, not just the cluster. A clustered node with mobility
+        // off never verifies another node's token, and refusing on the cluster
+        // alone rejected every deployment this repository ships -- none of them
+        // enables mobility, and none of them supplies a seed.
+        if config.cluster.scheduler_endpoint.is_some() && config.snapshot.mobility.enabled {
             bail!(
-                "sandbox access-token seed is node-local ({}) but this node is clustered; \
-                 set AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED to the same value on every node, \
-                 otherwise a sandbox paused on one node cannot be resumed on another",
+                "sandbox access-token seed is node-local ({}) but this node is clustered with \
+                 [snapshot.mobility] enabled; set AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED to the same \
+                 value on every node, otherwise a sandbox paused on one node cannot be resumed on \
+                 another",
                 managed_seed_path.display()
             );
         }
@@ -263,15 +269,16 @@ mod tests {
     /// it is a sandbox that can be paused and never resumed, so the refusal is
     /// at startup where the operator can still act on it.
     #[test]
-    fn a_clustered_node_refuses_a_node_local_seed() -> Result<()> {
+    fn a_clustered_node_with_mobility_refuses_a_node_local_seed() -> Result<()> {
         let temp = TempDir::new()?;
-        let config = AppConfig {
+        let mut config = AppConfig {
             home_path: temp.path().to_owned(),
             cluster: crate::cfg::ClusterConfig {
                 scheduler_endpoint: Some("http://scheduler:9000".to_owned()),
             },
             ..Default::default()
         };
+        config.snapshot.mobility.enabled = true;
 
         let err = SandboxAccessTokenGenerator::load_or_create(&config, false)
             .expect_err("a clustered node accepted a seed only it can verify");
@@ -280,6 +287,34 @@ mod tests {
             message.contains("AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED"),
             "the refusal must name the variable that fixes it, said {message:?}"
         );
+        Ok(())
+    }
+
+    /// A clustered node that cannot move a sandbox does not need a shared seed.
+    ///
+    /// This is the case the first version of the rule got wrong. Every clustered
+    /// artifact in this repository -- the compose stack, the k8s default
+    /// overlay, the fleet template, the fault-injection scripts -- sets a
+    /// scheduler endpoint and leaves `[snapshot.mobility]` at its default of
+    /// off, so refusing on the cluster alone put all of them into a crash loop
+    /// for a capability none of them use.
+    #[test]
+    fn a_clustered_node_without_mobility_still_starts() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config = AppConfig {
+            home_path: temp.path().to_owned(),
+            cluster: crate::cfg::ClusterConfig {
+                scheduler_endpoint: Some("http://scheduler:9000".to_owned()),
+            },
+            ..Default::default()
+        };
+        assert!(
+            !config.snapshot.mobility.enabled,
+            "mobility must default off, or this test is asserting the wrong thing"
+        );
+
+        let generator = SandboxAccessTokenGenerator::load_or_create(&config, false)?;
+        assert!(!generator.seed.is_empty());
         Ok(())
     }
 

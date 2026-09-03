@@ -49,11 +49,11 @@ type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
 /// Maximum time to wait for a sandbox to leave a transitional state.
 /// Guards against indefinite blocking when a sandbox's in-progress operation
 /// never completes (e.g. the task holding the state panics without rolling back).
-/// How many times a pause re-attempts its claim while a capture holds the
-/// sandbox. Two waits and a final try: a capture is one freeze, so more than
-/// that means something is re-claiming faster than the pause can win, and
-/// erroring is more useful than waiting.
-const PAUSE_CAPTURE_WAIT_ATTEMPTS: usize = 3;
+/// How many times a user operation re-attempts its state claim while a capture
+/// holds the sandbox. Two waits and a final try: a capture is one freeze, so
+/// more than that means something is re-claiming faster than the caller can
+/// win, and erroring is more useful than waiting.
+const CAPTURE_WAIT_ATTEMPTS: usize = 3;
 
 const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
@@ -751,23 +751,53 @@ where
             .resources;
         let admission = self.admit(count, source_resources).await?;
 
-        let source_metadata = self
-            .store
-            .update_if_state(&source_sandbox_id, &[SandboxState::Running], |metadata| {
-                metadata.state = SandboxState::Forking
-            })
-            .await
-            .map_err(|err| match err {
-                StoreError::StateConflict { actual_state, .. } => match actual_state {
-                    SandboxState::Killing => OrchestratorError::SandboxNotFound(source_sandbox_id),
-                    _ => OrchestratorError::InvalidSandboxState {
-                        sandbox_id: source_sandbox_id,
-                        state: actual_state,
-                    },
-                },
-                err => OrchestratorError::from(err),
-            })?
-            .previous;
+        let mut claimed = None;
+        for attempt in 0..CAPTURE_WAIT_ATTEMPTS {
+            match self
+                .store
+                .update_if_state(&source_sandbox_id, &[SandboxState::Running], |metadata| {
+                    metadata.state = SandboxState::Forking
+                })
+                .await
+            {
+                Ok(update) => {
+                    claimed = Some(update.previous);
+                    break;
+                }
+                Err(err) => {
+                    if self
+                        .waited_out_capture(source_sandbox_id, &err, attempt)
+                        .await
+                    {
+                        continue;
+                    }
+                    return Err(match err {
+                        StoreError::StateConflict {
+                            actual_state: SandboxState::Killing,
+                            ..
+                        } => OrchestratorError::SandboxNotFound(source_sandbox_id),
+                        StoreError::StateConflict { actual_state, .. } => {
+                            OrchestratorError::InvalidSandboxState {
+                                sandbox_id: source_sandbox_id,
+                                state: actual_state,
+                            }
+                        }
+                        err => OrchestratorError::from(err),
+                    });
+                }
+            }
+        }
+        let source_metadata = match claimed {
+            Some(metadata) => metadata,
+            // Every attempt lost to a capture. Reported as the conflict it is
+            // rather than retried forever.
+            None => {
+                return Err(OrchestratorError::InvalidSandboxState {
+                    sandbox_id: source_sandbox_id,
+                    state: SandboxState::Snapshotting,
+                })
+            }
+        };
 
         let children_spec = (0..count)
             .map(|_| {
@@ -1659,26 +1689,48 @@ where
         // cannot see. Wait it out and try again instead. Bounded, because
         // waiting forever on a sandbox that keeps being re-claimed is a hang
         // dressed up as patience.
-        for attempt in 0..PAUSE_CAPTURE_WAIT_ATTEMPTS {
+        for attempt in 0..CAPTURE_WAIT_ATTEMPTS {
             match self
                 .store
                 .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
                 .await
             {
                 Ok(_) => break,
-                Err(StoreError::StateConflict {
-                    actual_state: SandboxState::Snapshotting,
-                    ..
-                }) if attempt + 1 < PAUSE_CAPTURE_WAIT_ATTEMPTS => {
-                    debug!("waiting for an in-flight capture before pausing");
-                    self.wait_for_transition(sandbox_id, SandboxState::Snapshotting)
-                        .await?;
+                Err(err) => {
+                    if self.waited_out_capture(sandbox_id, &err, attempt).await {
+                        continue;
+                    }
+                    return self.report_pause_conflict(sandbox_id, err).await;
                 }
-                Err(err) => return self.report_pause_conflict(sandbox_id, err).await,
             }
         }
 
         self.pause_sandbox_impl(sandbox_id).await
+    }
+
+    /// Whether a failed state claim should be retried, and waits if so.
+    ///
+    /// Speculative checkpoints take `Snapshotting` on their own schedule. A user
+    /// operation that failed on it would fail for a reason the user did not
+    /// cause, cannot see, and cannot act on -- the sandbox is `Running` as far
+    /// as anything they can observe goes. Every other transitional state is
+    /// someone's deliberate operation and is still reported as a conflict.
+    async fn waited_out_capture(
+        &self,
+        sandbox_id: SandboxId,
+        err: &StoreError,
+        attempt: usize,
+    ) -> bool {
+        let StoreError::StateConflict { actual_state, .. } = err else {
+            return false;
+        };
+        if *actual_state != SandboxState::Snapshotting || attempt + 1 >= CAPTURE_WAIT_ATTEMPTS {
+            return false;
+        }
+        debug!("waiting for an in-flight capture before claiming the sandbox");
+        self.wait_for_transition(sandbox_id, SandboxState::Snapshotting)
+            .await
+            .is_ok()
     }
 
     /// Turns a failed claim of the pause transition into the caller's answer.
@@ -2186,26 +2238,36 @@ where
         self.ensure_accepting_lifecycle_operations()?;
 
         info!("capturing sandbox snapshot");
-        match self
-            .store
-            .update_state_if_state(
-                &sandbox_id,
-                SandboxState::Snapshotting,
-                &[SandboxState::Running],
-            )
-            .await
-        {
-            Ok(_) => {}
-            Err(StoreError::StateConflict { actual_state, .. }) => {
-                return match actual_state {
-                    SandboxState::Killing => Err(OrchestratorError::SandboxNotFound(sandbox_id)),
-                    _ => Err(OrchestratorError::InvalidSandboxState {
-                        sandbox_id,
-                        state: actual_state,
-                    }),
-                };
+        for attempt in 0..CAPTURE_WAIT_ATTEMPTS {
+            match self
+                .store
+                .update_state_if_state(
+                    &sandbox_id,
+                    SandboxState::Snapshotting,
+                    &[SandboxState::Running],
+                )
+                .await
+            {
+                Ok(_) => break,
+                Err(err) => {
+                    if self.waited_out_capture(sandbox_id, &err, attempt).await {
+                        continue;
+                    }
+                    return match err {
+                        StoreError::StateConflict {
+                            actual_state: SandboxState::Killing,
+                            ..
+                        } => Err(OrchestratorError::SandboxNotFound(sandbox_id)),
+                        StoreError::StateConflict { actual_state, .. } => {
+                            Err(OrchestratorError::InvalidSandboxState {
+                                sandbox_id,
+                                state: actual_state,
+                            })
+                        }
+                        err => Err(OrchestratorError::from(err)),
+                    };
+                }
             }
-            Err(err) => return Err(OrchestratorError::from(err)),
         }
 
         // Get the sandbox handle.

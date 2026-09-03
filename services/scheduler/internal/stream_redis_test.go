@@ -7,6 +7,9 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+
+	dto "github.com/prometheus/client_model/go"
+	"github.com/redis/go-redis/v9"
 )
 
 // newRedisStreamReplica builds a replica against a real Redis, so the encoding,
@@ -146,4 +149,78 @@ func TestNodeStreamFollowsFromTheHorizonNotTheLiveTail(t *testing.T) {
 	if followMs < before || followMs > after {
 		t.Fatalf("follow id %q is outside the replay window [%d, %d]", follow, before, after)
 	}
+}
+
+// Retention shorter than the replay window must be reported, and healthy
+// retention must not be.
+//
+// `schedulerNodeStreamWarmupIncomplete` and its WARN are the only signal that a
+// starting replica's view of the fleet is missing nodes. The check compares the
+// stream's oldest entry against the first entry at or after the horizon: equal
+// means nothing older than the horizon survived, so the tail was trimmed inside
+// the window. Written the other way round it fired on every healthy replica and
+// stayed silent on the trimmed one, which is worse than having no check --
+// operators are told to raise node_stream_maxlen on a stream that is fine, and
+// told nothing when it is not.
+func TestNodeStreamWarmupFlagsShortRetentionAndNotHealthyRetention(t *testing.T) {
+	addr := startRedisServerForTest(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	reportTTL := 30 * time.Second
+	bus, err := NewRedisNodeStream(ctx, addr, NodeStreamOptions{KeyPrefix: "test:retention", ReportTTL: reportTTL})
+	if err != nil {
+		t.Fatalf("connect node stream: %v", err)
+	}
+	t.Cleanup(func() { _ = bus.Close() })
+
+	key := bus.key(0)
+	horizonMs := time.Now().Add(-2 * reportTTL).UnixMilli()
+
+	// Healthy: an entry from well before the horizon is still retained, so the
+	// replay covers the whole window.
+	addEntry := func(atMs int64) {
+		if err := bus.client.XAdd(ctx, &redis.XAddArgs{
+			Stream: key,
+			ID:     fmt.Sprintf("%d-0", atMs),
+			Values: map[string]any{"payload": "x"},
+		}).Err(); err != nil {
+			t.Fatalf("seed stream entry at %d: %v", atMs, err)
+		}
+	}
+	addEntry(horizonMs - 60_000)
+	addEntry(horizonMs + 1_000)
+
+	// The gauge is process-global and this test asserts on transitions, so it
+	// is cleared rather than assumed clear -- under `-count=2` the second run
+	// would otherwise inherit the first run's trimmed-case value.
+	schedulerNodeStreamWarmupIncomplete.Set(0)
+	bus.warmUpShard(ctx, 0, func(*schedulerv1.NodeStateEvent) {})
+	if incomplete := readWarmupIncompleteGauge(t); incomplete != 0 {
+		t.Fatalf("healthy retention reported as incomplete (gauge=%v); operators are told to raise "+
+			"node_stream_maxlen on a stream that is fine", incomplete)
+	}
+
+	// Trimmed: drop everything older than the horizon, so the oldest entry
+	// retained is itself inside the replay window.
+	if err := bus.client.Del(ctx, key).Err(); err != nil {
+		t.Fatalf("clear stream: %v", err)
+	}
+	addEntry(horizonMs + 1_000)
+	addEntry(horizonMs + 2_000)
+
+	bus.warmUpShard(ctx, 0, func(*schedulerv1.NodeStateEvent) {})
+	if incomplete := readWarmupIncompleteGauge(t); incomplete != 1 {
+		t.Fatalf("retention trimmed inside the replay window went unreported (gauge=%v); a replica "+
+			"starts with part of the fleet missing and nothing says so", incomplete)
+	}
+}
+
+func readWarmupIncompleteGauge(t *testing.T) float64 {
+	t.Helper()
+	metric := &dto.Metric{}
+	if err := schedulerNodeStreamWarmupIncomplete.Write(metric); err != nil {
+		t.Fatalf("read warmup gauge: %v", err)
+	}
+	return metric.GetGauge().GetValue()
 }

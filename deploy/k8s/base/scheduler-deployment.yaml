@@ -39,9 +39,21 @@ spec:
               command:
                 - /grpc_health_probe
                 - -addr=127.0.0.1:9090
+                # The named service, not the overall one. ReadinessGate
+                # publishes fitness only here and leaves the overall status
+                # SERVING from process start so an unreachable Redis cannot
+                # crash-loop the whole tier. Without this flag the probe reads
+                # that always-SERVING status, every pod is Ready before its
+                # registry has replayed, and the gate is inert -- which is
+                # exactly what `replicas: 2` behind a round-robin client makes
+                # load-bearing.
+                - -service=scheduler.v1.Scheduler
             initialDelaySeconds: 3
             periodSeconds: 10
           livenessProbe:
+            # Deliberately the overall service: liveness asks whether the
+            # process is alive, and gating it on fitness would restart every
+            # replica at once for one Redis outage.
             exec:
               command:
                 - /grpc_health_probe

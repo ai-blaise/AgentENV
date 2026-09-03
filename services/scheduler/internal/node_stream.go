@@ -323,11 +323,17 @@ func (s *RedisNodeStream) warmUpShard(ctx context.Context, shard uint32, fn func
 		return horizonID
 	}
 
-	// Everything retained is newer than the horizon, so the tail was trimmed
-	// inside the window this replica needed and some live node may be missing
-	// from it until its next heartbeat.
+	// `messages[0]` is the first entry at or after the horizon. If the stream's
+	// true oldest entry is that same one, then nothing older than the horizon
+	// survives -- the tail was trimmed inside the window this replica needed,
+	// and some live node may be missing from its view until the next heartbeat.
+	//
+	// The comparison is `==`, not `!=`: a stream that still holds entries from
+	// before the horizon is the healthy case, and testing for difference
+	// reported every healthy replica as incomplete while staying silent on the
+	// trimmed one this exists to catch.
 	if oldest, err := s.client.XRangeN(readCtx, key, "-", "+", 1).Result(); err == nil && len(oldest) > 0 {
-		if oldest[0].ID != messages[0].ID {
+		if oldest[0].ID == messages[0].ID {
 			schedulerNodeStreamWarmupIncomplete.Set(1)
 			s.opts.Logger.Warn("scheduler node stream retention is shorter than the report TTL; raise scheduler.node_stream_maxlen",
 				zap.String("stream", key),
