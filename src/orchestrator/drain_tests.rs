@@ -457,9 +457,24 @@ async fn a_pass_that_overruns_its_deadline_still_answers() -> Result<()> {
     .await
     .expect("a drain must return when its deadline elapses")?;
 
-    // Paused before the publish began, so nothing is left to preserve even
-    // though the publish never finished.
+    // Paused, but its state never reached the repository: the deadline dropped
+    // the publish mid-flight, which reaches neither the Ok arm nor the Err arm.
+    // It has to be reported as work left, because the shipped preStop hook
+    // breaks its poll loop on `remaining == 0 && failed == 0` and lets the
+    // container stop -- and this node holds the only copy.
+    //
+    // This assertion previously read `remaining == 0`, with a comment saying
+    // nothing was left to preserve. It pinned the bug.
     assert_eq!(progress.remaining, 0);
     assert_eq!(progress.published, 0);
+    // The publish was dropped mid-flight, which reaches neither the Ok arm nor
+    // the Err arm. It still has to be reported: the shipped preStop hook breaks
+    // its poll loop on `remaining == 0 && failed == 0`, and this node holds the
+    // only copy. The assertion here previously read `published == 0` alone,
+    // with a comment saying nothing was left to preserve -- it pinned the bug.
+    assert_eq!(
+        progress.failed, 1,
+        "a paused sandbox whose publish the deadline cut off is not drained"
+    );
     Ok(())
 }

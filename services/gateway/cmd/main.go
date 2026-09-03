@@ -23,6 +23,9 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	// Registers the client-side health-check function that healthCheckConfig
+	// above depends on. Without this import the config parses and does nothing.
+	_ "google.golang.org/grpc/health"
 	"google.golang.org/grpc/resolver"
 	"google.golang.org/grpc/resolver/manual"
 )
@@ -35,15 +38,24 @@ const (
 )
 
 // schedulerLoadBalancingConfig spreads RPCs over every scheduler the resolver
-// names.
+// names, and drops the ones that say they are unfit.
 //
-// Without it grpc.NewClient balances with pick_first, which uses one address
-// and keeps one connection: every gateway pins itself to whichever scheduler it
-// resolved first, so scaling the tier out moves no traffic and rolling it
-// blacks routing out until the client reconnects. round_robin also drops a
-// subchannel that fails to connect, which is what makes killing a replica
-// invisible to clients.
-const schedulerLoadBalancingConfig = `{"loadBalancingConfig":[{"round_robin":{}}]}`
+// Without `loadBalancingConfig`, grpc.NewClient balances with pick_first, which
+// uses one address and keeps one connection: every gateway pins itself to
+// whichever scheduler it resolved first, so scaling the tier out moves no
+// traffic and rolling it blacks routing out until the client reconnects.
+//
+// `healthCheckConfig` is what makes the scheduler's readiness gate reach a
+// gateway that is already running. round_robin on its own only drops a
+// subchannel that fails to *connect*; a replica that has lost its binding store
+// keeps its listener open and answers every call with Unavailable, so it stays
+// in the picker. Kubernetes removing it from the EndpointSlice does not help
+// either: the DNS resolver re-resolves on ResolveNow, which the balancer calls
+// only when a subchannel enters TRANSIENT_FAILURE, and a NotReady pod that is
+// still listening never does. Client-side health checking asks the replica
+// directly, on the same named service the gate publishes.
+const schedulerLoadBalancingConfig = `{"loadBalancingConfig":[{"round_robin":{}}],` +
+	`"healthCheckConfig":{"serviceName":"scheduler.v1.Scheduler"}}`
 
 func newSchedulerConn(addr string, authToken string) (*grpc.ClientConn, error) {
 	target, resolverOptions, err := schedulerDialTarget(addr)

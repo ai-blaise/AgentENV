@@ -795,6 +795,7 @@ fn stream_verified_blob_range(
     blob_hash: iroh_blobs::Hash,
     range: std::ops::Range<u64>,
     budget: u64,
+    transfer_timeout: Duration,
 ) -> impl Stream<Item = Result<Bytes>> + Send + 'static {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes>>(8);
     tokio::spawn(async move {
@@ -802,8 +803,23 @@ fn stream_verified_blob_range(
         // rather than cloned out of: releasing it at the end of the call that
         // opened it would have the pool counting this transfer's connection as
         // free for its whole duration.
-        let result =
-            drive_verified_blob_range((*connection).clone(), blob_hash, range, budget, &tx).await;
+        //
+        // Bounded, because a QUIC read has no deadline of its own. The
+        // store-backed path this replaced got its bound from `download_blob`,
+        // which runs under the same `fetch_timeout`; without one here a peer
+        // that accepts the stream and then stalls -- alive enough to answer
+        // keepalives, wedged enough to send nothing -- parks this task and its
+        // pool permit forever, and the guest page fault behind it never
+        // completes.
+        let driven =
+            drive_verified_blob_range((*connection).clone(), blob_hash, range, budget, &tx);
+        let result = match tokio::time::timeout(transfer_timeout, driven).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Internal(anyhow::anyhow!(
+                "streamed range did not finish within {}ms",
+                transfer_timeout.as_millis()
+            ))),
+        };
         drop(connection);
         if let Err(err) = result {
             let _ = tx.send(Err(err)).await;
@@ -1144,7 +1160,8 @@ impl P2pTransport for IrohBlobsP2pTransport {
         let budget = (end - offset)
             .saturating_add(RANGE_VERIFICATION_ALLOWANCE)
             .saturating_mul(2);
-        let stream = stream_verified_blob_range(connection, blob_hash, range, budget);
+        let stream =
+            stream_verified_blob_range(connection, blob_hash, range, budget, self.fetch_timeout);
         p2p_metrics::record_range_stream_started();
         Ok(Box::pin(stream))
     }

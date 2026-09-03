@@ -35,6 +35,13 @@ pub(crate) struct MockTransport {
     pub(crate) fail_lookup: Arc<AtomicBool>,
     pub(crate) fail_publish: Arc<AtomicBool>,
     pub(crate) fail_fetch_range_stream_after_first_chunk: Arc<AtomicBool>,
+    /// The stream is handed back promptly and then never yields anything.
+    ///
+    /// This is the peer that accepts the connection and stalls -- alive enough
+    /// to answer keepalives, wedged enough to send no bytes. It is distinct
+    /// from `fetch_range_delay`, which delays the call that returns the stream:
+    /// a caller that only bounds that call sees this one as a success.
+    pub(crate) stall_fetch_range_stream: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -166,6 +173,9 @@ impl P2pTransport for MockTransport {
         } else {
             chunks
         };
+        if self.stall_fetch_range_stream.load(Ordering::Relaxed) {
+            return Ok(Box::pin(stream::pending()));
+        }
         Ok(Box::pin(stream::iter(chunks)))
     }
 

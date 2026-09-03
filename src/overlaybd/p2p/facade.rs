@@ -12,6 +12,8 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use axum::routing::{get, post};
 use axum::Router;
+use bytes::Bytes;
+use futures::{stream, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -545,15 +547,43 @@ async fn fetch_p2p_range(
         )
     })?
     .context("fetch p2p layer range")?;
-    // The timeout covers reaching first bytes, not the whole transfer: the
-    // streaming path returns as soon as the connection is established and the
-    // request is on the wire, and the bytes then flow through the response
-    // body. A local provider behaves the same way, for the same reason.
-    // Once this stream is attached to the response body, headers are committed;
-    // any mid-stream P2P failure is reported through HTTP framing instead of
-    // falling back to origin.
+
+    // Wait for the first chunk before returning, under the same budget.
+    //
+    // Attaching the stream to the body commits the response headers, and past
+    // that point a P2P failure can only be reported through HTTP framing --
+    // the fallback to origin below this call is unreachable. The streaming
+    // transport returns as soon as the connection is up and the request is on
+    // the wire, so without this the budget covered the connect and nothing
+    // else: a peer that accepts and then sends nothing produced a committed
+    // 206 whose body never completed, where the store-backed path it replaced
+    // would have timed out and read from the origin.
+    //
+    // The cost is the first chunk's latency, which is the latency of the read
+    // either way.
+    let mut bytes = bytes;
+    let first = tokio::time::timeout(state.fetch_range_timeout, bytes.next())
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "p2p range produced no bytes within {}ms",
+                state.fetch_range_timeout.as_millis()
+            )
+        })?;
+    let leading = match first {
+        Some(chunk) => chunk.context("read the first chunk of a p2p layer range")?,
+        // An empty stream for a non-empty range is a truncation, and reporting
+        // it here still leaves the origin reachable.
+        None if fetch_len > 0 => bail!("p2p range returned no data for {fetch_len} bytes"),
+        None => Bytes::new(),
+    };
+
+    // Everything after the first chunk still streams; a mid-stream failure is
+    // reported through HTTP framing, which is unavoidable once headers are out.
+    let body = stream::once(async move { Ok::<Bytes, anyhow::Error>(leading) })
+        .chain(bytes.map(|chunk| chunk.map_err(anyhow::Error::from)));
     Ok(RangeBody {
-        body: Body::from_stream(bytes),
+        body: Body::from_stream(body),
         response_len: fetch_len as u64,
         total_size: metadata.size(),
     })
@@ -1500,6 +1530,81 @@ mod tests {
             2,
             "both reads served by origin"
         );
+        facade.shutdown().await.unwrap();
+        origin_handle.abort();
+    }
+
+    /// A peer that connects and then sends nothing must still fall back.
+    ///
+    /// The streaming transport returns as soon as the connection is up and the
+    /// request is on the wire, so a budget applied only to that call sees a
+    /// stalled peer as a success. Attaching its stream to the body commits the
+    /// response headers, and past that the origin fallback below is
+    /// unreachable -- the guest gets a 206 whose body never completes, where
+    /// the store-backed path this replaced would have timed out and read the
+    /// origin. Distinct from `slow_p2p_range_fetch_falls_back_to_origin`, which
+    /// delays the call itself and so was already covered.
+    #[tokio::test]
+    async fn a_peer_that_stalls_after_connecting_still_falls_back_to_origin() {
+        let blob: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let digest = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+        let canonical = CanonicalBlobIdentity::from_digest(digest);
+        let key = layer_artifact_key(&canonical);
+
+        let transport = Arc::new(MockTransport::default());
+        transport
+            .stall_fetch_range_stream
+            .store(true, Ordering::Relaxed);
+        transport.descriptors.write().await.insert(
+            key.clone(),
+            layer_descriptor(key.clone(), digest, blob.len() as u64),
+        );
+        transport
+            .blobs
+            .write()
+            .await
+            .insert(key, Bytes::from(blob.clone()));
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (origin, origin_handle) = spawn_origin(OriginState {
+            blob: Arc::new(blob.clone()),
+            hits: hits.clone(),
+            force_200: false,
+        })
+        .await;
+        let facade = start_test_facade_with_config(
+            transport.clone(),
+            P2pHttpFacadeConfig {
+                lookup_timeout: DEFAULT_LOOKUP_TIMEOUT,
+                fetch_range_timeout: Duration::from_millis(50),
+                descriptor_cache_ttl: Duration::from_secs(60),
+                descriptor_miss_cache_ttl: Duration::from_secs(60),
+                descriptor_cache_max_entries: DEFAULT_DESCRIPTOR_CACHE_MAX_ENTRIES,
+                allowed_publish_roots: Vec::new(),
+                commit_store_roots: Vec::new(),
+            },
+        )
+        .await;
+
+        let origin_url = format!("{origin}/v2/ns/repo/blobs/{digest}?sig=one");
+        let resp = get_range(&format!("{}/{}", facade.address(), origin_url), 100, 199).await;
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::PARTIAL_CONTENT,
+            "a stalled peer must not leave the read without an answer"
+        );
+        assert_eq!(
+            resp.bytes().await.unwrap().as_ref(),
+            &blob[100..200],
+            "the origin's bytes must come back when the peer stalls"
+        );
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            1,
+            "the origin was never read; the stalled peer's stream was committed instead"
+        );
+
         facade.shutdown().await.unwrap();
         origin_handle.abort();
     }

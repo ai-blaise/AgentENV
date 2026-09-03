@@ -1649,10 +1649,50 @@ where
             .await?
             .len();
 
+        // `failed` is derived from the store, not accumulated from the arms.
+        //
+        // It means "paused here, and its state is not in the repository" -- the
+        // shipped preStop hook breaks its poll loop on `remaining == 0 &&
+        // failed == 0`, so this is the counter that stops a node being declared
+        // drained while it holds the only copy of something. Accumulating it
+        // from `publish_paused`'s `Err` arm missed the case the deadline
+        // creates: when the pass runs out of time it drops every in-flight
+        // publish, and a dropped future reaches neither arm. The sandbox was
+        // `Paused` by then, so it also fell out of the `remaining` count above,
+        // and the pass reported a drained node.
+        //
+        // `committed_snapshot` is the same authority the pass uses to decide a
+        // sandbox needs no publishing, so the two cannot disagree. Without
+        // mobility nothing publishes at all and there is nothing to be behind.
+        let mut failed = failed.into_inner();
+        if let Some(mobility) = self.mobility() {
+            let paused = self
+                .store
+                .list_filtered(SandboxListFilter {
+                    states: Some(vec![SandboxState::Paused]),
+                    ..SandboxListFilter::matches_all()
+                })
+                .await?;
+            let mut unpublished = 0;
+            for metadata in paused {
+                if mobility.committed_snapshot(&metadata.id).await.is_none() {
+                    unpublished += 1;
+                }
+            }
+            if unpublished > failed {
+                warn!(
+                    unpublished,
+                    counted_from_errors = failed,
+                    "drain pass left paused sandboxes whose state is not in the repository"
+                );
+            }
+            failed = unpublished;
+        }
+
         let progress = DrainProgress {
             remaining,
             published: published.into_inner(),
-            failed: failed.into_inner(),
+            failed,
         };
         info!(
             remaining = progress.remaining,

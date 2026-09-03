@@ -36,6 +36,13 @@ use crate::proto::scheduler::{
 };
 use crate::types::SandboxId;
 
+/// How long a mobility RPC may take before the node gives up on it.
+///
+/// Matches `GRPC_CALL_TIMEOUT` in the observability reporter: these are calls
+/// to the same scheduler over the same network, and a node that waits longer
+/// than its own heartbeat interval for one of them is already in trouble.
+const MOBILITY_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// A [`MobilityStore`] backed by the scheduler.
 #[derive(Clone)]
 pub struct SchedulerMobilityStore {
@@ -65,6 +72,23 @@ impl SchedulerMobilityStore {
         }
     }
 
+    /// Wraps a mobility message in a request that carries a deadline.
+    ///
+    /// Every other node-to-scheduler client sets one; these five were the
+    /// exception. It matters most on `record_paused`, which runs inside
+    /// `pause_sandbox_impl` after the guest has been frozen and the proxy route
+    /// detached, but before the store is moved to `Paused` and the VM is
+    /// stopped. `pause_sandbox` runs detached, so the caller's HTTP deadline
+    /// does not reach it. A scheduler that is reachable at the TCP level but
+    /// wedged therefore left the sandbox in the transitional `Pausing` state --
+    /// Firecracker process, guest memory and network slot all still held,
+    /// unroutable, and clearable by no API call.
+    fn deadlined<T>(message: T) -> tonic::Request<T> {
+        let mut request = tonic::Request::new(message);
+        request.set_timeout(MOBILITY_RPC_TIMEOUT);
+        request
+    }
+
     fn client(&self) -> SchedulerClient<Channel> {
         SchedulerClient::new(self.channel.clone())
     }
@@ -75,13 +99,13 @@ impl MobilityStore for SchedulerMobilityStore {
     async fn upsert(&self, record: &MobilityRecord) -> Result<MobilityWrite> {
         let response = self
             .client()
-            .upsert_mobility_record(scheduler::UpsertMobilityRecordRequest {
+            .upsert_mobility_record(Self::deadlined(scheduler::UpsertMobilityRecordRequest {
                 record: Some(to_proto(record)?),
                 // Unconditional: this is the bookkeeping path, ordered by
                 // generation. Claims go through compare_and_set.
                 expected_generation: String::new(),
                 expect_absent: false,
-            })
+            }))
             .await
             .context("upsert mobility record through the scheduler")?
             .into_inner();
@@ -99,7 +123,7 @@ impl MobilityStore for SchedulerMobilityStore {
     ) -> Result<MobilityWrite> {
         let response = self
             .client()
-            .upsert_mobility_record(scheduler::UpsertMobilityRecordRequest {
+            .upsert_mobility_record(Self::deadlined(scheduler::UpsertMobilityRecordRequest {
                 record: Some(to_proto(record)?),
                 expected_generation: expected
                     .as_ref()
@@ -108,7 +132,7 @@ impl MobilityStore for SchedulerMobilityStore {
                 // Distinguishes "expect nothing stored" from "do not check",
                 // which the empty string alone cannot.
                 expect_absent: expected.is_none(),
-            })
+            }))
             .await
             .context("compare-and-set mobility record through the scheduler")?
             .into_inner();
@@ -122,9 +146,9 @@ impl MobilityStore for SchedulerMobilityStore {
     async fn get(&self, sandbox_id: &SandboxId) -> Result<Option<MobilityRecord>> {
         let response = self
             .client()
-            .get_mobility_record(scheduler::GetMobilityRecordRequest {
+            .get_mobility_record(Self::deadlined(scheduler::GetMobilityRecordRequest {
                 sandbox_id: sandbox_id.to_string(),
-            })
+            }))
             .await
             .context("read mobility record from the scheduler")?
             .into_inner();
@@ -137,9 +161,9 @@ impl MobilityStore for SchedulerMobilityStore {
     async fn list(&self) -> Result<Vec<MobilityRecord>> {
         let response = self
             .client()
-            .list_mobility_records(scheduler::ListMobilityRecordsRequest {
+            .list_mobility_records(Self::deadlined(scheduler::ListMobilityRecordsRequest {
                 origin_node_id: self.node_id.clone(),
-            })
+            }))
             .await
             .context("list mobility records from the scheduler")?
             .into_inner();
@@ -148,9 +172,9 @@ impl MobilityStore for SchedulerMobilityStore {
 
     async fn remove(&self, sandbox_id: &SandboxId) -> Result<()> {
         self.client()
-            .remove_mobility_record(scheduler::RemoveMobilityRecordRequest {
+            .remove_mobility_record(Self::deadlined(scheduler::RemoveMobilityRecordRequest {
                 sandbox_id: sandbox_id.to_string(),
-            })
+            }))
             .await
             .context("remove mobility record through the scheduler")?;
         Ok(())
